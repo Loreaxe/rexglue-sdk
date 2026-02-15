@@ -96,10 +96,23 @@ dword_result_t NtQueryInformationFile_entry(
       break;
     }
     case XFileSectorInformation: {
-      // TODO(benvanik): return sector this file's on.
-      REXKRNL_ERROR("NtQueryInformationFile(XFileSectorInformation) unimplemented");
-      status = X_STATUS_INVALID_PARAMETER;
-      out_length = 0;
+      auto info = info_ptr.as<X_FILE_SECTOR_INFORMATION*>();
+
+      // Keep consistent with XFileFsSizeInformation (which asserts 0x200).
+      uint32_t bytes_per_sector = 0x200;
+      if (auto device = file->device()) {
+          bytes_per_sector = device->bytes_per_sector();
+    }
+
+      // Avoid returning nonsense if a device implementation misbehaves.
+      if (!bytes_per_sector) {
+          status = X_STATUS_INVALID_PARAMETER;
+          out_length = 0;
+          break;
+    }
+
+      info->bytes_per_sector = bytes_per_sector;
+      out_length = sizeof(*info);
       break;
     }
     case XFileXctdCompressionInformation: {

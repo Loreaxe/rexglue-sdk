@@ -108,6 +108,11 @@ struct X_FILE_NETWORK_OPEN_INFORMATION {
 };
 static_assert_size(X_FILE_NETWORK_OPEN_INFORMATION, 56);
 
+struct X_FILE_SECTOR_INFORMATION {
+  be<uint32_t> bytes_per_sector;
+};
+static_assert_size(X_FILE_SECTOR_INFORMATION, 4);
+
 #pragma pack(pop)
 
 }  // namespace kernel
