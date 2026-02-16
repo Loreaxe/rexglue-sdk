@@ -58,8 +58,14 @@ if(NOT WIN32)
     # TODO: do we actually need this?
     # Use large code model on Linux for linking with very large recompiled executables (35MB+)
     # Position-independent code for all targets
-    add_compile_options(-mcmodel=large)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+    # Only x86_64 needs/uses mcmodel=large in our current setup.
+    # Clang rejects -mcmodel=large with -fPIC (used by vendored libs like fmt),
+    # and on AArch64 this flag isn't needed for now.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        add_compile_options(-mcmodel=large)
+    endif()
 endif()
 
 # Global compile options

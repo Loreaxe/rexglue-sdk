@@ -288,10 +288,97 @@ endif()
 #=============================================================================
 
 set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
+#=============================================================================
+# FFmpeg - configure step (out-of-tree, safe, multi-arch)
+#=============================================================================
+
+set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
+set(FFMPEG_SRC_DIR "${FFMPEG_DIR}")
+
+# Out-of-tree configure dir (unique per arch + OS)
+set(FFMPEG_CFG_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg_cfg_${CMAKE_SYSTEM_NAME}_${CMAKE_SYSTEM_PROCESSOR}"
+)
+set(FFMPEG_STAMP "${FFMPEG_CFG_DIR}/.configured")
+
+file(MAKE_DIRECTORY "${FFMPEG_CFG_DIR}")
+
+# -----------------------------------------------------------------------------
+# Map architecture
+# -----------------------------------------------------------------------------
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(FFMPEG_ARCH "aarch64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    set(FFMPEG_ARCH "x86_64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(i[3-6]86)$")
+    set(FFMPEG_ARCH "x86")
+else()
+    message(FATAL_ERROR "Unsupported FFmpeg arch: ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
+# -----------------------------------------------------------------------------
+# Map target OS
+# -----------------------------------------------------------------------------
+if(WIN32)
+    set(FFMPEG_TARGET_OS "win64")
+elseif(APPLE)
+    set(FFMPEG_TARGET_OS "darwin")
+elseif(ANDROID)
+    set(FFMPEG_TARGET_OS "android")
+elseif(UNIX)
+    set(FFMPEG_TARGET_OS "linux")
+else()
+    message(FATAL_ERROR "Unsupported FFmpeg target OS")
+endif()
+
+# -----------------------------------------------------------------------------
+# Configure arguments
+# -----------------------------------------------------------------------------
+set(FFMPEG_CONFIGURE_ARGS
+    --arch=${FFMPEG_ARCH}
+    --target-os=${FFMPEG_TARGET_OS}
+    --cc=${CMAKE_C_COMPILER}
+
+    --disable-programs
+    --disable-doc
+    --disable-debug
+    --disable-everything
+    --enable-avutil
+    --enable-avcodec
+)
+
+# -----------------------------------------------------------------------------
+# Clean any in-tree configure leftovers (CRITICAL)
+# -----------------------------------------------------------------------------
+add_custom_command(
+    OUTPUT "${FFMPEG_STAMP}"
+
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${FFMPEG_CFG_DIR}"
+
+    # Remove in-tree configure artifacts (FFmpeg refuses out-of-tree otherwise)
+    COMMAND "${CMAKE_COMMAND}" -E remove -f
+        "${FFMPEG_SRC_DIR}/config.h"
+        "${FFMPEG_SRC_DIR}/config.mak"
+        "${FFMPEG_SRC_DIR}/config_components.h"
+        "${FFMPEG_SRC_DIR}/config.asm"
+
+    COMMAND "${CMAKE_COMMAND}" -E remove_directory
+        "${FFMPEG_SRC_DIR}/ffbuild"
+
+    # Run configure in binary dir
+    COMMAND "${CMAKE_COMMAND}" -E chdir "${FFMPEG_CFG_DIR}"
+        "${FFMPEG_SRC_DIR}/configure" ${FFMPEG_CONFIGURE_ARGS}
+
+    COMMAND "${CMAKE_COMMAND}" -E touch "${FFMPEG_STAMP}"
+
+    DEPENDS "${FFMPEG_SRC_DIR}/configure"
+    VERBATIM
+)
+
+add_custom_target(ffmpeg_configure DEPENDS "${FFMPEG_STAMP}")
 
 # Common defines for both libraries
 set(FFMPEG_COMMON_DEFINES
-    HAVE_AV_CONFIG_H
     _USE_MATH_DEFINES  # For M_PI/etc
 )
 
@@ -382,22 +469,34 @@ add_library(libavutil STATIC
     ${FFMPEG_DIR}/libavutil/film_grain_params.c
 )
 
-# Add x86 optimizations on Windows/Linux
+# Detect x86/x64 host architecture (used for FFmpeg x86 sources)
+set(REX_FFMPEG_X86 FALSE)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)$")
+    set(REX_FFMPEG_X86 TRUE)
+endif()
+
+# Add x86 optimizations on Windows/Linux (x86 only)
 if(WIN32 OR (UNIX AND NOT APPLE))
-    target_sources(libavutil PRIVATE
-        ${FFMPEG_DIR}/libavutil/x86/cpu.c
-        ${FFMPEG_DIR}/libavutil/x86/fixed_dsp_init.c
-        ${FFMPEG_DIR}/libavutil/x86/float_dsp_init.c
-        ${FFMPEG_DIR}/libavutil/x86/imgutils_init.c
-        ${FFMPEG_DIR}/libavutil/x86/lls_init.c
-    )
+    if(REX_FFMPEG_X86)
+        target_sources(libavutil PRIVATE
+            ${FFMPEG_DIR}/libavutil/x86/cpu.c
+            ${FFMPEG_DIR}/libavutil/x86/fixed_dsp_init.c
+            ${FFMPEG_DIR}/libavutil/x86/float_dsp_init.c
+            ${FFMPEG_DIR}/libavutil/x86/imgutils_init.c
+            ${FFMPEG_DIR}/libavutil/x86/lls_init.c
+        )
+    endif()
 endif()
 
 target_include_directories(libavutil
+    PRIVATE
+        "${FFMPEG_CFG_DIR}"           # generated config.h, config_components.h
+        "${FFMPEG_CFG_DIR}/libavutil" # generated libavutil/avconfig.h
     PUBLIC
         $<BUILD_INTERFACE:${FFMPEG_DIR}>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-    PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
+    PRIVATE
+        ${FFMPEG_ATOMICS_INCLUDE}
 )
 target_compile_definitions(libavutil PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavutil PRIVATE -w)  # Suppress warnings in third-party code
@@ -464,6 +563,38 @@ add_library(libavcodec STATIC
     ${FFMPEG_DIR}/libavcodec/fft_init_table.c
 )
 
+# -----------------------------------------------------------------------------
+# FFmpeg build-config plumbing (required for many macros to exist)
+# -----------------------------------------------------------------------------
+
+# Tell FFmpeg headers that a generated libavutil/avconfig.h exists.
+target_compile_definitions(libavutil PRIVATE HAVE_AV_CONFIG_H=1)
+target_compile_definitions(libavcodec PRIVATE HAVE_AV_CONFIG_H=1)
+
+# Make sure the generated headers are on the include path.
+target_include_directories(libavutil PRIVATE
+    "${FFMPEG_CFG_DIR}"
+    "${FFMPEG_CFG_DIR}/libavutil"
+)
+target_include_directories(libavcodec PRIVATE
+    "${FFMPEG_CFG_DIR}"
+    "${FFMPEG_CFG_DIR}/libavutil"
+)
+
+# Force-include generated config early in every translation unit.
+target_compile_options(libavutil PRIVATE
+    "-include${FFMPEG_CFG_DIR}/config.h"
+    "-include${FFMPEG_CFG_DIR}/libavutil/avconfig.h"
+)
+target_compile_options(libavcodec PRIVATE
+    "-include${FFMPEG_CFG_DIR}/config.h"
+    "-include${FFMPEG_CFG_DIR}/libavutil/avconfig.h"
+)
+
+# Ensure configure runs before we compile these.
+add_dependencies(libavutil ffmpeg_configure)
+add_dependencies(libavcodec ffmpeg_configure)
+
 # Windows-specific source
 if(WIN32)
     target_sources(libavcodec PRIVATE
@@ -471,22 +602,48 @@ if(WIN32)
     )
 endif()
 
-# Add x86 optimizations on Windows/Linux
+# Detect x86/x64 host architecture (used for FFmpeg x86 sources)
+set(REX_FFMPEG_X86 FALSE)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)$")
+    set(REX_FFMPEG_X86 TRUE)
+endif()
+
+# Detect AArch64 host architecture
+set(REX_FFMPEG_AARCH64 FALSE)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(REX_FFMPEG_AARCH64 TRUE)
+endif()
+
+# Add x86 optimizations on Windows/Linux (x86 only)
 if(WIN32 OR (UNIX AND NOT APPLE))
-    target_sources(libavcodec PRIVATE
-        ${FFMPEG_DIR}/libavcodec/x86/constants.c
-        ${FFMPEG_DIR}/libavcodec/x86/fdctdsp_init.c
-        ${FFMPEG_DIR}/libavcodec/x86/fft_init.c
-        ${FFMPEG_DIR}/libavcodec/x86/idctdsp_init.c
-        ${FFMPEG_DIR}/libavcodec/x86/fdct.c
+    if(REX_FFMPEG_X86)
+        target_sources(libavcodec PRIVATE
+            ${FFMPEG_DIR}/libavcodec/x86/constants.c
+            ${FFMPEG_DIR}/libavcodec/x86/fdctdsp_init.c
+            ${FFMPEG_DIR}/libavcodec/x86/fft_init.c
+            ${FFMPEG_DIR}/libavcodec/x86/idctdsp_init.c
+            ${FFMPEG_DIR}/libavcodec/x86/fdct.c
+        )
+    endif()
+endif()
+
+# Add AArch64 CPU detection implementation (arm64 only)
+if(REX_FFMPEG_AARCH64)
+    target_sources(libavutil PRIVATE
+        ${FFMPEG_DIR}/libavutil/aarch64/cpu.c
     )
 endif()
 
+
 target_include_directories(libavcodec
+    PRIVATE
+        "${FFMPEG_CFG_DIR}"
+        "${FFMPEG_CFG_DIR}/libavutil"
     PUBLIC
         $<BUILD_INTERFACE:${FFMPEG_DIR}>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-    PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
+    PRIVATE
+        ${FFMPEG_ATOMICS_INCLUDE}
 )
 target_compile_definitions(libavcodec PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavcodec PRIVATE -w)  # Suppress warnings in third-party code

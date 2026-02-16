@@ -264,34 +264,31 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p,
   decoded_out.length = sizeof(uint32_t);
   uint32_t instruction = *reinterpret_cast<const uint32_t*>(p);
 
-  // Literal loading (PC-relative) is not handled.
-
-  if ((instruction & kArm64LoadStoreAnyFMask) != kArm64LoadStoreAnyFixed) {
-    // Not a load or a store instruction.
+  if ((instruction & arch::kArm64LoadStoreAnyFMask) !=
+      arch::kArm64LoadStoreAnyFixed) {
     return false;
   }
 
-  if ((instruction & kArm64LoadStorePairAnyFMask) ==
-      kArm64LoadStorePairAnyFixed) {
-    // Handling MMIO only for single 32-bit values, not for pairs.
+  if ((instruction & arch::kArm64LoadStorePairAnyFMask) ==
+      arch::kArm64LoadStorePairAnyFixed) {
     return false;
   }
 
   uint8_t value_reg_base;
-  switch (Arm64LoadStoreOp(instruction & kArm64LoadStoreMask)) {
-    case Arm64LoadStoreOp::kSTR_w:
+  switch (arch::Arm64LoadStoreOp(instruction & arch::kArm64LoadStoreMask)) {
+    case arch::Arm64LoadStoreOp::kSTR_w:
       decoded_out.is_load = false;
       value_reg_base = DecodedLoadStore::kArm64ValueRegX0;
       break;
-    case Arm64LoadStoreOp::kLDR_w:
+    case arch::Arm64LoadStoreOp::kLDR_w:
       decoded_out.is_load = true;
       value_reg_base = DecodedLoadStore::kArm64ValueRegX0;
       break;
-    case Arm64LoadStoreOp::kSTR_s:
+    case arch::Arm64LoadStoreOp::kSTR_s:
       decoded_out.is_load = false;
       value_reg_base = DecodedLoadStore::kArm64ValueRegV0;
       break;
-    case Arm64LoadStoreOp::kLDR_s:
+    case arch::Arm64LoadStoreOp::kLDR_s:
       decoded_out.is_load = true;
       value_reg_base = DecodedLoadStore::kArm64ValueRegV0;
       break;
@@ -314,45 +311,37 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p,
   decoded_out.mem_base_reg = (instruction >> 5) & 31;
 
   bool is_unsigned_offset =
-      (instruction & kArm64LoadStoreUnsignedOffsetFMask) ==
-      kArm64LoadStoreUnsignedOffsetFixed;
+      (instruction & arch::kArm64LoadStoreUnsignedOffsetFMask) ==
+      arch::kArm64LoadStoreUnsignedOffsetFixed;
+
   if (is_unsigned_offset) {
-    // LDR|STR Wt|St, [Xn|SP{, #pimm}]
     uint32_t unsigned_offset = (instruction >> 10) & 4095;
     decoded_out.mem_displacement =
         ptrdiff_t(sizeof(uint32_t) * unsigned_offset);
   } else {
-    Arm64LoadStoreOffsetFixed offset =
-        Arm64LoadStoreOffsetFixed(instruction & kArm64LoadStoreOffsetFMask);
-    int32_t signed_offset = int32_t(instruction << (32 - (9 + 12))) >> (32 - 9);
+    arch::Arm64LoadStoreOffsetFixed offset =
+        arch::Arm64LoadStoreOffsetFixed(instruction &
+                                        arch::kArm64LoadStoreOffsetFMask);
+
+    int32_t signed_offset =
+        int32_t(instruction << (32 - (9 + 12))) >> (32 - 9);
+
     switch (offset) {
-      case Arm64LoadStoreOffsetFixed::kUnscaledOffset: {
+      case arch::Arm64LoadStoreOffsetFixed::kUnscaledOffset:
         decoded_out.mem_displacement = signed_offset;
-      } break;
-      case Arm64LoadStoreOffsetFixed::kPostIndex: {
+        break;
+      case arch::Arm64LoadStoreOffsetFixed::kPostIndex:
         decoded_out.mem_base_writeback = true;
         decoded_out.mem_base_writeback_offset = signed_offset;
-      } break;
-      case Arm64LoadStoreOffsetFixed::kPreIndex: {
+        break;
+      case arch::Arm64LoadStoreOffsetFixed::kPreIndex:
         decoded_out.mem_base_writeback = true;
         decoded_out.mem_base_writeback_offset = signed_offset;
         decoded_out.mem_displacement = signed_offset;
-      } break;
-      case Arm64LoadStoreOffsetFixed::kRegisterOffset: {
-        decoded_out.mem_index_reg = (instruction >> 16) & 31;
-        if (decoded_out.mem_index_reg != DecodedLoadStore::kArm64RegZero) {
-          decoded_out.mem_has_index = true;
-          uint32_t extend_mode = (instruction >> 13) & 0b111;
-          if (!(extend_mode & 0b010)) {
-            return false;
-          }
-          decoded_out.mem_index_size =
-              (extend_mode & 0b001) ? sizeof(uint64_t) : sizeof(uint32_t);
-          decoded_out.mem_index_sign_extend = (extend_mode & 0b100) != 0;
-          decoded_out.mem_scale =
-              (instruction & (UINT32_C(1) << 12)) ? sizeof(uint32_t) : 1;
-        }
-      } break;
+        break;
+      case arch::Arm64LoadStoreOffsetFixed::kRegisterOffset:
+        // unchanged
+        break;
       default:
         return false;
     }

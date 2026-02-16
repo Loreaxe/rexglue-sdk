@@ -409,12 +409,20 @@ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b) {
 
 // Vector Shift Left - shift entire 128-bit vector left by bits in low 3 bits of b
 inline simde__m128i simde_mm_vsl(simde__m128i a, simde__m128i b) {
-    int shift = simde_mm_extract_epi8(b, 15) & 0x7;  // Get low 3 bits from byte 15 (BE: byte 0)
-    if (shift == 0) return a;
-    // Split into high and low 64-bit parts
-    simde__m128i low_shifted = simde_mm_slli_epi64(a, shift);
-    simde__m128i high_carry = simde_mm_srli_epi64(a, 64 - shift);
-    // Shift the carry from low qword to high qword position
+    int shift = simde_mm_extract_epi8(b, 15) & 0x7;  // low 3 bits
+
+    if (shift == 0)
+        return a;
+
+    // Broadcast shift counts into vector form (required for variable shifts)
+    simde__m128i shift_vec     = simde_mm_set1_epi64x((int64_t)shift);
+    simde__m128i inv_shift_vec = simde_mm_set1_epi64x((int64_t)(64 - shift));
+
+    // Shift each 64-bit lane
+    simde__m128i low_shifted = simde_mm_sll_epi64(a, shift_vec);
+    simde__m128i high_carry  = simde_mm_srl_epi64(a, inv_shift_vec);
+
+    // Move carry from low qword into high qword position
     high_carry = simde_mm_slli_si128(high_carry, 8);
     return simde_mm_or_si128(low_shifted, high_carry);
 }
