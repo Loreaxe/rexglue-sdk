@@ -232,6 +232,7 @@ bool build_fmadd(BuilderContext& ctx);
 bool build_fmadds(BuilderContext& ctx);
 bool build_fmsub(BuilderContext& ctx);
 bool build_fmsubs(BuilderContext& ctx);
+bool build_fnmadd(BuilderContext& ctx);
 bool build_fnmadds(BuilderContext& ctx);
 bool build_fnmsub(BuilderContext& ctx);
 bool build_fnmsubs(BuilderContext& ctx);

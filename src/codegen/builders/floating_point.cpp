@@ -234,6 +234,15 @@ bool build_fmsubs(BuilderContext& ctx)
     return true;
 }
 
+bool build_fnmadd(BuilderContext& ctx)
+{
+    ctx.emit_set_flush_mode(false);
+    ctx.println("\t{}.f64 = -({}.f64 * {}.f64 + {}.f64);",
+        ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]),
+        ctx.f(ctx.insn.operands[2]), ctx.f(ctx.insn.operands[3]));
+    return true;
+}
+
 bool build_fnmadds(BuilderContext& ctx)
 {
     ctx.emit_set_flush_mode(false);
