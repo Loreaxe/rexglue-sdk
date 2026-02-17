@@ -323,6 +323,12 @@ bool build_vsubuhm(BuilderContext& ctx)
     return true;
 }
 
+bool build_vsubuwm(BuilderContext& ctx)
+{
+    ctx.emit_vec_int_binary("sub_epi32", "u32");
+    return true;
+}
+
 bool build_vmaxsw(BuilderContext& ctx)
 {
     ctx.emit_vec_int_binary("max_epi32", "u32");

@@ -432,6 +432,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable()
         { PPC_INST_VSUBUBS, build_vsububs },
         { PPC_INST_VSUBUWS, build_vsubuws },
         { PPC_INST_VSUBUHM, build_vsubuhm },
+        { PPC_INST_VSUBUWM, build_vsubuwm },
         { PPC_INST_VSUBSHS, build_vsubshs },
         { PPC_INST_VMAXSW, build_vmaxsw },
         { PPC_INST_VMAXSH, build_vmaxsh },
