@@ -13,7 +13,6 @@ set(REQUIRED_SUBMODULES
     xxHash
     spdlog
     fmt
-    date
     snappy
     utfcpp
     imgui
@@ -133,15 +132,6 @@ set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
 set(SPDLOG_INSTALL ON CACHE BOOL "" FORCE)
 add_subdirectory(spdlog)
 target_compile_options(spdlog PRIVATE -w)
-
-#=============================================================================
-# date - Date and time library
-#=============================================================================
-set(ENABLE_DATE_TESTING OFF CACHE BOOL "" FORCE)
-set(ENABLE_DATE_INSTALL ON CACHE BOOL "" FORCE)
-set(BUILD_TZ_LIB ON CACHE BOOL "" FORCE)
-set(USE_SYSTEM_TZ_DB ON CACHE BOOL "" FORCE)
-add_subdirectory(date)
 
 #=============================================================================
 # snappy - Fast compression/decompression (GPU traces)

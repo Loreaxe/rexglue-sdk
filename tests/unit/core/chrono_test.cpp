@@ -138,10 +138,10 @@ struct TimeFields {
 // Decompose a FILETIME exactly as RtlTimeToTimeFields_entry does
 static TimeFields decompose(uint64_t filetime) {
   auto tp = WinSystemClock::to_sys(WinSystemClock::from_file_time(filetime));
-  auto dp = date::floor<date::days>(tp);
-  auto ymd = date::year_month_day{dp};
-  auto wd = date::weekday{dp};
-  auto time = date::hh_mm_ss{date::floor<std::chrono::milliseconds>(tp - dp)};
+  auto dp = std::chrono::floor<std::chrono::days>(tp);
+  auto ymd = std::chrono::year_month_day{dp};
+  auto wd = std::chrono::weekday{dp};
+  auto time = std::chrono::hh_mm_ss{std::chrono::floor<std::chrono::milliseconds>(tp - dp)};
   return {
       static_cast<int>(ymd.year()),
       static_cast<unsigned>(ymd.month()),
@@ -233,9 +233,9 @@ TEST_CASE("calendar decomposition: 2021-01-01", "[chrono]") {
 // Recompose fields to FILETIME exactly as RtlTimeFieldsToTime_entry does
 static uint64_t recompose(int y, unsigned m, unsigned d,
                           int hour, int min, int sec, int ms) {
-  auto ymd = date::year_month_day{date::year{y}, date::month{m}, date::day{d}};
+  auto ymd = std::chrono::year_month_day{std::chrono::year{y}, std::chrono::month{m}, std::chrono::day{d}};
   if (!ymd.ok()) return 0;
-  auto dp = static_cast<date::sys_days>(ymd);
+  auto dp = static_cast<std::chrono::sys_days>(ymd);
   std::chrono::system_clock::time_point time = dp;
   time += std::chrono::hours{hour};
   time += std::chrono::minutes{min};
@@ -264,19 +264,19 @@ TEST_CASE("calendar recomposition: decompose then recompose round-trips", "[chro
 
 TEST_CASE("year_month_day::ok rejects invalid dates", "[chrono]") {
   // Feb 30 - never valid
-  CHECK_FALSE(date::year_month_day{date::year{2000}, date::month{2}, date::day{30}}.ok());
+  CHECK_FALSE(std::chrono::year_month_day{std::chrono::year{2000}, std::chrono::month{2}, std::chrono::day{30}}.ok());
   // Month 13 - invalid month
-  CHECK_FALSE(date::year_month_day{date::year{2000}, date::month{13}, date::day{1}}.ok());
+  CHECK_FALSE(std::chrono::year_month_day{std::chrono::year{2000}, std::chrono::month{13}, std::chrono::day{1}}.ok());
   // Day 0 - invalid day
-  CHECK_FALSE(date::year_month_day{date::year{2000}, date::month{1}, date::day{0}}.ok());
+  CHECK_FALSE(std::chrono::year_month_day{std::chrono::year{2000}, std::chrono::month{1}, std::chrono::day{0}}.ok());
   // Feb 29 in non-leap year
-  CHECK_FALSE(date::year_month_day{date::year{2001}, date::month{2}, date::day{29}}.ok());
+  CHECK_FALSE(std::chrono::year_month_day{std::chrono::year{2001}, std::chrono::month{2}, std::chrono::day{29}}.ok());
   // Feb 29 in leap year - valid
-  CHECK(date::year_month_day{date::year{2000}, date::month{2}, date::day{29}}.ok());
+  CHECK(std::chrono::year_month_day{std::chrono::year{2000}, std::chrono::month{2}, std::chrono::day{29}}.ok());
   // Century non-leap: 1900 is not a leap year
-  CHECK_FALSE(date::year_month_day{date::year{1900}, date::month{2}, date::day{29}}.ok());
+  CHECK_FALSE(std::chrono::year_month_day{std::chrono::year{1900}, std::chrono::month{2}, std::chrono::day{29}}.ok());
   // 400-year leap: 2000 is a leap year (already checked above, but explicit)
-  CHECK(date::year_month_day{date::year{2000}, date::month{2}, date::day{29}}.ok());
+  CHECK(std::chrono::year_month_day{std::chrono::year{2000}, std::chrono::month{2}, std::chrono::day{29}}.ok());
 }
 
 TEST_CASE("recompose returns 0 for invalid dates", "[chrono]") {
@@ -291,7 +291,7 @@ TEST_CASE("recompose returns 0 for invalid dates", "[chrono]") {
 // =============================================================================
 
 TEST_CASE("weekday c_encoding returns 0=Sunday through 6=Saturday", "[chrono]") {
-  using namespace date;
+  using namespace std::chrono;
 
   // Verify the full range of c_encoding values using known days
   // 2000-01-02 is Sunday (0)

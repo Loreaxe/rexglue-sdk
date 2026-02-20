@@ -494,10 +494,10 @@ void RtlTimeToTimeFields_entry(lpqword_t time_ptr,
   using rex::chrono::WinSystemClock;
   auto tp =
       WinSystemClock::to_sys(WinSystemClock::from_file_time(time_ptr.value()));
-  auto dp = date::floor<date::days>(tp);
-  auto year_month_day = date::year_month_day{dp};
-  auto weekday = date::weekday{dp};
-  auto time = date::hh_mm_ss{date::floor<std::chrono::milliseconds>(tp - dp)};
+  auto dp = std::chrono::floor<std::chrono::days>(tp);
+  auto year_month_day = std::chrono::year_month_day{dp};
+  auto weekday = std::chrono::weekday{dp};
+  auto time = std::chrono::hh_mm_ss{std::chrono::floor<std::chrono::milliseconds>(tp - dp)};
   time_fields_ptr->year = static_cast<int>(year_month_day.year());
   time_fields_ptr->month = static_cast<unsigned>(year_month_day.month());
   time_fields_ptr->day = static_cast<unsigned>(year_month_day.day());
@@ -520,14 +520,14 @@ dword_result_t RtlTimeFieldsToTime_entry(
       time_fields_ptr->milliseconds > 999) {
     return 0;
   }
-  auto year = date::year{time_fields_ptr->year};
-  auto month = date::month{time_fields_ptr->month};
-  auto day = date::day{time_fields_ptr->day};
-  auto year_month_day = date::year_month_day{year, month, day};
+  auto year = std::chrono::year{time_fields_ptr->year};
+  auto month = std::chrono::month{time_fields_ptr->month};
+  auto day = std::chrono::day{time_fields_ptr->day};
+  auto year_month_day = std::chrono::year_month_day{year, month, day};
   if (!year_month_day.ok()) {
     return 0;
   }
-  auto dp = static_cast<date::sys_days>(year_month_day);
+  auto dp = static_cast<std::chrono::sys_days>(year_month_day);
   std::chrono::system_clock::time_point time = dp;
   time += std::chrono::hours{time_fields_ptr->hour};
   time += std::chrono::minutes{time_fields_ptr->minute};

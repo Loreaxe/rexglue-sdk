@@ -61,7 +61,6 @@ endif()
 target_link_libraries(rexcore
     PUBLIC
         fmt::fmt
-        date::date
         simde
         tomlplusplus
         spdlog::spdlog

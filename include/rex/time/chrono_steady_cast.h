@@ -20,7 +20,7 @@
 // epoch as a steady clock in waits. In such cases, include this header and use
 // clock_cast<>().
 
-namespace date {
+namespace std::chrono {
 
 // This conveniently works only for Host time domain because Guest needs
 // additional scaling. Convert XSystemClock to WinSystemClock first if
@@ -72,4 +72,4 @@ struct clock_time_conversion<std::chrono::steady_clock,
   }
 };
 
-}  // namespace date
+}  // namespace std::chrono
