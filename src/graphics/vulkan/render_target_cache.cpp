@@ -1086,12 +1086,42 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
 
+      uint32_t copy_dest_range_unscaled =
+          resolve_info.copy_dest_extent_start - resolve_info.copy_dest_base +
+          resolve_info.copy_dest_extent_length;
+      uint64_t copy_dest_base = resolve_info.copy_dest_base;
+      uint64_t copy_dest_range_length = copy_dest_range_unscaled;
+      uint64_t copy_dest_use_start = resolve_info.copy_dest_extent_start;
+      uint64_t copy_dest_use_length = resolve_info.copy_dest_extent_length;
+      if (draw_resolution_scaled) {
+        if (!texture_cache.GetScaledResolveRange(
+                resolve_info.copy_dest_base, copy_dest_range_unscaled,
+                copy_shader_info.dest_bpe_log2, copy_dest_base,
+                copy_dest_range_length) ||
+            !texture_cache.GetScaledResolveRange(
+                resolve_info.copy_dest_extent_start,
+                resolve_info.copy_dest_extent_length,
+                copy_shader_info.dest_bpe_log2, copy_dest_use_start,
+                copy_dest_use_length)) {
+          REXGPU_ERROR(
+              "VulkanRenderTargetCache: Failed to map scaled resolve "
+              "destination range (base={:08X}, length={:08X})",
+              resolve_info.copy_dest_base, copy_dest_range_unscaled);
+          return false;
+        }
+      }
+
       // Make sure there is memory to write to.
       bool copy_dest_committed;
-      // TODO(Triang3l): Resolution-scaled buffer committing.
-      copy_dest_committed =
-          shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
-                                     resolve_info.copy_dest_extent_length);
+      if (draw_resolution_scaled) {
+        copy_dest_committed = texture_cache.CommitScaledResolveRange(
+            resolve_info.copy_dest_base, copy_dest_range_unscaled,
+            copy_shader_info.dest_bpe_log2);
+      } else {
+        copy_dest_committed =
+            shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
+                                       resolve_info.copy_dest_extent_length);
+      }
       if (!copy_dest_committed) {
         REXGPU_ERROR(
             "VulkanRenderTargetCache: Failed to obtain the resolve destination "
@@ -1107,15 +1137,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                     kStorageBufferCompute);
         if (descriptor_set_dest != VK_NULL_HANDLE) {
           // Write the destination descriptor.
-          // TODO(Triang3l): Scaled resolve buffer binding.
           VkDescriptorBufferInfo write_descriptor_set_dest_buffer_info;
-          write_descriptor_set_dest_buffer_info.buffer = shared_memory.buffer();
-          write_descriptor_set_dest_buffer_info.offset =
-              resolve_info.copy_dest_base;
-          write_descriptor_set_dest_buffer_info.range =
-              resolve_info.copy_dest_extent_start -
-              resolve_info.copy_dest_base +
-              resolve_info.copy_dest_extent_length;
+          write_descriptor_set_dest_buffer_info.buffer =
+              draw_resolution_scaled ? texture_cache.scaled_resolve_buffer()
+                                     : shared_memory.buffer();
+          write_descriptor_set_dest_buffer_info.offset = copy_dest_base;
+          write_descriptor_set_dest_buffer_info.range = copy_dest_range_length;
           VkWriteDescriptorSet write_descriptor_set_dest;
           write_descriptor_set_dest.sType =
               VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1134,11 +1161,15 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                      nullptr);
 
           // Submit the resolve.
-          // TODO(Triang3l): Transition the scaled resolve buffer.
-          shared_memory.Use(VulkanSharedMemory::Usage::kComputeWrite,
-                            std::pair<uint32_t, uint32_t>(
-                                resolve_info.copy_dest_extent_start,
-                                resolve_info.copy_dest_extent_length));
+          if (draw_resolution_scaled) {
+            texture_cache.UseScaledResolveBufferForWrite(copy_dest_use_start,
+                                                         copy_dest_use_length);
+          } else {
+            shared_memory.Use(
+                VulkanSharedMemory::Usage::kComputeWrite,
+                std::pair<uint32_t, uint32_t>(uint32_t(copy_dest_use_start),
+                                              uint32_t(copy_dest_use_length)));
+          }
           UseEdramBuffer(EdramBufferUsage::kComputeRead);
           command_processor_.BindExternalComputePipeline(
               resolve_copy_pipelines_[size_t(copy_shader)]);

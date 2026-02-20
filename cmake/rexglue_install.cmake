@@ -35,6 +35,14 @@ if(REXGLUE_USE_D3D12)
     list(APPEND REXGLUE_INSTALL_TARGETS dxc-headers)
 endif()
 
+if(TARGET amd_fidelityfx_vk)
+    list(APPEND REXGLUE_INSTALL_TARGETS amd_fidelityfx_vk)
+endif()
+
+if(TARGET amd_fidelityfx_dx12)
+    list(APPEND REXGLUE_INSTALL_TARGETS amd_fidelityfx_dx12)
+endif()
+
 install(TARGETS ${REXGLUE_INSTALL_TARGETS}
     EXPORT rexglueTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

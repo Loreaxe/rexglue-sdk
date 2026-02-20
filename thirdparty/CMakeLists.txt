@@ -26,6 +26,10 @@ if(REXGLUE_USE_VULKAN)
     )
 endif()
 
+if(REXGLUE_ENABLE_FIDELITYFX)
+    list(APPEND REQUIRED_SUBMODULES FidelityFX)
+endif()
+
 if(REXGLUE_BUILD_TESTS)
     list(APPEND REQUIRED_SUBMODULES catch2)
 endif()
@@ -168,6 +172,42 @@ if(REXGLUE_USE_VULKAN)
     target_link_libraries(volk PUBLIC Vulkan::Headers)
     target_link_libraries(volk_headers INTERFACE Vulkan::Headers)
     target_compile_options(volk PRIVATE -w)
+endif()
+
+#=============================================================================
+# FidelityFX (optional)
+#=============================================================================
+if(REXGLUE_ENABLE_FIDELITYFX)
+    if(REXGLUE_USE_VULKAN)
+        set(FFX_API_BACKEND VK_X64 CACHE STRING "" FORCE)
+    elseif(REXGLUE_USE_D3D12)
+        set(FFX_API_BACKEND DX12_X64 CACHE STRING "" FORCE)
+    else()
+        message(FATAL_ERROR "FidelityFX requires a supported graphics backend")
+    endif()
+
+    set(FFX_API_ENABLE_FRAMEGEN_PROVIDER OFF CACHE BOOL "" FORCE)
+    if(WIN32)
+        set(FFX_API_AUTO_COMPILE_SHADERS ON CACHE BOOL "" FORCE)
+    else()
+        set(FFX_API_AUTO_COMPILE_SHADERS OFF CACHE BOOL "" FORCE)
+    endif()
+    add_subdirectory(FidelityFX/ffx-api EXCLUDE_FROM_ALL)
+
+    # The upstream FidelityFX targets expose source-tree include paths in
+    # INTERFACE_INCLUDE_DIRECTORIES, which breaks our install export checks.
+    # We only link against these targets internally, so no public includes are
+    # needed on the exported interface.
+    if(TARGET amd_fidelityfx_vk)
+        set_target_properties(amd_fidelityfx_vk PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES ""
+        )
+    endif()
+    if(TARGET amd_fidelityfx_dx12)
+        set_target_properties(amd_fidelityfx_dx12 PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES ""
+        )
+    endif()
 endif()
 
 #=============================================================================

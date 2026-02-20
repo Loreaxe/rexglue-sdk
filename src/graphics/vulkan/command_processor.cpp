@@ -34,6 +34,7 @@
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/graphics/xenos.h>
+#include <rex/kernel/xboxkrnl/video.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -272,11 +273,26 @@ bool VulkanCommandProcessor::SetupContext() {
   uint32_t shared_memory_binding_count = UINT32_C(1)
                                          << shared_memory_binding_count_log2;
 
+  uint32_t draw_resolution_scale_x, draw_resolution_scale_y;
+  bool draw_resolution_scale_not_clamped =
+      TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x,
+                                                 draw_resolution_scale_y);
+  if (!draw_resolution_scale_not_clamped) {
+    REXGPU_WARN(
+        "The requested draw resolution scale is not supported by the "
+        "emulator, reducing to {}x{}",
+        draw_resolution_scale_x, draw_resolution_scale_y);
+  }
+  if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
+    REXGPU_WARN(
+        "Vulkan draw resolution scaling is experimental and may not affect all "
+        "titles correctly");
+  }
+
   // Requires the transient descriptor set layouts.
-  // TODO(Triang3l): Get the actual draw resolution scale when the texture cache
-  // supports resolution scaling.
   render_target_cache_ = std::make_unique<VulkanRenderTargetCache>(
-      *register_file_, *memory_, trace_writer_, 1, 1, *this);
+      *register_file_, *memory_, trace_writer_, draw_resolution_scale_x,
+      draw_resolution_scale_y, *this);
   if (!render_target_cache_->Initialize(shared_memory_binding_count)) {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
@@ -339,9 +355,10 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   // Requires the transient descriptor set layouts.
-  // TODO(Triang3l): Actual draw resolution scale.
   texture_cache_ =
-      VulkanTextureCache::Create(*register_file_, *shared_memory_, 1, 1, *this,
+      VulkanTextureCache::Create(*register_file_, *shared_memory_,
+                                 draw_resolution_scale_x,
+                                 draw_resolution_scale_y, *this,
                                  guest_shader_pipeline_stages_);
   if (!texture_cache_) {
     REXGPU_ERROR("Failed to initialize the texture cache");
@@ -1255,8 +1272,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
     return;
   }
 
-  // Obtaining the actual front buffer size to pass to RefreshGuestOutput,
-  // resolution-scaled if it's a resolve destination, or not otherwise.
+  // Obtain the actual swap source texture size (resolution-scaled if it's a
+  // resolve destination, or not otherwise).
   uint32_t frontbuffer_width_scaled, frontbuffer_height_scaled;
   xenos::TextureFormat frontbuffer_format;
   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
@@ -1265,14 +1282,31 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
     return;
   }
-  REXGPU_DEBUG("XELOG_GPU PRESENT: swap_texture_view={:p} scaled_size={}x{} format={}",
-         static_cast<void*>(swap_texture_view), frontbuffer_width_scaled,
-         frontbuffer_height_scaled, static_cast<uint32_t>(frontbuffer_format));
+  uint32_t guest_output_width = frontbuffer_width;
+  uint32_t guest_output_height = frontbuffer_height;
+  // Fall back to the source texture size if the swap command didn't provide a
+  // valid guest frontbuffer size.
+  if (!guest_output_width || !guest_output_height) {
+    guest_output_width = frontbuffer_width_scaled;
+    guest_output_height = frontbuffer_height_scaled;
+  }
+  REXGPU_DEBUG(
+      "XELOG_GPU PRESENT: swap_texture_view={:p} src_size={}x{} "
+      "guest_output_size={}x{} format={}",
+      static_cast<void*>(swap_texture_view), frontbuffer_width_scaled,
+      frontbuffer_height_scaled, guest_output_width, guest_output_height,
+      static_cast<uint32_t>(frontbuffer_format));
+
+  kernel::X_VIDEO_MODE video_mode;
+  kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+  uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
+  uint32_t display_height =
+      std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
   presenter->RefreshGuestOutput(
-      frontbuffer_width_scaled, frontbuffer_height_scaled, 1280, 720,
-      [this, frontbuffer_width_scaled, frontbuffer_height_scaled,
-       frontbuffer_format, swap_texture_view](
+      guest_output_width, guest_output_height, display_width, display_height,
+      [this, guest_output_width, guest_output_height, frontbuffer_format,
+       swap_texture_view](
           ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
@@ -1444,8 +1478,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
               swap_apply_gamma_render_pass_;
           swap_framebuffer_create_info.attachmentCount = 1;
           swap_framebuffer_create_info.pAttachments = &guest_output_image_view;
-          swap_framebuffer_create_info.width = frontbuffer_width_scaled;
-          swap_framebuffer_create_info.height = frontbuffer_height_scaled;
+          swap_framebuffer_create_info.width = guest_output_width;
+          swap_framebuffer_create_info.height = guest_output_height;
           swap_framebuffer_create_info.layers = 1;
           if (dfn.vkCreateFramebuffer(
                   device, &swap_framebuffer_create_info, nullptr,
@@ -1489,10 +1523,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         render_pass_begin_info.framebuffer = swap_framebuffer.framebuffer;
         render_pass_begin_info.renderArea.offset.x = 0;
         render_pass_begin_info.renderArea.offset.y = 0;
-        render_pass_begin_info.renderArea.extent.width =
-            frontbuffer_width_scaled;
-        render_pass_begin_info.renderArea.extent.height =
-            frontbuffer_height_scaled;
+        render_pass_begin_info.renderArea.extent.width = guest_output_width;
+        render_pass_begin_info.renderArea.extent.height = guest_output_height;
         render_pass_begin_info.clearValueCount = 0;
         render_pass_begin_info.pClearValues = nullptr;
         deferred_command_buffer_.CmdVkBeginRenderPass(
@@ -1501,16 +1533,16 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         VkViewport viewport;
         viewport.x = 0.0f;
         viewport.y = 0.0f;
-        viewport.width = float(frontbuffer_width_scaled);
-        viewport.height = float(frontbuffer_height_scaled);
+        viewport.width = float(guest_output_width);
+        viewport.height = float(guest_output_height);
         viewport.minDepth = 0.0f;
         viewport.maxDepth = 1.0f;
         SetViewport(viewport);
         VkRect2D scissor;
         scissor.offset.x = 0;
         scissor.offset.y = 0;
-        scissor.extent.width = frontbuffer_width_scaled;
-        scissor.extent.height = frontbuffer_height_scaled;
+        scissor.extent.width = guest_output_width;
+        scissor.extent.height = guest_output_height;
         SetScissor(scissor);
 
         BindExternalGraphicsPipeline(

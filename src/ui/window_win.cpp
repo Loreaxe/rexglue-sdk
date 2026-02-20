@@ -12,12 +12,14 @@
 #include <rex/ui/window_win.h>
 
 #include <algorithm>
+#include <charconv>
 #include <memory>
 #include <string>
 
 #include <rex/assert.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/ui/flags.h>
 #include <rex/ui/surface_win.h>
 
 // Must be included before Windows headers for things like NOMINMAX.
@@ -28,6 +30,56 @@
 #include <ShellScalingApi.h>
 #include <dwmapi.h>
 
+namespace {
+
+bool TryGetInt32FlagValue(std::string_view flag_name, int32_t& value_out) {
+  std::string flag_value = rex::cvar::GetFlagByName(flag_name);
+  if (flag_value.empty()) {
+    return false;
+  }
+  int32_t parsed_value = 0;
+  auto [parse_end, parse_error] = std::from_chars(
+      flag_value.data(), flag_value.data() + flag_value.size(), parsed_value);
+  if (parse_error != std::errc() ||
+      parse_end != flag_value.data() + flag_value.size()) {
+    return false;
+  }
+  value_out = parsed_value;
+  return true;
+}
+
+uint32_t ResolveWindowWidth(uint32_t requested_width) {
+  if (REXCVAR_GET(window_width) > 0) {
+    return uint32_t(REXCVAR_GET(window_width));
+  }
+  if (!rex::cvar::HasNonDefaultValue("window_width")) {
+    int32_t linked_width = 0;
+    if (rex::cvar::HasNonDefaultValue("video_mode_width") &&
+        TryGetInt32FlagValue("video_mode_width", linked_width) &&
+        linked_width > 0) {
+      return uint32_t(linked_width);
+    }
+  }
+  return requested_width;
+}
+
+uint32_t ResolveWindowHeight(uint32_t requested_height) {
+  if (REXCVAR_GET(window_height) > 0) {
+    return uint32_t(REXCVAR_GET(window_height));
+  }
+  if (!rex::cvar::HasNonDefaultValue("window_height")) {
+    int32_t linked_height = 0;
+    if (rex::cvar::HasNonDefaultValue("video_mode_height") &&
+        TryGetInt32FlagValue("video_mode_height", linked_height) &&
+        linked_height > 0) {
+      return uint32_t(linked_height);
+    }
+  }
+  return requested_height;
+}
+
+}  // namespace
+
 namespace rex {
 namespace ui {
 
@@ -35,6 +87,8 @@ std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
                                        const std::string_view title,
                                        uint32_t desired_logical_width,
                                        uint32_t desired_logical_height) {
+  desired_logical_width = ResolveWindowWidth(desired_logical_width);
+  desired_logical_height = ResolveWindowHeight(desired_logical_height);
   return std::make_unique<Win32Window>(
       app_context, title, desired_logical_width, desired_logical_height);
 }
