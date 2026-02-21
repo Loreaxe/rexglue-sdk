@@ -12,6 +12,7 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -41,8 +42,31 @@ REXCVAR_DEFINE_BOOL(trace_gpu_stream, false,
     "Enable GPU trace streaming",
     "GPU");
 
+REXCVAR_DEFINE_STRING(swap_post_effect, "none",
+    "Swap post effect: none, fxaa, fxaa_extreme",
+    "GPU")
+    .allowed({"none", "fxaa", "fxaa_extreme"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace {
 constexpr bool kStoreShaders = true;
+
+rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+    const std::string& effect_name) {
+  std::string lowered = effect_name;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](unsigned char c) {
+                   c = static_cast<unsigned char>(std::tolower(c));
+                   return c == '-' ? '_' : char(c);
+                 });
+  if (lowered == "fxaa") {
+    return rex::graphics::CommandProcessor::SwapPostEffect::kFxaa;
+  }
+  if (lowered == "fxaa_extreme" || lowered == "extreme") {
+    return rex::graphics::CommandProcessor::SwapPostEffect::kFxaaExtreme;
+  }
+  return rex::graphics::CommandProcessor::SwapPostEffect::kNone;
+}
 }  // namespace
 
 namespace rex::graphics {
@@ -100,6 +124,8 @@ X_STATUS GraphicsSystem::Setup(runtime::Processor* processor,
       REXGPU_ERROR("Unable to initialize command processor");
       return X_STATUS_UNSUCCESSFUL;
     }
+  command_processor_->SetDesiredSwapPostEffect(
+      ParseSwapPostEffect(REXCVAR_GET(swap_post_effect)));
 
   // Register GPU MMIO handlers
   // GPU registers are at 0x7FC80000-0x7FCFFFFF

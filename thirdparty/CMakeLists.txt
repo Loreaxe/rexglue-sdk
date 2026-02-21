@@ -178,12 +178,45 @@ endif()
 # FidelityFX (optional)
 #=============================================================================
 if(REXGLUE_ENABLE_FIDELITYFX)
-    if(REXGLUE_USE_VULKAN)
+    set(REXGLUE_FIDELITYFX_BACKEND "auto" CACHE STRING
+        "FidelityFX backend to build (auto, vk, dx12)")
+    set_property(CACHE REXGLUE_FIDELITYFX_BACKEND PROPERTY STRINGS auto vk dx12)
+    set(_rexglue_fidelityfx_backend "${REXGLUE_FIDELITYFX_BACKEND}")
+    string(TOLOWER "${_rexglue_fidelityfx_backend}" _rexglue_fidelityfx_backend)
+
+    if(_rexglue_fidelityfx_backend STREQUAL "auto")
+        if(WIN32 AND REXGLUE_USE_D3D12)
+            set(_rexglue_fidelityfx_backend "dx12")
+        elseif(REXGLUE_USE_VULKAN)
+            set(_rexglue_fidelityfx_backend "vk")
+        elseif(REXGLUE_USE_D3D12)
+            set(_rexglue_fidelityfx_backend "dx12")
+        endif()
+    endif()
+
+    if(_rexglue_fidelityfx_backend STREQUAL "vk")
+        if(NOT REXGLUE_USE_VULKAN)
+            message(FATAL_ERROR
+                "REXGLUE_FIDELITYFX_BACKEND=vk requires REXGLUE_USE_VULKAN=ON")
+        endif()
         set(FFX_API_BACKEND VK_X64 CACHE STRING "" FORCE)
-    elseif(REXGLUE_USE_D3D12)
+    elseif(_rexglue_fidelityfx_backend STREQUAL "dx12")
+        if(NOT REXGLUE_USE_D3D12)
+            message(FATAL_ERROR
+                "REXGLUE_FIDELITYFX_BACKEND=dx12 requires REXGLUE_USE_D3D12=ON")
+        endif()
         set(FFX_API_BACKEND DX12_X64 CACHE STRING "" FORCE)
-    else()
+    elseif(_rexglue_fidelityfx_backend STREQUAL "")
         message(FATAL_ERROR "FidelityFX requires a supported graphics backend")
+    else()
+        message(FATAL_ERROR
+            "Invalid REXGLUE_FIDELITYFX_BACKEND='${REXGLUE_FIDELITYFX_BACKEND}' "
+            "(expected auto, vk, or dx12)")
+    endif()
+
+    if(REXGLUE_USE_VULKAN AND REXGLUE_USE_D3D12)
+        message(STATUS
+            "FidelityFX backend selected for this build: ${_rexglue_fidelityfx_backend}")
     endif()
 
     set(FFX_API_ENABLE_FRAMEGEN_PROVIDER OFF CACHE BOOL "" FORCE)

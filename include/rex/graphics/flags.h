@@ -60,9 +60,11 @@ REXCVAR_DECLARE(bool, dxbc_source_map);
 // GPU Tracing
 REXCVAR_DECLARE(std::string, trace_gpu_prefix);
 REXCVAR_DECLARE(bool, trace_gpu_stream);
+REXCVAR_DECLARE(std::string, swap_post_effect);
 
 // Vulkan specific
 REXCVAR_DECLARE(bool, vulkan_sparse_shared_memory);
+REXCVAR_DECLARE(bool, vulkan_readback_resolve);
 REXCVAR_DECLARE(std::string, render_target_path_vulkan);
 REXCVAR_DECLARE(bool, non_seamless_cube_map);
 

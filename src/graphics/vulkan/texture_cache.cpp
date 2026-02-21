@@ -2990,9 +2990,10 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
       break;
     case VulkanTexture::Usage::kSwapSampled:
       // The swap texture is likely to be used only for the presentation
-      // fragment shader, and not during emulation, where it'd be used in other
-      // stages.
-      stage_mask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+      // post-processing passes, and not during emulation where it'd be used in
+      // other stages.
+      stage_mask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
       access_mask = VK_ACCESS_SHADER_READ_BIT;
       layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       break;
