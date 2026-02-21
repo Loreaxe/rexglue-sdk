@@ -40,6 +40,10 @@ endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
+# Keep installed runtime artifacts in lib (executables, shared libraries, DLLs).
+set(CMAKE_INSTALL_BINDIR "${CMAKE_INSTALL_LIBDIR}" CACHE STRING
+    "Install path for runtime programs" FORCE)
+
 # Enforce Clang18 compiler
 if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     message(FATAL_ERROR "ReXGlue requires Clang compiler. Please set CMAKE_CXX_COMPILER to clang++")
