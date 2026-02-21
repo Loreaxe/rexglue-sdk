@@ -509,4 +509,11 @@ bool build_srw(BuilderContext& ctx)
     return true;
 }
 
+bool build_crand(BuilderContext& ctx)
+{
+    // crand: CR[crD] = CR[crA] & CR[crB]
+    emitCRBitOperation(ctx, "&");
+    return true;
+}
+
 } // namespace rexglue::codegen::builders

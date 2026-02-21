@@ -101,6 +101,8 @@ bool build_xor(BuilderContext& ctx);
 bool build_xori(BuilderContext& ctx);
 bool build_xoris(BuilderContext& ctx);
 
+// Conditional Register operations
+bool build_crand(BuilderContext& ctx);
 // Equivalence (XNOR)
 bool build_eqv(BuilderContext& ctx);
 

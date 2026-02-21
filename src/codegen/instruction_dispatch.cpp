@@ -97,6 +97,9 @@ static const std::unordered_map<int, Builder>& GetDispatchTable()
         { PPC_INST_SRW, build_srw },
 
         //=====================================================================
+        // Conditional Register
+        //=====================================================================
+		{ PPC_INST_CRAND, build_crand },
         // Comparison
         //=====================================================================
         { PPC_INST_CMPD, build_cmpd },
