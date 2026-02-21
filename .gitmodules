@@ -58,4 +58,4 @@
 	url = https://github.com/CLIUtils/CLI11
 [submodule "thirdparty/FidelityFX"]
 	path = thirdparty/FidelityFX
-	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
+	url = https://github.com/rexglue/FidelityFX-SDK.git
