@@ -125,6 +125,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();
   void InitializeTraceCompleteDownloads();
+  void RestoreEdramSnapshot(const void* snapshot);
 
   bool Update(bool is_rasterization_done,
               reg::RB_DEPTHCONTROL normalized_depth_control,
@@ -929,6 +930,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkDeviceMemory edram_snapshot_download_buffer_memory_ = VK_NULL_HANDLE;
   uint32_t edram_snapshot_download_buffer_memory_type_ = UINT32_MAX;
   VkDeviceSize edram_snapshot_download_buffer_memory_size_ = 0;
+  std::unique_ptr<ui::vulkan::VulkanUploadBufferPool>
+      edram_snapshot_restore_pool_;
   void ResetTraceDownload();
 
   // For pixel (fragment) shader interlock.

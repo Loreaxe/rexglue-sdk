@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -136,6 +137,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   ~VulkanCommandProcessor();
 
   void ClearCaches() override;
+  void InitializeShaderStorage(const std::filesystem::path& cache_root,
+                               uint32_t title_id, bool blocking) override;
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
@@ -146,6 +149,10 @@ class VulkanCommandProcessor : public CommandProcessor {
                graphics_system_->provider())
         ->vulkan_device();
   }
+
+  bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
+                          std::vector<uint32_t>& spirv_out,
+                          std::string& error_out) const;
 
   // Returns the deferred drawing command list for the currently open
   // submission.

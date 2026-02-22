@@ -306,16 +306,16 @@ void main() {
 )";
 }
 
-bool CompileComputeGlslToSpirv(std::string_view source,
-                               std::vector<uint32_t>& spirv_out,
-                               std::string& error_out) {
+bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
+                                std::vector<uint32_t>& spirv_out,
+                                std::string& error_out) {
   static std::once_flag glslang_initialize_once;
   std::call_once(glslang_initialize_once, []() { glslang::InitializeProcess(); });
 
   const char* source_c_str = source.data();
-  glslang::TShader shader(EShLangCompute);
+  glslang::TShader shader(stage);
   shader.setStrings(&source_c_str, 1);
-  shader.setEnvInput(glslang::EShSourceGlsl, EShLangCompute,
+  shader.setEnvInput(glslang::EShSourceGlsl, stage,
                      glslang::EShClientVulkan, 450);
   shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
   shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
@@ -343,10 +343,9 @@ bool CompileComputeGlslToSpirv(std::string_view source,
     return false;
   }
 
-  const glslang::TIntermediate* intermediate =
-      program.getIntermediate(EShLangCompute);
+  const glslang::TIntermediate* intermediate = program.getIntermediate(stage);
   if (intermediate == nullptr) {
-    error_out = "glslang produced no compute intermediate";
+    error_out = "glslang produced no stage intermediate";
     return false;
   }
 
@@ -425,13 +424,24 @@ void VulkanCommandProcessor::ClearCaches() {
   cache_clear_requested_ = true;
 }
 
+void VulkanCommandProcessor::InitializeShaderStorage(
+    const std::filesystem::path& cache_root, uint32_t title_id, bool blocking) {
+  CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
+  pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
+}
+
 void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr,
                                                       uint32_t length) {
   shared_memory_->MemoryInvalidationCallback(base_ptr, length, true);
   primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
 }
 
-void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {}
+void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+  if (!BeginSubmission(true)) {
+    return;
+  }
+  render_target_cache_->RestoreEdramSnapshot(snapshot);
+}
 
 std::string VulkanCommandProcessor::GetWindowTitleText() const {
   std::ostringstream title;
@@ -459,6 +469,37 @@ std::string VulkanCommandProcessor::GetWindowTitleText() const {
   return title.str();
 }
 
+bool VulkanCommandProcessor::CompileGlslToSpirv(
+    VkShaderStageFlagBits stage, std::string_view source,
+    std::vector<uint32_t>& spirv_out, std::string& error_out) const {
+  EShLanguage glslang_stage;
+  switch (stage) {
+    case VK_SHADER_STAGE_VERTEX_BIT:
+      glslang_stage = EShLangVertex;
+      break;
+    case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
+      glslang_stage = EShLangTessControl;
+      break;
+    case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:
+      glslang_stage = EShLangTessEvaluation;
+      break;
+    case VK_SHADER_STAGE_GEOMETRY_BIT:
+      glslang_stage = EShLangGeometry;
+      break;
+    case VK_SHADER_STAGE_FRAGMENT_BIT:
+      glslang_stage = EShLangFragment;
+      break;
+    case VK_SHADER_STAGE_COMPUTE_BIT:
+      glslang_stage = EShLangCompute;
+      break;
+    default:
+      error_out = fmt::format("Unsupported Vulkan shader stage mask {}",
+                              uint32_t(stage));
+      return false;
+  }
+  return CompileGlslToSpirvInternal(glslang_stage, source, spirv_out, error_out);
+}
+
 bool VulkanCommandProcessor::SetupContext() {
   if (!CommandProcessor::SetupContext()) {
     REXGPU_ERROR("Failed to initialize base command processor context");
@@ -480,8 +521,10 @@ bool VulkanCommandProcessor::SetupContext() {
   guest_shader_vertex_stages_ = VK_SHADER_STAGE_VERTEX_BIT;
   if (device_properties.tessellationShader) {
     guest_shader_pipeline_stages_ |=
+        VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
         VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT;
-    guest_shader_vertex_stages_ |= VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+    guest_shader_vertex_stages_ |= VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                   VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
   }
   if (!device_properties.vertexPipelineStoresAndAtomics) {
     // For memory export from vertex shaders converted to compute shaders.
@@ -1589,8 +1632,9 @@ bool VulkanCommandProcessor::SetupContext() {
   // FXAA compute pipelines, compiled to SPIR-V at runtime.
   std::vector<uint32_t> swap_fxaa_spirv;
   std::string swap_fxaa_compile_error;
-  if (!CompileComputeGlslToSpirv(GetSwapFxaaComputeSource(false),
-                                 swap_fxaa_spirv, swap_fxaa_compile_error)) {
+  if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT,
+                          GetSwapFxaaComputeSource(false), swap_fxaa_spirv,
+                          swap_fxaa_compile_error)) {
     REXGPU_WARN("Failed to compile FXAA compute shader to SPIR-V: {}",
                 swap_fxaa_compile_error);
   } else {
@@ -1604,9 +1648,10 @@ bool VulkanCommandProcessor::SetupContext() {
 
   std::vector<uint32_t> swap_fxaa_extreme_spirv;
   std::string swap_fxaa_extreme_compile_error;
-  if (!CompileComputeGlslToSpirv(GetSwapFxaaComputeSource(true),
-                                 swap_fxaa_extreme_spirv,
-                                 swap_fxaa_extreme_compile_error)) {
+  if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT,
+                          GetSwapFxaaComputeSource(true),
+                          swap_fxaa_extreme_spirv,
+                          swap_fxaa_extreme_compile_error)) {
     REXGPU_WARN(
         "Failed to compile extreme FXAA compute shader to SPIR-V: {}",
         swap_fxaa_extreme_compile_error);
@@ -4003,6 +4048,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
     EndRenderPass();
 
+    pipeline_cache_->EndSubmission();
+
     render_target_cache_->EndSubmission();
 
     primitive_processor_->EndSubmission();
@@ -4613,6 +4660,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
   auto vgt_indx_offset = regs.Get<int32_t>(XE_GPU_REG_VGT_INDX_OFFSET);
+  auto vgt_max_vtx_indx = regs.Get<uint32_t>(XE_GPU_REG_VGT_MAX_VTX_INDX);
+  auto vgt_min_vtx_indx = regs.Get<uint32_t>(XE_GPU_REG_VGT_MIN_VTX_INDX);
 
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() ==
@@ -4766,6 +4815,25 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   // Vertex index offset.
   dirty |= system_constants_.vertex_base_index != vgt_indx_offset;
   system_constants_.vertex_base_index = vgt_indx_offset;
+
+  // Vertex index range.
+  dirty |= system_constants_.vertex_index_min != vgt_min_vtx_indx;
+  dirty |= system_constants_.vertex_index_max != vgt_max_vtx_indx;
+  system_constants_.vertex_index_min = vgt_min_vtx_indx;
+  system_constants_.vertex_index_max = vgt_max_vtx_indx;
+
+  // Tessellation factor range, plus 1.0 according to
+  // https://www.slideshare.net/blackdevilvikas/next-generation-graphics-programming-on-xbox-360.
+  float tessellation_factor_min =
+      regs.Get<float>(XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL) + 1.0f;
+  float tessellation_factor_max =
+      regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
+  dirty |= system_constants_.tessellation_factor_range_min !=
+           tessellation_factor_min;
+  dirty |= system_constants_.tessellation_factor_range_max !=
+           tessellation_factor_max;
+  system_constants_.tessellation_factor_range_min = tessellation_factor_min;
+  system_constants_.tessellation_factor_range_max = tessellation_factor_max;
 
   // Conversion to host normalized device coordinates.
   for (uint32_t i = 0; i < 3; ++i) {
