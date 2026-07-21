@@ -1,3 +1,12 @@
+// @file        rexnet/core/src/subnet.rs
+// @brief       Shard subnet addressing — a shard as a virtual /24 (design spec §17.3.7).
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
 //! Shard subnet addressing — a shard as a virtual /24 (design spec §17.3.7).
 //!
 //! A shard is capped at a /24 worth of hosts because that is what it *is*: a

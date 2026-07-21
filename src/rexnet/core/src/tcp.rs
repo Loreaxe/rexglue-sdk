@@ -1,34 +1,28 @@
-//! Guest TCP over libp2p streams — design spec §18.
+// @file        rexnet/core/src/tcp.rs
+// @brief       Guest TCP over libp2p streams.
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
+//! Guest TCP over libp2p streams — docs/rexnet-design-spec.md §18.1.
 //!
-//! System Link is not UDP-only. SoulCalibur IV listens on **TCP** port 1001
-//! and runs its session over stream sockets, with no `XSession` involvement at
-//! all; the datagram work that carries Fable 2's XRNM does nothing for it. A
-//! guest `SOCK_STREAM` socket therefore needs a real reliable, ordered,
-//! connection-oriented carrier.
-//!
-//! That carrier already exists: the libp2p connection we hold to every peer is
-//! reliable, ordered and multiplexed. Reimplementing TCP over the punched UDP
-//! game plane would be rebuilding it badly, so a guest connection maps onto a
-//! libp2p stream instead.
-//!
-//! The one thing a libp2p stream does not carry is the guest's **port**. A
-//! stream says which peer, never which listener — so each one opens with a
-//! short header naming the destination and source ports. Everything after the
-//! header is the guest's byte stream, unframed and untouched.
+//! System Link titles are not UDP-only, and the libp2p connection is already
+//! reliable and ordered, so a guest SOCK_STREAM maps onto a stream. A stream
+//! names a peer but not a listener, hence the port header below.
 
 use std::collections::HashMap;
 
 use libp2p::PeerId;
 
-/// Identifies one guest TCP connection. Allocated locally and never sent, so
-/// the two ends number the same connection differently — the pairing that
-/// matters is (stream id -> peer, ports), which each side holds for itself.
+/// Allocated locally and never sent: the two ends number the same connection
+/// differently.
 pub type StreamId = u64;
 
-/// Opening header on a `/rexnet/tcp/1.0.0` stream.
-///
-/// Fixed 5 bytes, big-endian to match guest byte order: the shim reads these
-/// values straight into guest structures.
+/// Opening header on a `/rexnet/tcp/1.0.0` stream. Big-endian: the shim reads
+/// these straight into guest structures.
 ///
 /// ```text
 ///   0        1        2        3        4
@@ -58,9 +52,8 @@ impl StreamHeader {
         out
     }
 
-    /// Returns `None` for a truncated or unknown-schema header rather than
-    /// guessing: a stream opened by something that is not us must not be
-    /// mistaken for a guest connection.
+    /// `None` rather than guessing: a stream opened by something that is not
+    /// us must not be mistaken for a guest connection.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < STREAM_HEADER_LEN || bytes[0] != STREAM_SCHEMA {
             return None;
@@ -87,11 +80,8 @@ pub struct StreamInfo {
     pub outbound: bool,
 }
 
-/// Registry of live guest connections.
-///
-/// Deliberately plain: the engine owns the futures that actually move bytes,
-/// and this only answers "what is stream N" and "which streams belong to a
-/// peer that just went away".
+/// The engine owns the futures that move bytes; this only answers "what is
+/// stream N" and "which streams belong to a peer that went away".
 #[derive(Debug, Default)]
 pub struct StreamTable {
     next_id: StreamId,
@@ -128,9 +118,8 @@ impl StreamTable {
         self.streams.is_empty()
     }
 
-    /// Every stream belonging to `peer`. A dropped connection takes its guest
-    /// sockets with it, and the shim has to be told so the guest sees a close
-    /// rather than a socket that silently stops producing data.
+    /// A dropped connection takes its guest sockets with it; the shim must be
+    /// told, or the guest sees a socket that silently stops.
     pub fn streams_for_peer(&self, peer: &PeerId) -> Vec<StreamId> {
         self.streams
             .iter()

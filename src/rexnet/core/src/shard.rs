@@ -1,3 +1,12 @@
+// @file        rexnet/core/src/shard.rs
+// @brief       Ambient title shards.
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
 //! Ambient title shards — design spec §17.3.
 //!
 //! A shard is the "Connected" tier: up to 255 peers playing the same title,

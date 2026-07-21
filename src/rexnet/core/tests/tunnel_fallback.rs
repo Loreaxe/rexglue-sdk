@@ -1,16 +1,17 @@
-//! Game traffic still flows when the punch fails — design spec §5, §14.
+// @file        rexnet/core/tests/tunnel_fallback.rs
+// @brief       Game traffic still flows when the punch fails.
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
+//! Game traffic still flows when the punch fails (§5, §14).
 //!
-//! §14 promises that a CGNAT/symmetric-NAT pair, which cannot hole-punch,
-//! still plays over the control connection rather than silently failing. That
-//! is the one preservation guarantee no amount of local testing exercises:
-//! on a loopback machine every punch succeeds, so the fallback would never run.
-//!
-//! The punch cannot simply be "arranged to fail" on one machine: every node
-//! advertises a loopback candidate, so the punch succeeds no matter how the
-//! sockets are bound. (An earlier version of this test tried and quietly
-//! passed through the *working* path, proving nothing.) The engine therefore
-//! exposes `force_tunnel`, which skips punching outright -- the same switch a
-//! user can set to reproduce a CGNAT player'"'"'s experience locally.
+//! On a loopback machine every punch succeeds, so the fallback would never
+//! run — hence `force_tunnel`, which is also how a user reproduces a CGNAT
+//! player's experience locally.
 
 use std::time::Duration;
 
@@ -186,19 +187,12 @@ async fn traffic_falls_back_to_the_tunnel_when_the_punch_fails() {
     );
 }
 
-/// Sustained game traffic survives the tunnel intact.
+/// 200 datagrams at a game-like rate, each arriving exactly once.
 ///
-/// 200 datagrams at a game-like rate: every one must arrive, exactly once,
-/// with its ports unmangled.
-///
-/// Be clear about what this does and does not show. It is a regression guard
-/// on the new carrier, **not** a reproduction of the failure that motivated
-/// it: the substream exhaustion we hit in a real session came from many
-/// requests in flight at once over a real link, and on loopback each one
-/// completes fast enough that the old request-response tunnel would most
-/// likely have passed this too. What the old carrier could not have passed is
-/// the arithmetic -- 200 datagrams meant 200 substreams, against a per-
-/// connection cap, where this opens one.
+/// A regression guard, not a reproduction of the substream exhaustion that
+/// motivated the rewrite — on loopback the old carrier would likely have
+/// passed this too. What it could not pass is the arithmetic: 200 substreams
+/// against a per-connection cap, where this opens one.
 #[tokio::test(flavor = "multi_thread")]
 async fn sustained_tunnel_traffic_survives() {
     const COUNT: u32 = 200;

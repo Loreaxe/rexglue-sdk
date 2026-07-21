@@ -1,3 +1,12 @@
+// @file        rexnet/core/src/friends.rs
+// @brief       Local friend list (design spec §8.2).
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
 //! Local friend list (design spec §8.2).
 //!
 //! Friendship is mutual-consent: a request/accept exchange is required

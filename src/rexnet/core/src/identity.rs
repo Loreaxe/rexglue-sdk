@@ -1,3 +1,12 @@
+// @file        rexnet/core/src/identity.rs
+// @brief       Persistent ed25519 identity (design spec §3).
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
 //! Persistent ed25519 identity (design spec §3).
 //!
 //! One keypair per install; the derived PeerId is the player's permanent

@@ -1,3 +1,12 @@
+// @file        rexnet/core/src/engine.rs
+// @brief       Async engine: the libp2p swarm, the game-plane UDP socket, and the.
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
 //! Async engine: the libp2p swarm, the game-plane UDP socket, and the
 //! command/event loop.
 //!
@@ -550,15 +559,10 @@ fn spawn_stream_acceptor(
     });
 }
 
-// --- Degraded game plane (§5, §14) ------------------------------------------
+// --- Degraded game plane (§5, §14) ---
 //
-// The tunnel uses one long-lived stream per peer per *direction*: we write on
-// the stream we opened and read from the ones peers open to us. A single
-// stream used both ways would be one fewer substream, but both sides degrade
-// at once in the case this exists for, so both would open simultaneously and
-// need a tie-break to decide whose stream survives. Two one-way streams have
-// no race, and the cost is O(peers), not O(datagrams) — which was the whole
-// point of moving off request-response.
+// One stream per peer per direction: we write on ours, read from theirs. Both
+// sides degrade at once here, so a shared stream would need a tie-break.
 
 /// Messages from the tunnel tasks back into the engine.
 #[derive(Debug)]
@@ -571,13 +575,8 @@ enum TunnelEvent {
     WriterGone { peer: PeerId, error: Option<String> },
 }
 
-/// How many frames may be in flight to a tunnel writer before we start
-/// dropping.
-///
-/// Bounded on purpose. The guest believes it is sending UDP, so when the link
-/// cannot keep up the honest thing is to drop — an unbounded queue would turn
-/// congestion into unbounded memory and ever-growing latency, which is worse
-/// for a game than loss.
+/// Bounded: the guest thinks it is sending UDP, so congestion should drop
+/// rather than grow memory and latency.
 const TUNNEL_WRITE_QUEUE: usize = 64;
 
 /// Write queued frames to a peer's tunnel stream until it dies.
@@ -592,9 +591,7 @@ async fn pump_tunnel_writer(
         if stream.write_all(&frame).await.is_err() {
             break;
         }
-        // Flushed per frame: a game datagram held in a buffer waiting for
-        // company is a datagram delivered late, which is the failure mode
-        // this path is already closest to.
+        // Per frame: a datagram held for company is a datagram delivered late.
         if stream.flush().await.is_err() {
             break;
         }
@@ -640,9 +637,7 @@ async fn pump_tunnel_reader(
             break; // EOF or the connection went away
         }
         let Some((src_port, dst_port, len)) = tunnel::decode_header(&header) else {
-            // A length we will not honour means we have lost framing, and a
-            // byte stream offers no way to resynchronise. Closing is the only
-            // safe move; skipping would misframe everything after it.
+            // Framing is lost and a byte stream cannot resynchronise.
             tracing::warn!(%peer, "tunnel: bad frame header, closing stream");
             break;
         };
@@ -1608,11 +1603,9 @@ impl Engine {
             {
                 continue;
             }
-            // These arrived before the address mapped to a peer, so they could
-            // not be decrypted then -- the key is per peer, and the record
-            // deliberately carries nothing identifying. Now that the peer is
-            // known, open them here. Counters are still inside the replay
-            // window, having only been buffered for a punch.
+            // Buffered before the address mapped to a peer, so they could not
+            // be decrypted then: keys are per peer and records carry nothing
+            // identifying.
             let Some((src_port, dst_port, data)) = self.open_datagram(peer, &frame) else {
                 continue;
             };
@@ -1632,17 +1625,13 @@ impl Engine {
         });
     }
 
-    /// Our X25519 public key for this peer, creating the agreement on first
-    /// use. Reused across punch attempts so both sides always agree (§6).
+    /// Reused across punch attempts so both sides agree (§6.1).
     fn local_game_pubkey(&mut self, peer: PeerId) -> [u8; 32] {
         self.key_agreements.entry(peer).or_default().public_key()
     }
 
-    /// Derive the game-plane keys once the peer's public key arrives.
-    ///
-    /// Deriving again with the same key is harmless but would reset the nonce
-    /// counter and the replay window, so an established session is left alone:
-    /// a repeated offer must not be able to rewind either.
+    /// An established session is left alone: re-deriving would rewind the
+    /// nonce counter and replay window.
     fn establish_game_keys(&mut self, peer: PeerId, peer_pub: [u8; 32]) {
         if self.game_keys.contains_key(&peer) {
             return;
@@ -1652,13 +1641,8 @@ impl Engine {
         tracing::debug!(%peer, "game-plane keys established");
     }
 
-    /// Encrypt one guest datagram for the punched socket.
-    ///
-    /// Returns None when there are no keys, and the caller drops the datagram.
-    /// There is deliberately no plaintext fallback: a peer that could strip
-    /// the key exchange would otherwise be able to downgrade the session, and
-    /// silently sending a player's traffic in the clear is worse than dropping
-    /// it.
+    /// `None` when there are no keys — the caller drops it. No plaintext
+    /// fallback: that would be a downgrade an attacker could force.
     fn seal_datagram(
         &mut self,
         peer: PeerId,
@@ -1703,8 +1687,7 @@ impl Engine {
                 None
             }
             Err(crypto::CryptoError::Replay) => {
-                // Expected on a lossy path with retransmitting titles; not a
-                // sign of attack on its own.
+                // Expected with retransmitting titles; not an attack signal.
                 tracing::trace!(%peer, "replayed game datagram dropped");
                 None
             }
@@ -1768,14 +1751,9 @@ impl Engine {
         }
     }
 
-    /// Tear down a peer's tunnel: it is no longer needed, or no longer usable.
-    ///
-    /// Called only when the peer has just stopped being tunneled — the punch
-    /// landed, or the connection dropped. That matters: `WriterGone` names a
-    /// peer, not a particular writer, so if a *new* writer could be created
-    /// between this call and the old task's `WriterGone` arriving, the stale
-    /// event would tear down the new one. It cannot, because after either
-    /// caller the peer is no longer a tunnel destination.
+    /// Only safe because the peer has stopped being a tunnel destination:
+    /// `WriterGone` names a peer, not a writer, so a new writer created before
+    /// the old event arrived would be torn down by it.
     fn close_tunnel(&mut self, peer: &PeerId) {
         // Dropping the sender ends the writer task, which closes the stream.
         if self.tunnel_writers.remove(peer).is_some() {
@@ -2500,9 +2478,8 @@ impl Engine {
                     self.punch_deadline.remove(&peer_id);
                     self.tunneled_peers.remove(&peer_id);
                     self.close_tunnel(&peer_id);
-                    // Drop the session keys with the session. A reconnect
-                    // negotiates fresh ones, which is what keeps counters and
-                    // the replay window from being reused across sessions.
+                    // A reconnect negotiates fresh keys, so counters and the
+                    // replay window are never reused.
                     self.key_agreements.remove(&peer_id);
                     self.game_keys.remove(&peer_id);
                     // Allow a retry if they come back on the topic.

@@ -1,59 +1,20 @@
-//! Game-plane encryption — design spec §6, §13.
+// @file        rexnet/core/src/crypto.rs
+// @brief       Game-plane encryption for the punched UDP socket.
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
+//! Game-plane encryption for the punched UDP socket. Full rationale and wire
+//! format in docs/rexnet-design-spec.md §6.1.
 //!
-//! The control plane is Noise/TLS all the way down, but the punched UDP game
-//! socket carried plaintext: anyone on the path between two players could read
-//! their session and forge datagrams into it. This closes that.
+//! X25519 per peer session -> HKDF-SHA256 -> two directional ChaCha20-Poly1305
+//! keys. Record is `[counter u64BE][ciphertext||tag]`; the frame type is AAD.
 //!
-//! # Shape
-//!
-//! Key agreement rides the punch handshake, which is already the moment the
-//! game plane comes up and already runs over the authenticated control
-//! connection. Each side sends an ephemeral X25519 public key; the shared
-//! secret goes through HKDF-SHA256 into **two** directional keys.
-//!
-//! Ephemeral ECDH rather than one side simply choosing a key and sending it:
-//! the game plane then has forward secrecy of its own, and neither peer alone
-//! determines the key, so one weak RNG does not sink the session.
-//!
-//! # Why the key does not depend on which punch won
-//!
-//! Both peers may punch at once, so two offers exist with two different
-//! nonces, and each side locks its endpoint on whichever probe arrives first
-//! -- which need not be the same one. That was harmless when datagrams were
-//! plaintext and is fatal when they are not.
-//!
-//! So the keypair is per *peer session*, not per punch attempt: it is reused
-//! across every offer and answer to that peer, and both sides therefore see
-//! the same pair of public keys no matter which message carried them or which
-//! punch completed. Direction is settled by comparing the two public keys
-//! rather than by who offered, for the same reason -- there is no ordering
-//! left for the two ends to disagree about.
-//!
-//! # Record
-//!
-//! ```text
-//!   0        1                 9
-//! +--------+-----------------+---------------------------+
-//! | type   | counter (u64BE) | ChaCha20-Poly1305 ct+tag  |
-//! +--------+-----------------+---------------------------+
-//! ```
-//!
-//! The plaintext is `[src_port BE][dst_port BE][payload]` — the guest's ports
-//! are encrypted too, since which ports a title talks on is a fingerprint of
-//! what it is doing. The frame-type byte is authenticated as associated data
-//! so a record cannot be replayed as a different frame kind.
-//!
-//! Nonces are `[0u8; 4] || counter`, and the counter is per-direction and
-//! strictly increasing. Distinct keys per direction mean the two sides cannot
-//! collide on a (key, nonce) pair, which is the one thing that would break
-//! ChaCha20-Poly1305 outright.
-//!
-//! # What this does and does not defend against
-//!
-//! It defends against an on-path observer: reading game traffic, forging it,
-//! or replaying it. It does **not** defend against the peer you are playing
-//! with — they hold the key by construction. Misbehaviour by a legitimate
-//! participant is anti-cheat, an explicit non-goal (§1).
+//! Defends against an on-path observer, not against the peer you are playing
+//! with — they hold the key. Anti-cheat is a non-goal.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -61,20 +22,14 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-/// Bytes added to each datagram: 8-byte counter + 16-byte Poly1305 tag. The
-/// frame-type byte is not counted here — it exists on the plaintext path too.
+/// 8-byte counter + 16-byte Poly1305 tag.
 pub const CRYPTO_OVERHEAD: usize = 8 + 16;
 
-/// Domain separation. Changing this changes the keys, so it is effectively the
-/// game-plane crypto version.
+/// Changing this changes the keys: effectively the crypto version.
 const HKDF_INFO: &[u8] = b"rexnet-game-plane-v1";
 
-/// How far out of order a datagram may arrive and still be accepted.
-///
-/// Games send unreliable UDP and the network reorders it; rejecting anything
-/// out of order would drop legitimate traffic. 64 matches the width of the
-/// bitmap used to track it, and is the same order of magnitude DTLS and
-/// WireGuard settle on.
+/// Reorder tolerance. UDP reorders, so rejecting out-of-order would drop good
+/// traffic; 64 is the bitmap width and matches DTLS/WireGuard practice.
 pub const REPLAY_WINDOW: u64 = 64;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -89,8 +44,8 @@ pub enum CryptoError {
     TooLarge,
 }
 
-/// Our half of the key agreement with one peer: fresh per peer session, and
-/// reusable across every punch attempt within it.
+/// Fresh per peer session, reused across every punch attempt to that peer —
+/// see `derive`.
 pub struct LocalKeyAgreement {
     secret: StaticSecret,
     public: [u8; 32],
@@ -108,20 +63,14 @@ impl LocalKeyAgreement {
         self.public
     }
 
-    /// Derive the session keys from the peer's public key.
-    ///
-    /// Takes `&self` so it can be called again when the same peer's key
-    /// arrives on more than one message; the result is identical every time.
-    ///
-    /// Direction is decided here by comparing public keys, rather than being
-    /// passed in. A caller-supplied "am I the initiator" flag is exactly the
-    /// kind of thing two ends can disagree about, and the consequence would be
-    /// a session where one direction authenticates nothing.
+    /// Idempotent: simultaneous punches mean the peer's key can arrive twice,
+    /// and both ends must land on the same result. Direction comes from
+    /// comparing public keys rather than a caller-passed initiator flag, which
+    /// the two ends could disagree about.
     pub fn derive(&self, peer_public: &[u8; 32]) -> SessionKeys {
         let shared = self.secret.diffie_hellman(&PublicKey::from(*peer_public));
 
-        // Bind both public keys into the derivation, in an order both sides
-        // compute identically.
+        // Order both sides compute identically.
         let (low, high) = if self.public <= *peer_public {
             (self.public, *peer_public)
         } else {
@@ -138,9 +87,6 @@ impl LocalKeyAgreement {
             .expect("64 bytes is a valid HKDF-SHA256 output length");
 
         let (first, second) = okm.split_at(32);
-        // The peer with the numerically lower public key seals under the first
-        // key. Deterministic on both sides, and the keys are fresh per
-        // session, so the two ends cannot line up wrongly.
         let we_are_low = self.public <= *peer_public;
         let (send, recv) = if we_are_low { (first, second) } else { (second, first) };
 
@@ -177,17 +123,12 @@ impl Sealer {
         }
     }
 
-    /// Encrypt one datagram, returning `[counter][ciphertext||tag]`.
-    ///
-    /// `aad` is authenticated but not encrypted; the caller passes the frame
-    /// type byte so a record cannot be reinterpreted as another kind.
+    /// `aad` is the frame type, so a record cannot be reinterpreted as
+    /// another kind.
     pub fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let counter = self.counter;
-        // A wrapped counter would reuse a nonce under the same key, which
-        // breaks the cipher's guarantees outright. At one datagram per
-        // nanosecond this takes ~584 years, so it is unreachable rather than
-        // handled -- but it is checked, because "unreachable" and "unchecked"
-        // should not mean the same thing in crypto code.
+        // Wrapping would reuse a nonce under the same key. Unreachable in
+        // practice, checked anyway.
         self.counter = self.counter.checked_add(1).expect("game-plane nonce counter exhausted");
 
         let nonce = nonce_for(counter);
@@ -213,11 +154,9 @@ pub struct Opener {
     cipher: ChaCha20Poly1305,
     /// Highest counter accepted so far.
     highest: u64,
-    /// Bitmap of the `REPLAY_WINDOW` counters below `highest`; bit *i* means
-    /// `highest - 1 - i` has been seen.
+    /// Bit *i* means `highest - 1 - i` has been seen.
     seen: u64,
-    /// True once anything has been accepted — without it, counter 0 could not
-    /// be distinguished from "nothing yet".
+    /// Without this, counter 0 is indistinguishable from "nothing yet".
     started: bool,
 }
 
@@ -231,11 +170,8 @@ impl Opener {
         }
     }
 
-    /// Authenticate, decrypt, and record the counter.
-    ///
-    /// The replay check runs only *after* authentication succeeds, so a forged
-    /// packet carrying a high counter cannot advance the window and lock out
-    /// the real peer.
+    /// The window only advances after authentication, so a forged packet with
+    /// a high counter cannot lock out the real peer.
     pub fn open(&mut self, aad: &[u8], record: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if record.len() < 8 + 16 {
             return Err(CryptoError::Truncated);
@@ -287,7 +223,6 @@ impl Opener {
             if advance >= 64 {
                 self.seen = 0;
             } else {
-                // Shift the window up, and mark the old highest as seen.
                 self.seen = (self.seen << advance) | (1u64 << (advance - 1));
             }
             self.highest = counter;
@@ -310,7 +245,6 @@ fn nonce_for(counter: u64) -> Nonce {
 mod tests {
     use super::*;
 
-    /// Two peers that have completed a punch handshake.
     fn pair() -> (SessionKeys, SessionKeys) {
         let a = LocalKeyAgreement::new();
         let b = LocalKeyAgreement::new();

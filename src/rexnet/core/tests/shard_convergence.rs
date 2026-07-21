@@ -1,3 +1,12 @@
+// @file        rexnet/core/tests/shard_convergence.rs
+// @brief       Two live nodes must end up in the same ambient shard.
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
 //! Two live nodes must end up in the same ambient shard — design spec §17.3.
 //!
 //! `shard.rs` unit-tests the placement and convergence *rules* over synthetic

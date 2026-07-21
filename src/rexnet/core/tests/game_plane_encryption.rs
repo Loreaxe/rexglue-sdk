@@ -1,28 +1,23 @@
-//! The game plane carries encrypted traffic end to end — design spec §6, §13.
+// @file        rexnet/core/tests/game_plane_encryption.rs
+// @brief       The game plane carries encrypted traffic end to end.
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
+//! Proves the engine actually uses the crypto, which is a different claim
+//! from `crypto.rs` proving the cipher works.
 //!
-//! `crypto.rs` unit-tests the cipher; this tests that the *engine* uses it.
-//! Those are different claims, and the gap between them is where a security
-//! feature quietly fails to be wired up.
+//! The round-trip half is the discriminating one: miss a send site and the
+//! datagram never arrives. That is how `broadcast_datagram` was caught still
+//! emitting plaintext.
 //!
-//! **What each half of this test is worth, stated precisely:**
-//!
-//! The round-trip assertion is the discriminating one. Every send site has to
-//! seal and the receive site has to open; miss one and the datagram either
-//! never arrives or fails authentication. That is not hypothetical — the
-//! shard-broadcast test failed exactly this way when `broadcast_datagram` was
-//! still building plaintext frames, which is how that missed site was found.
-//!
-//! The injection assertion is **defence in depth, not proof of encryption.**
-//! Be honest about it: a frame from an unmapped address is parked in the
-//! orphan buffer and never delivered, so this half would have passed before
-//! any of this existed. It is kept because it pins the end-to-end property an
-//! on-path attacker actually cares about, and would catch a future change that
-//! loosened endpoint gating — but it must not be read as evidence the cipher
-//! is engaged.
-//!
-//! Genuinely spoofing the punched peer's source address is what would test the
-//! receive path directly, and that needs a machine where the test can bind or
-//! forge that address. It is not reachable from a loopback integration test.
+//! The injection half is defence in depth only — a frame from an unmapped
+//! address was already dropped before any of this existed, so it would have
+//! passed then too. Spoofing the punched peer's source address is what would
+//! test the receive path, and that is not reachable from loopback.
 
 use std::time::Duration;
 

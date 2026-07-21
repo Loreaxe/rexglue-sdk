@@ -1,15 +1,17 @@
-//! Guest TCP over RexNet — design spec §18.
+// @file        rexnet/core/tests/guest_tcp.rs
+// @brief       Guest TCP over RexNet.
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
+//! Guest TCP over RexNet (§18.1): a connection to a peer's virtual IP arrives
+//! addressed to the right guest port, and bytes travel both ways.
 //!
-//! Discovered from SoulCalibur IV: System Link is not UDP-only. It opens a
-//! non-blocking TCP server on port 1001 and runs its session over stream
-//! sockets, with no `XSession` involvement. The datagram plane that carries
-//! Fable 2's XRNM does nothing for a title shaped like that, so a guest
-//! `SOCK_STREAM` socket has to reach its peer over a real ordered byte stream.
-//!
-//! What this proves: a connection opened against a peer's virtual IP arrives
-//! at the other node addressed to the right guest port, and bytes travel both
-//! ways. What it does not prove is that any particular title is satisfied —
-//! that needs a recompiled System Link game.
+//! Does not prove any title is satisfied; that needs a recompiled System Link
+//! game.
 
 use std::time::Duration;
 

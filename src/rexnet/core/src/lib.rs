@@ -1,3 +1,12 @@
+// @file        rexnet/core/src/lib.rs
+// @brief       rexnet-core — serverless P2P control plane for RexNet.
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
 //! rexnet-core — serverless P2P control plane for RexNet.
 //!
 //! Layer L1 of the RexNet design: identity, Kademlia peer routing, relay

@@ -1,3 +1,12 @@
+// @file        rexnet/core/src/ffi.rs
+// @brief       C ABI (design spec §12): non-blocking command-in / poll-event-out.
+//
+// @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+//              All rights reserved.
+//
+// @license     BSD 3-Clause License
+//              See LICENSE file in the project root for full license text.
+
 //! C ABI (design spec §12): non-blocking command-in / poll-event-out.
 //!
 //! The library owns its tokio runtime; the game thread never blocks. Every
