@@ -18,8 +18,24 @@ std::string VirtualIpTable::Key(const RexNetPeerId& peer) {
 
 void VirtualIpTable::Insert(const RexNetPeerId& peer, uint32_t virtual_ip) {
   const std::string key = Key(peer);
-  if (auto it = by_peer_.find(key); it != by_peer_.end() && it->second == virtual_ip) {
-    return;
+  if (auto it = by_peer_.find(key); it != by_peer_.end()) {
+    if (it->second == virtual_ip) {
+      return;
+    }
+    // Readdressed. The forward mapping is overwritten below, but the old
+    // reverse entry has to go explicitly: Entries() walks by_ip_, so a peer
+    // left under both addresses is enumerated twice, and one ghost is enough
+    // to report a two-slot co-op session as full.
+    by_ip_.erase(it->second);
+  }
+  // The address may have belonged to someone else a moment ago. Leaving their
+  // forward mapping would resolve that peer to an address this one now owns.
+  if (auto old = by_ip_.find(virtual_ip); old != by_ip_.end()) {
+    const std::string old_key = Key(old->second);
+    if (old_key != key) {
+      by_peer_.erase(old_key);
+      by_online_key_.erase(old_key.substr(0, 20));
+    }
   }
   by_peer_[key] = virtual_ip;
   by_ip_[virtual_ip] = peer;
