@@ -183,8 +183,11 @@ Rationale: public relays only permit brief low-bandwidth reservations, and
 libp2p streams are reliable/ordered — wrong for 360 titles' VDP-style
 traffic. The control connection exchanges observed external endpoints and
 coordinates the punch; the game socket then carries all XNet datagram
-traffic. ENet or GameNetworkingSockets framing runs on the game socket to
-provide optional reliable channels, sequencing, and (with GNS) encryption.
+traffic, framed with a 5-byte RexNet header (type, source port, destination
+port) and nothing more.
+
+Game-plane packets carry their own encryption (§6.1); no framing library is
+involved, and none is needed for confidentiality.
 
 Many 360 titles run their own reliability protocol on top of UDP (e.g. the
 XDK's XRNM library: its own acks, SACKs,
@@ -192,11 +195,77 @@ retries, and probes). For such games the framing MUST be a
 pure-unreliable channel — stacking a reliable carrier underneath a
 retransmitting protocol double-buffers loss recovery and adds retransmit
 latency at the worst moments. The per-game config selects the channel mode
-(§11.1); GNS remains useful purely as encrypted framing.
+(§11.1).
 
-Game-plane packets are encrypted with keys derived from the Noise/TLS
-session of the control connection (export keying material), so relay
-operators and on-path observers cannot read or forge game traffic.
+**Game-plane packets are encrypted** with ChaCha20-Poly1305 under keys agreed
+during the punch handshake (§6.1), so an on-path observer can neither read
+game traffic nor forge datagrams into a session.
+
+### 6.1 Game-plane encryption
+
+**Key agreement.** Each side generates an X25519 keypair per *peer session*
+and sends the public key in its punch offer and answer. That ride is safe:
+the control connection is already authenticated and confidential, so the keys
+arrive from the peer whose identity libp2p has verified. The shared secret
+goes through HKDF-SHA256, with both public keys bound into the derivation, to
+produce **two** keys — one per direction.
+
+Ephemeral ECDH rather than one side choosing a key and sending it: the game
+plane then has forward secrecy of its own, and neither peer alone determines
+the key.
+
+**The keypair is per peer session, not per punch attempt.** Both peers may
+punch simultaneously, producing two offers with two nonces, and each side
+locks its endpoint on whichever probe arrives first — which need not be the
+same one. Keying off the punch would then leave the two ends holding different
+keys. Reusing one keypair for every attempt to that peer removes the race
+entirely. For the same reason, direction is decided by comparing the two
+public keys rather than by who offered: there is no ordering left for the two
+ends to disagree about.
+
+**Record format**, replacing the old plaintext `[type][src][dst][payload]`:
+
+```text
+  0        1                 9
++--------+-----------------+---------------------------+
+| type   | counter (u64BE) | ChaCha20-Poly1305 ct+tag  |
++--------+-----------------+---------------------------+
+```
+
+The plaintext is `[src_port BE][dst_port BE][payload]`: guest ports are
+encrypted too, since which ports a title talks on is a fingerprint of what it
+is doing. The frame-type byte is authenticated as associated data, so a record
+cannot be replayed as a different frame kind. Overhead is 24 bytes per
+datagram.
+
+Nonces are `[0u8; 4] || counter`, with the counter per-direction and strictly
+increasing. Separate keys per direction are what make a (key, nonce) collision
+between the two sides impossible — the one failure ChaCha20-Poly1305 does not
+survive.
+
+**Replay.** Receivers keep a 64-wide sliding window, as DTLS and WireGuard do.
+Genuine reordering is accepted, duplicates and anything older than the window
+are dropped. Authentication runs *before* the window advances: otherwise a
+forged record carrying a huge counter would push the window out of reach and
+lock out the real peer.
+
+**No plaintext fallback.** A datagram that cannot be sealed or opened is
+dropped. A fallback would be a downgrade an attacker could force, and sending
+a player's traffic in the clear is worse than losing it.
+
+**Cost at shard scale.** Keys are per peer, so a §17.3.6 broadcast seals once
+per recipient rather than building one frame for everyone — 255 encryptions
+per broadcast at a full shard. Cheap per datagram, but it scales with shard
+size and is unmeasured there (§17.6).
+
+**Threat model.** This defends against an on-path observer: reading, forging,
+or replaying game traffic. It does **not** defend against the peer you are
+playing with, who holds the key by construction. Misbehaviour by a legitimate
+participant is anti-cheat, an explicit non-goal (§1).
+
+**What the tunnel does.** The §5 fallback rides the libp2p control connection
+and inherits its encryption end to end, including through a circuit relay, so
+it is not separately encrypted.
 
 ---
 
@@ -360,7 +429,7 @@ struct SessionDesc {
 | `sendto`/`recvfrom` on virtual IPs | routed to that peer's punched game socket (or tunnel fallback) |
 | `XNetQosListen` / `XNetQosRelease` | success no-ops (hosts call Listen on session create; joiners Release their lookup handle) |
 | `XNetQosLookup` | synthetic-but-sane results, ideally populated with the real RTT measured by the punch engine |
-| `XNetRegisterKey` / `XNetUnregisterKey` / SA functions | no-ops (transport already encrypted) |
+| `XNetRegisterKey` / `XNetUnregisterKey` / SA functions | no-ops. The XDK's key exchange has no counterpart here — RexNet does its own (§6.1), so guest traffic is protected regardless of what the title registers |
 | VDP sockets | unreliable channel on game socket — semantics preserved |
 | `XSession*` | §10 lifecycle |
 | `XUserGetSigninState` / `GetSigninInfo` | local profile from identity + display name |
@@ -527,8 +596,11 @@ the game socket; absent in v1.
 
 ## 13. Security & privacy
 
-- All control traffic: libp2p Noise/TLS. All game traffic: keys exported
-  from the control session (§6). No plaintext paths.
+- All control traffic: libp2p Noise/TLS. All game traffic: ChaCha20-Poly1305
+  under X25519-agreed keys (§6.1). No plaintext paths — a datagram that cannot
+  be authenticated is dropped, and there is deliberately no fallback to
+  sending in the clear, since that would be a downgrade an attacker could
+  force.
 - Presence only between mutual friends; enforced at the protocol layer.
 - Public session records expose: title ID, host PeerId, slot counts, and
   the game-config attribute set — nothing else. Private sessions expose
@@ -562,8 +634,8 @@ record of what is actually true.
 1. ✅ **P2P core proof (pure Rust CLI):** identity, FindPeer across real NATs,
    DCUtR, echo over a stream. De-risks everything not under our control.
 2. ✅ **FFI + event queue** integrated into the ReXGlue runtime.
-3. ✅ **Second-socket punch** carrying live traffic; tunnel fallback (§5).
-   *GNS is not in this path — see §16.*
+3. ✅ **Second-socket punch** carrying live traffic; tunnel fallback (§5),
+   with the datagram plane encrypted end to end (§6.1).
 4. ✅ **XAM shim generic module:** XNet virtual IPs, XSession private path,
    XNotify plumbing.
 5. 🟡 **First title bring-up:** config file, invites and two-instance co-op
@@ -592,14 +664,21 @@ game. Every result so far is loopback or same-host.
   friends only — acceptable?).
 - Governance: where the wire-spec repo lives and who signs off on protocol
   major versions (proposal: ReXGlue org, two-maintainer rule).
-- GNS vs. ENet as the blessed game-socket framing (GNS: encryption built
-  in; ENet: smaller). Current lean: GNS — with the caveat that for
-  own-reliability titles (§6) only its unreliable channel and encryption are
-  used, so ENet's reliability features carry no weight in the comparison.
-  **Neither is in the path today:** the game plane uses a plain 5-byte RexNet
-  header, and `REXGLUE_REXNET_GNS` defaults OFF. Co-op has been made to work
-  without either, so this is now a question about game-traffic encryption
-  rather than framing, and should be decided on that basis.
+- ~~GNS vs. ENet as the game-socket framing.~~ **Resolved.** The question was
+  originally posed as a framing choice, and GNS was vendored against it. Co-op
+  worked over a plain 5-byte header, so framing was never the requirement —
+  encryption was, and §6.1 now provides it directly with no framing library
+  involved. The vendored dependency has been removed rather than left switched
+  off: it was never linked by any target, so enabling it built protobuf and
+  OpenSSL to produce a library nothing consumed.
+
+- **Game-plane crypto has not been reviewed by anyone else.** §6.1 is composed
+  from standard parts used conventionally (X25519, HKDF-SHA256,
+  ChaCha20-Poly1305, a WireGuard-style replay window) rather than invented,
+  and it is unit-tested against tampering, replay, cross-session keys and
+  window-poisoning. That is not the same as review, and it has never run
+  between two machines. Treat it as sound in construction and unproven in
+  deployment.
 - **`libp2p-stream` is pinned at `0.4.0-alpha`** and carries both guest TCP
   (§18.1) and the tunnel (§5). An alpha crate under a preservation project is
   the wrong shape of dependency: the whole point is to still build in ten

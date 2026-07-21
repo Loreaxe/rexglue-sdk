@@ -43,6 +43,7 @@ use crate::friends::FriendStore;
 use crate::shard::{self, Candidate, Migration, Placement, ShardDesc, DEFAULT_SHARD_CAP};
 use crate::subnet;
 use crate::tcp::{StreamHeader, StreamId, StreamInfo, StreamTable, STREAM_HEADER_LEN, STREAM_SCHEMA};
+use crate::crypto::{self, LocalKeyAgreement, SessionKeys};
 use crate::tunnel;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -359,12 +360,16 @@ const PRESENCE_HEARTBEAT: Duration = Duration::from_secs(30);
 struct PunchOffer {
     nonce: [u8; 16],
     candidates: Vec<SocketAddr>,
+    /// X25519 public key for game-plane encryption (§6). Safe to send here:
+    /// the control connection is already authenticated and confidential.
+    eph_pub: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PunchAnswer {
     nonce: [u8; 16],
     candidates: Vec<SocketAddr>,
+    eph_pub: [u8; 32],
 }
 
 /// Ambient presence broadcast on a shard's gossipsub topic (§17.3.4).
@@ -945,6 +950,8 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             tunnel_drops: HashMap::new(),
             game_endpoint_by_peer: HashMap::new(),
             peer_by_game_endpoint: HashMap::new(),
+            key_agreements: HashMap::new(),
+            game_keys: HashMap::new(),
             pending_punch_nonce: HashMap::new(),
             punch_replies: HashMap::new(),
             pending_punch_offers: HashMap::new(),
@@ -1065,6 +1072,12 @@ struct Engine {
     tunnel_drops: HashMap<PeerId, u64>,
     game_endpoint_by_peer: HashMap<PeerId, SocketAddr>,
     peer_by_game_endpoint: HashMap<SocketAddr, PeerId>,
+    /// Our half of the game-plane key agreement, one per peer session (§6).
+    /// Created when we first punch toward a peer and reused for every attempt,
+    /// so simultaneous punches cannot derive mismatched keys.
+    key_agreements: HashMap<PeerId, LocalKeyAgreement>,
+    /// Derived game-plane keys, once the peer's public key has arrived.
+    game_keys: HashMap<PeerId, SessionKeys>,
     pending_punch_nonce: HashMap<[u8; 16], PeerId>,
     punch_replies: HashMap<PeerId, oneshot::Sender<Result<SocketAddr, String>>>,
     pending_punch_offers: HashMap<OutboundRequestId, PeerId>,
@@ -1561,12 +1574,11 @@ impl Engine {
             }
             match addr {
                 Some(endpoint) => {
-                    let mut frame = Vec::with_capacity(5 + pending.data.len());
-                    frame.push(FRAME_DATA);
-                    frame.extend_from_slice(&pending.src_port.to_be_bytes());
-                    frame.extend_from_slice(&pending.dst_port.to_be_bytes());
-                    frame.extend_from_slice(&pending.data);
-                    let _ = self.game_socket.try_send_to(&frame, endpoint);
+                    if let Some(frame) =
+                        self.seal_datagram(peer, pending.src_port, pending.dst_port, &pending.data)
+                    {
+                        let _ = self.game_socket.try_send_to(&frame, endpoint);
+                    }
                 }
                 None => self.send_tunneled(
                     peer,
@@ -1591,15 +1603,20 @@ impl Engine {
         let virtual_ip = self.vip_for(peer);
         let mut delivered = 0usize;
         for (received_at, frame) in queue {
-            if received_at.elapsed() > PUNCH_QUEUE_MAX_AGE || frame.len() < 5 {
+            if received_at.elapsed() > PUNCH_QUEUE_MAX_AGE
+                || frame.len() < 1 + crypto::CRYPTO_OVERHEAD
+            {
                 continue;
             }
-            self.emit(Event::Datagram {
-                virtual_ip,
-                src_port: u16::from_be_bytes([frame[1], frame[2]]),
-                dst_port: u16::from_be_bytes([frame[3], frame[4]]),
-                data: frame[5..].to_vec(),
-            });
+            // These arrived before the address mapped to a peer, so they could
+            // not be decrypted then -- the key is per peer, and the record
+            // deliberately carries nothing identifying. Now that the peer is
+            // known, open them here. Counters are still inside the replay
+            // window, having only been buffered for a punch.
+            let Some((src_port, dst_port, data)) = self.open_datagram(peer, &frame) else {
+                continue;
+            };
+            self.emit(Event::Datagram { virtual_ip, src_port, dst_port, data });
             delivered += 1;
         }
         if delivered > 0 {
@@ -1613,6 +1630,89 @@ impl Engine {
             queue.retain(|(at, _)| at.elapsed() <= PUNCH_QUEUE_MAX_AGE);
             !queue.is_empty()
         });
+    }
+
+    /// Our X25519 public key for this peer, creating the agreement on first
+    /// use. Reused across punch attempts so both sides always agree (§6).
+    fn local_game_pubkey(&mut self, peer: PeerId) -> [u8; 32] {
+        self.key_agreements.entry(peer).or_default().public_key()
+    }
+
+    /// Derive the game-plane keys once the peer's public key arrives.
+    ///
+    /// Deriving again with the same key is harmless but would reset the nonce
+    /// counter and the replay window, so an established session is left alone:
+    /// a repeated offer must not be able to rewind either.
+    fn establish_game_keys(&mut self, peer: PeerId, peer_pub: [u8; 32]) {
+        if self.game_keys.contains_key(&peer) {
+            return;
+        }
+        let keys = self.key_agreements.entry(peer).or_default().derive(&peer_pub);
+        self.game_keys.insert(peer, keys);
+        tracing::debug!(%peer, "game-plane keys established");
+    }
+
+    /// Encrypt one guest datagram for the punched socket.
+    ///
+    /// Returns None when there are no keys, and the caller drops the datagram.
+    /// There is deliberately no plaintext fallback: a peer that could strip
+    /// the key exchange would otherwise be able to downgrade the session, and
+    /// silently sending a player's traffic in the clear is worse than dropping
+    /// it.
+    fn seal_datagram(
+        &mut self,
+        peer: PeerId,
+        src_port: u16,
+        dst_port: u16,
+        data: &[u8],
+    ) -> Option<Vec<u8>> {
+        let Some(keys) = self.game_keys.get_mut(&peer) else {
+            tracing::warn!(%peer, "no game-plane keys; datagram dropped rather than sent in clear");
+            return None;
+        };
+        let mut plaintext = Vec::with_capacity(4 + data.len());
+        plaintext.extend_from_slice(&src_port.to_be_bytes());
+        plaintext.extend_from_slice(&dst_port.to_be_bytes());
+        plaintext.extend_from_slice(data);
+
+        match keys.sealer.seal(&[FRAME_DATA], &plaintext) {
+            Ok(record) => {
+                let mut frame = Vec::with_capacity(1 + record.len());
+                frame.push(FRAME_DATA);
+                frame.extend_from_slice(&record);
+                Some(frame)
+            }
+            Err(err) => {
+                tracing::warn!(%peer, ?err, "sealing a game datagram failed; dropped");
+                None
+            }
+        }
+    }
+
+    /// Authenticate and decrypt an inbound game datagram.
+    fn open_datagram(&mut self, peer: PeerId, frame: &[u8]) -> Option<(u16, u16, Vec<u8>)> {
+        let keys = self.game_keys.get_mut(&peer)?;
+        match keys.opener.open(&[FRAME_DATA], &frame[1..]) {
+            Ok(plain) if plain.len() >= 4 => Some((
+                u16::from_be_bytes([plain[0], plain[1]]),
+                u16::from_be_bytes([plain[2], plain[3]]),
+                plain[4..].to_vec(),
+            )),
+            Ok(_) => {
+                tracing::debug!(%peer, "authentic game datagram was too short to carry ports");
+                None
+            }
+            Err(crypto::CryptoError::Replay) => {
+                // Expected on a lossy path with retransmitting titles; not a
+                // sign of attack on its own.
+                tracing::trace!(%peer, "replayed game datagram dropped");
+                None
+            }
+            Err(err) => {
+                tracing::debug!(%peer, ?err, "game datagram failed authentication");
+                None
+            }
+        }
     }
 
     /// Carry one datagram over the control connection (§14 degraded path).
@@ -1810,11 +1910,12 @@ impl Engine {
         let nonce: [u8; 16] = rand::random();
         let candidates = self.local_candidates();
         self.pending_punch_nonce.insert(nonce, peer);
+        let eph_pub = self.local_game_pubkey(peer);
         let id = self
             .swarm
             .behaviour_mut()
             .punch
-            .send_request(&peer, PunchOffer { nonce, candidates });
+            .send_request(&peer, PunchOffer { nonce, candidates, eph_pub });
         self.pending_punch_offers.insert(id, peer);
     }
 
@@ -1843,20 +1944,21 @@ impl Engine {
     /// actually broadcast pay for it, rather than every shard punching a full
     /// mesh on the chance someone might.
     fn broadcast_datagram(&mut self, src_port: u16, dst_port: u16, data: &[u8]) {
-        let mut frame = Vec::with_capacity(5 + data.len());
-        frame.push(FRAME_DATA);
-        frame.extend_from_slice(&src_port.to_be_bytes());
-        frame.extend_from_slice(&dst_port.to_be_bytes());
-        frame.extend_from_slice(data);
-
+        // Sealed once per recipient rather than built once and reused: keys
+        // are per peer (§6), so there is no such thing as a frame every member
+        // can read. At a full 255-member shard that is 255 encryptions per
+        // broadcast — cheap per datagram, but it scales with the shard and is
+        // one of the things §17.6 flags as unmeasured at that size.
         let members: Vec<PeerId> = self.shard_member_peers.iter().copied().collect();
         let mut sent = 0usize;
         let mut punching = 0usize;
         for peer in members {
-            match self.game_endpoint_by_peer.get(&peer) {
+            match self.game_endpoint_by_peer.get(&peer).copied() {
                 Some(endpoint) => {
-                    let _ = self.game_socket.try_send_to(&frame, *endpoint);
-                    sent += 1;
+                    if let Some(frame) = self.seal_datagram(peer, src_port, dst_port, data) {
+                        let _ = self.game_socket.try_send_to(&frame, endpoint);
+                        sent += 1;
+                    }
                 }
                 None => {
                     if self.pending_punch_offers.values().all(|p| *p != peer) {
@@ -1962,8 +2064,8 @@ impl Engine {
     fn handle_game_frame(&mut self, addr: SocketAddr, frame: Vec<u8>) {
         match frame.first().copied() {
             Some(FRAME_DATA) => {
-                // [0x01][src be16][dst be16][payload]
-                if frame.len() < 5 {
+                // [0x01][counter u64be][ChaCha20-Poly1305 ciphertext+tag]
+                if frame.len() < 1 + crypto::CRYPTO_OVERHEAD {
                     return;
                 }
                 let Some(peer) = self.peer_by_game_endpoint.get(&addr).copied() else {
@@ -1982,15 +2084,11 @@ impl Engine {
                     tracing::debug!(%addr, queued = queue.len(), "datagram held: endpoint not mapped yet");
                     return;
                 };
-                let src_port = u16::from_be_bytes([frame[1], frame[2]]);
-                let dst_port = u16::from_be_bytes([frame[3], frame[4]]);
+                let Some((src_port, dst_port, data)) = self.open_datagram(peer, &frame) else {
+                    return;
+                };
                 let virtual_ip = self.vip_for(peer);
-                self.emit(Event::Datagram {
-                    virtual_ip,
-                    src_port,
-                    dst_port,
-                    data: frame[5..].to_vec(),
-                });
+                self.emit(Event::Datagram { virtual_ip, src_port, dst_port, data });
             }
             Some(FRAME_PROBE) | Some(FRAME_PROBE_ACK) if frame.len() == 17 => {
                 let mut nonce = [0u8; 16];
@@ -2069,12 +2167,9 @@ impl Engine {
                 };
                 let peer = *peer;
                 if let Some(endpoint) = self.game_endpoint_by_peer.get(&peer).copied() {
-                    let mut frame = Vec::with_capacity(5 + data.len());
-                    frame.push(FRAME_DATA);
-                    frame.extend_from_slice(&src_port.to_be_bytes());
-                    frame.extend_from_slice(&dst_port.to_be_bytes());
-                    frame.extend_from_slice(&data);
-                    let _ = self.game_socket.try_send_to(&frame, endpoint);
+                    if let Some(frame) = self.seal_datagram(peer, src_port, dst_port, &data) {
+                        let _ = self.game_socket.try_send_to(&frame, endpoint);
+                    }
                 } else if self.tunneled_peers.contains(&peer) {
                     self.send_tunneled(peer, src_port, dst_port, data);
                 } else {
@@ -2405,6 +2500,11 @@ impl Engine {
                     self.punch_deadline.remove(&peer_id);
                     self.tunneled_peers.remove(&peer_id);
                     self.close_tunnel(&peer_id);
+                    // Drop the session keys with the session. A reconnect
+                    // negotiates fresh ones, which is what keeps counters and
+                    // the replay window from being reused across sessions.
+                    self.key_agreements.remove(&peer_id);
+                    self.game_keys.remove(&peer_id);
                     // Allow a retry if they come back on the topic.
                     self.shard_reachable_attempted.remove(&peer_id);
                     if self.relays.remove(&peer_id) {
@@ -2643,15 +2743,18 @@ impl Engine {
                     let candidates = self.local_candidates();
                     let nonce = request.nonce;
                     self.pending_punch_nonce.insert(nonce, peer);
+                    let eph_pub = self.local_game_pubkey(peer);
+                    self.establish_game_keys(peer, request.eph_pub);
                     let _ = self
                         .swarm
                         .behaviour_mut()
                         .punch
-                        .send_response(channel, PunchAnswer { nonce, candidates });
+                        .send_response(channel, PunchAnswer { nonce, candidates, eph_pub });
                     self.spawn_probes(nonce, request.candidates);
                 }
                 request_response::Message::Response { request_id, response } => {
                     if self.pending_punch_offers.remove(&request_id).is_some() {
+                        self.establish_game_keys(peer, response.eph_pub);
                         self.spawn_probes(response.nonce, response.candidates);
                     }
                 }

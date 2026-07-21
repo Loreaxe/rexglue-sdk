@@ -10,9 +10,8 @@ Layout (spec §2):
 | L2 FFI | `include/rex/net/rexnet_ffi.h` ↔ `core/src/ffi.rs` | C ABI, command queue in / event queue out, `catch_unwind` |
 | L1 core | `core/` (`rexnet-core`, Rust) | identity, libp2p (kad/identify/dcutr/relay/mdns), punch engine. No Xbox concepts. |
 
-Build: `-DREXGLUE_ENABLE_REXNET=ON` (needs a Rust toolchain; built via
-corrosion). `-DREXGLUE_REXNET_GNS=ON` additionally builds
-GameNetworkingSockets for the game plane (milestone 3+).
+Build: `-DREXGLUE_ENABLE_REXNET=ON` (needs a Rust toolchain >= 1.88, built
+via corrosion). OFF by default; everything here is compiled out.
 
 ## Milestone-1 CLI
 

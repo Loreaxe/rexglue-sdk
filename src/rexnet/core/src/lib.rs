@@ -10,6 +10,7 @@
 //!
 //! The public surface is the C ABI in [`ffi`]; everything else is internal.
 
+pub mod crypto;
 pub mod engine;
 pub mod ffi;
 pub mod friends;
@@ -25,7 +26,11 @@ pub mod protocol {
     pub const FRIEND: &str = "/rexnet/friend/1.0.0";
     pub const INVITE: &str = "/rexnet/invite/1.0.0";
     pub const SESSION: &str = "/rexnet/session/1.0.0";
-    pub const PUNCH: &str = "/rexnet/punch/1.0.0";
+    /// Punch signalling, and the X25519 key agreement for the game plane
+    /// (§6). 2.0.0 because the offer/answer now carry public keys: a peer
+    /// speaking 1.0.0 would punch successfully and then be unable to decrypt
+    /// anything, so this must fail negotiation instead.
+    pub const PUNCH: &str = "/rexnet/punch/2.0.0";
 
     /// Degraded game plane (§5, §14).
     ///

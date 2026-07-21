@@ -45,5 +45,13 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Game-plane encryption (§6). All of these are already in the tree via
+# libp2p-noise; naming them here makes the dependency explicit rather than
+# borrowed, so a libp2p bump cannot silently take our crypto with it.
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+sha2 = "0.10"
+
 [profile.release]
 lto = "thin"

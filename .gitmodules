@@ -69,6 +69,3 @@
 [submodule "thirdparty/corrosion"]
 	path = thirdparty/corrosion
 	url = https://github.com/corrosion-rs/corrosion.git
-[submodule "thirdparty/GameNetworkingSockets"]
-	path = thirdparty/GameNetworkingSockets
-	url = https://github.com/ValveSoftware/GameNetworkingSockets.git

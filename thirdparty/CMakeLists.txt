@@ -52,9 +52,6 @@ endif()
 
 if(REXGLUE_ENABLE_REXNET)
     list(APPEND REQUIRED_SUBMODULES corrosion)
-    if(REXGLUE_REXNET_GNS)
-        list(APPEND REQUIRED_SUBMODULES GameNetworkingSockets)
-    endif()
 endif()
 
 foreach(submodule ${REQUIRED_SUBMODULES})
@@ -341,21 +338,6 @@ if(REXGLUE_ENABLE_REXNET)
     # first-class CMake target (imported in src/rexnet/CMakeLists.txt).
     # Requires a Rust toolchain (rustup/cargo) on the host.
     add_subdirectory(corrosion)
-
-    # GameNetworkingSockets - game-plane framing/encryption on the punched
-    # UDP socket (design spec §6). Not needed until the second-socket punch
-    # milestone, and it drags in protobuf + OpenSSL, so it stays behind its
-    # own toggle. For own-reliability titles (XRNM) only its unreliable
-    # channel and encryption are used.
-    if(REXGLUE_REXNET_GNS)
-        set(BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
-        set(BUILD_STATIC_LIB ON CACHE BOOL "" FORCE)
-        set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-        set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
-        set(BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-        add_subdirectory(GameNetworkingSockets)
-        target_compile_options(GameNetworkingSockets_s PRIVATE -w)
-    endif()
 endif()
 
 #=============================================================================
