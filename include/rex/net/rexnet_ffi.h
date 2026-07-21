@@ -2,6 +2,12 @@
  * @file        net/rexnet_ffi.h
  * @brief       C ABI of rexnet-core (Rust) — design spec §12.
  *
+ * @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ *
  * Hand-maintained mirror of src/rexnet/core/src/ffi.rs; keep in sync until
  * cbindgen generation is wired into the build (see core/cbindgen.toml).
  * Non-blocking command-in / poll-event-out: the library owns its tokio

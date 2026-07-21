@@ -1,6 +1,12 @@
 /**
  * @file        ui/overlay/rexnet_overlay.cpp
  * @brief       RexNet overlay implementation. See rexnet_overlay.h.
+ *
+ * @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
  */
 #include <rex/ui/overlay/rexnet_overlay.h>
 

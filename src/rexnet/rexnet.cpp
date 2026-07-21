@@ -1,6 +1,12 @@
 /**
  * @file        rexnet.cpp
  * @brief       RexNet module lifecycle and per-frame event pump.
+ *
+ * @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
  */
 #include "rex/net/rexnet.h"
 

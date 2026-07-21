@@ -2,6 +2,12 @@
  * @file        net/virtual_ip.h
  * @brief       Virtual-IP table for XNet address mapping (design spec §11).
  *
+ * @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ *
  * Each remote peer has an address in 10.77.0.0/16; XNetXnAddrToInAddr and
  * InAddrToXnAddr resolve through this table, and sendto/recvfrom on a
  * virtual IP routes to that peer's punched game socket. Allocation is owned

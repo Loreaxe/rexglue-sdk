@@ -1,9 +1,17 @@
 /**
- * Pseudonym derivation — design spec §17.3.5.
+ * @file        net/pseudonym_test.cpp
+ * @brief       Pseudonym derivation tests — design spec §17.3.7.
  *
- * These names are shown to every peer who is not your friend, so the
- * properties that matter are: identical on every observer, stable across
- * sessions, and evenly spread so a shard does not fill with duplicates.
+ * @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ *
+ * @remarks     These names are shown to every peer who is not your friend, so
+ *              the properties that matter are: identical on every observer,
+ *              stable across sessions, and evenly spread so a shard does not
+ *              fill with duplicates.
  */
 
 #include <catch2/catch_test_macros.hpp>

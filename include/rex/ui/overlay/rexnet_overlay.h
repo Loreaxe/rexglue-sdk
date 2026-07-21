@@ -2,6 +2,12 @@
  * @file        rex/ui/overlay/rexnet_overlay.h
  * @brief       Basic ImGui overlay for the RexNet netplay module (F6).
  *
+ * @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ *
  * The UI layer sits below the kernel shim that owns the RexNet instance, so
  * this overlay reads a snapshot through a registered provider and issues
  * actions through registered callbacks (the same observer pattern used for

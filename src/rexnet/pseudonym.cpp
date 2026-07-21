@@ -1,6 +1,12 @@
 /**
  * @file        rexnet/pseudonym.cpp
  * @brief       Deterministic inoffensive peer names — design spec §17.3.7.
+ *
+ * @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
  */
 
 #include <rex/net/pseudonym.h>

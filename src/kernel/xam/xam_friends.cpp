@@ -2,6 +2,12 @@
  * @file        xam/xam_friends.cpp
  * @brief       Friends enumerator backed by the RexNet friend mirror.
  *
+ * @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ *
  * Marshals the module's friend list (design spec §8.2) into guest
  * XONLINE_FRIEND records. Reached two ways: the XamCreateEnumerator-style
  * export below, and XLiveBase message 0x58020 (xlivebase_app.cpp) — the

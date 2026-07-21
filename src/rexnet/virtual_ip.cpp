@@ -1,6 +1,12 @@
 /**
  * @file        virtual_ip.cpp
  * @brief       Virtual-IP table: peer <-> 10.77.0.0/16 address mapping.
+ *
+ * @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
  */
 #include "rex/net/virtual_ip.h"
 

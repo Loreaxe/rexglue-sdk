@@ -2,6 +2,12 @@
  * @file        net/rexnet.h
  * @brief       RexNet module — serverless Xbox Live replacement (L3 shim).
  *
+ * @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ *
  * Owns the rexnet-core handle and the guest-facing state the XAM shim needs:
  * the virtual-IP table and the per-frame event pump. XNet/XSession/XUser/
  * XPresence/XNotify/XInvite exports call into this module; it contains all

@@ -3,6 +3,12 @@
  * @brief       Stable inoffensive display names for non-friend peers —
  *              design spec §17.3.7.
  *
+ * @copyright   Copyright (c) 2026 Ryan Fisher <ryanfisher099@gmail.com>
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ *
  * Peers you are not friends with are never shown their self-asserted display
  * name. They are shown a generated one ("Curious Cat", "Lucky Dog") derived
  * deterministically from the peer id, so:

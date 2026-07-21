@@ -8,6 +8,7 @@
  ******************************************************************************
  *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    Ryan Fisher, 2026 - RexNet netplay integration
  */
 
 #include <atomic>
