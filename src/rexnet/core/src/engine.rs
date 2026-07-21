@@ -80,6 +80,18 @@ const FRAME_PROBE_ACK: u8 = 0x03;
 /// untuned). The sweep is cheap -- one provider lookup -- but a migration is
 /// a resubscribe, so moves are rate-limited far more aggressively than scans.
 const SHARD_RESCAN_INTERVAL: Duration = Duration::from_secs(20);
+/// How long to keep looking after a fruitless sweep before founding a shard.
+///
+/// The sweep can finish before a peer that is already up has connected and
+/// identified -- on LAN that gap was measured at ~6 s -- and a node that founds
+/// a shard inside that window abandons it moments later when the peer's
+/// descriptor finally arrives. Convergence handles the collision correctly, but
+/// every hop re-rolls the shard id and therefore the subnet, re-addressing the
+/// whole membership for nothing.
+///
+/// Costs a node that really is alone a short wait before ambient presence
+/// starts; it blocks nothing else, and friend invites do not go through here.
+const SHARD_CREATE_GRACE: Duration = Duration::from_secs(10);
 /// Below this many members, migrate without the jitter roll. Jitter exists to
 /// stop a large shard stampeding into another one; with a handful of members
 /// there is no stampede to prevent, and the roll just leaves two players
@@ -908,6 +920,7 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
                 state: 1, // online
                 rich: Vec::new(),
             },
+            announced_vip: None,
             invited: HashSet::new(),
             pending_invites: HashMap::new(),
             local_session: None,
@@ -922,13 +935,12 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             pending_shard_queries: HashMap::new(),
             shard_member_peers: HashSet::new(),
             shard_reachable_attempted: HashSet::new(),
-            shard_swept: false,
+            shard_swept_at: None,
             last_shard_move: None,
             listen_addrs: Vec::new(),
             external_ips: Vec::new(),
             vip_by_peer: HashMap::new(),
             peer_by_vip: HashMap::new(),
-            next_vip_host: 1,
             pending_datagrams: HashMap::new(),
             orphan_frames: HashMap::new(),
             punch_deadline: HashMap::new(),
@@ -978,6 +990,8 @@ struct Engine {
     announced: HashSet<PeerId>,
     presence_seq: u64,
     my_presence: PresenceMsg,
+    /// Last address handed to the shim, so re-announcing is free.
+    announced_vip: Option<u32>,
     /// Peers we invited to the current session; they may fetch its
     /// descriptor even when the session is private.
     invited: HashSet<PeerId>,
@@ -1017,7 +1031,9 @@ struct Engine {
     /// without it the first rescan tick (which fires immediately) would
     /// create a shard before discovery had a chance to answer, so every node
     /// would found its own and the population would start fully fragmented.
-    shard_swept: bool,
+    /// When the last provider sweep finished, or `None` if none has. Doubles
+    /// as the swept flag so the two cannot drift apart.
+    shard_swept_at: Option<Instant>,
     /// Migration rate limiting (§17.3.3). Direction is unconditional, so this
     /// is the only thing standing between a rescan and a stampede.
     last_shard_move: Option<Instant>,
@@ -1027,7 +1043,6 @@ struct Engine {
     // Virtual-IP allocation (authoritative; the C++ shim mirrors it).
     vip_by_peer: HashMap<PeerId, u32>,
     peer_by_vip: HashMap<u32, PeerId>,
-    next_vip_host: u16,
 
     // Punched game-plane endpoints.
     /// Datagrams waiting for a peer's punch to resolve, oldest first. Held
@@ -1094,6 +1109,7 @@ impl Engine {
         for peer in stored {
             self.emit(Event::FriendAccepted { peer });
         }
+        self.announce_local_address();
 
         let mut heartbeat = tokio::time::interval(PRESENCE_HEARTBEAT);
         let mut shard_rescan = tokio::time::interval(SHARD_RESCAN_INTERVAL);
@@ -1190,7 +1206,7 @@ impl Engine {
             "joined shard"
         );
         self.current_shard = Some(desc);
-        self.announce_local_address();
+        self.readdress_all();
     }
 
     /// Leave the current shard, unsubscribing and withdrawing our record.
@@ -1205,7 +1221,7 @@ impl Engine {
         self.shard_member_peers.clear();
         self.shard_reachable_attempted.clear();
         tracing::info!(shard = %hex16(&current.shard_id), "left shard");
-        self.announce_local_address();
+        self.readdress_all();
     }
 
     fn shard_create(&mut self) {
@@ -1292,8 +1308,19 @@ impl Engine {
                         // Only found a shard once we have actually looked and
                         // every descriptor query has come back. Creating on
                         // incomplete knowledge is how a population fragments.
-                        if self.shard_swept && self.pending_shard_queries.is_empty() {
-                            self.shard_create();
+                        if !self.pending_shard_queries.is_empty() {
+                            return;
+                        }
+                        match self.shard_swept_at {
+                            None => {} // never looked
+                            Some(at) if at.elapsed() >= SHARD_CREATE_GRACE => {
+                                self.shard_create();
+                            }
+                            Some(_) => {
+                                // A peer still connecting has not had the
+                                // chance to answer yet (SHARD_CREATE_GRACE).
+                                tracing::debug!("shard creation deferred; still looking");
+                            }
                         }
                     }
                 }
@@ -1385,7 +1412,7 @@ impl Engine {
         if self.shard_member_peers.len() > SHARD_WARM_CONNECT_LIMIT {
             return;
         }
-        if self.game_endpoint_by_peer.contains_key(&peer)
+        if self.game_plane_ready(&peer)
             || self.punch_deadline.contains_key(&peer)
             || self.tunneled_peers.contains(&peer)
         {
@@ -1487,16 +1514,19 @@ impl Engine {
         }
         let virtual_ip = self.vip_for(peer);
         self.emit(Event::PeerConnected { peer, virtual_ip });
+        // Membership feeds the off-shard table, so our own address can move.
+        // Only a collision actually shifts it, which needs a near-full subnet.
+        self.announce_local_address();
     }
 
     /// Allocate (or return) the virtual IP for a peer.
     ///
-    /// **An allocated address is never revised.** The guest holds it in live
-    /// sockets -- XRNM addresses its link by virtual IP -- so re-addressing a
-    /// peer mid-session would cut the game's connection out from under it.
-    /// A peer that joins our shard after we first met them therefore keeps its
-    /// off-subnet address until the link is torn down; correct-but-stale beats
-    /// tidy-but-broken.
+    /// **Addresses are stable within a shard epoch, never inside one.** The
+    /// guest holds an address in live sockets -- XRNM addresses its link by
+    /// virtual IP -- so nothing here revises one on a whim.
+    ///
+    /// A shard change is the exception, because it moves the whole /24: see
+    /// [`Self::readdress_all`].
     fn vip_for(&mut self, peer: PeerId) -> u32 {
         if let Some(vip) = self.vip_by_peer.get(&peer) {
             return *vip;
@@ -1505,6 +1535,68 @@ impl Engine {
         self.vip_by_peer.insert(peer, vip);
         self.peer_by_vip.insert(vip, peer);
         vip
+    }
+
+    /// Re-derive one peer's address, reporting whether it moved.
+    fn readdress_peer(&mut self, peer: PeerId) -> bool {
+        let previous = self.vip_by_peer.get(&peer).copied();
+        let vip = self.derive_vip(peer);
+        if previous == Some(vip) {
+            return false;
+        }
+        if let Some(old) = previous {
+            self.peer_by_vip.remove(&old);
+        }
+        self.vip_by_peer.insert(peer, vip);
+        self.peer_by_vip.insert(vip, peer);
+        tracing::info!(
+            %peer,
+            from = %previous.map(format_vip).unwrap_or_else(|| "-".to_string()),
+            to = %format_vip(vip),
+            "peer readdressed"
+        );
+        // The shim mirrors the table off this event.
+        if self.connected.contains(&peer) {
+            self.emit(Event::PeerConnected { peer, virtual_ip: vip });
+        }
+        true
+    }
+
+    /// Move every address onto the current shard's /24, together.
+    ///
+    /// Our own address is derived fresh on every read, so it follows a shard
+    /// change on its own. Peers must follow in the same step or the two sides
+    /// end up on different subnets -- which silently disables the one thing a
+    /// shard is for, since subnet broadcast (System Link discovery) can only
+    /// reach the /24 we are actually on.
+    ///
+    /// Placement recomputes the whole table from one membership snapshot
+    /// rather than peer by peer: `subnet::assign` resolves collisions by
+    /// probing, so a partial update can hand a newcomer an address another
+    /// member is still holding.
+    ///
+    /// Safe to do here because migration is suppressed while a session is
+    /// active (§17.3.3), so this does not re-address anyone mid-co-op.
+    fn readdress_all(&mut self) {
+        // A peer in neither membership table cannot be derived -- `assign`
+        // would not place it, and every such peer would collapse onto the same
+        // fallback address. Drop them; a reconnect derives a fresh one.
+        let stale: Vec<PeerId> = self
+            .vip_by_peer
+            .keys()
+            .copied()
+            .filter(|p| !self.announced.contains(p) && !self.shard_member_peers.contains(p))
+            .collect();
+        for peer in stale {
+            if let Some(vip) = self.vip_by_peer.remove(&peer) {
+                self.peer_by_vip.remove(&vip);
+            }
+        }
+        let peers: Vec<PeerId> = self.vip_by_peer.keys().copied().collect();
+        for peer in peers {
+            self.readdress_peer(peer);
+        }
+        self.announce_local_address();
     }
 
     /// Shard members get their derived address on the shard's /24 (§17.3.5);
@@ -1529,27 +1621,35 @@ impl Engine {
                 tracing::warn!(%peer, "shard subnet full; using reserved range");
             }
         }
-        self.reserved_vip()
+        self.reserved_vip_for(&peer)
     }
 
     /// Sequential address in 10.77.255.0/24 for a peer outside our shard.
-    fn reserved_vip(&mut self) -> u32 {
+    /// Off-shard peers, plus ourselves. Both nodes derive the same table from
+    /// the same membership, which a local counter cannot do.
+    fn reserved_members(&self) -> Vec<PeerId> {
+        let mut members: Vec<PeerId> = self
+            .announced
+            .iter()
+            .copied()
+            .filter(|p| !self.shard_member_peers.contains(p))
+            .collect();
+        members.push(*self.swarm.local_peer_id());
+        members
+    }
+
+    /// Address in the reserved /24, derived rather than allocated: a counter
+    /// gives each node its own private numbering, so two peers never agree on
+    /// who is who — fine on one machine, useless across two.
+    fn reserved_vip_for(&self, peer: &PeerId) -> u32 {
         let base = VIP_NETWORK_BASE | (u32::from(subnet::RESERVED_SUBNET) << 8);
-        for _ in 0..subnet::USABLE_HOSTS {
-            let host = self.next_vip_host;
-            self.next_vip_host = self.next_vip_host.wrapping_add(1);
-            if self.next_vip_host == 0 || self.next_vip_host > subnet::HOST_MAX as u16 {
-                self.next_vip_host = subnet::HOST_MIN as u16;
-            }
-            let candidate = base | u32::from(host);
-            if !self.peer_by_vip.contains_key(&candidate) {
-                return candidate;
+        match subnet::assign(&self.reserved_members()).get(peer) {
+            Some(host) => base | u32::from(*host),
+            None => {
+                tracing::error!(%peer, "reserved virtual-IP subnet exhausted");
+                base | u32::from(subnet::HOST_MIN)
             }
         }
-        // 254 simultaneous off-shard peers is far past anything expected;
-        // reuse rather than fail, and say so.
-        tracing::error!("reserved virtual-IP subnet exhausted; addresses will alias");
-        base | u32::from(subnet::HOST_MIN)
     }
 
     /// Send anything that was waiting on this peer's punch, in order, over
@@ -1625,6 +1725,12 @@ impl Engine {
         });
     }
 
+    /// A punched endpoint is only usable once it is also keyed; before that
+    /// nothing can be sealed, so treating it as ready strands the peer.
+    fn game_plane_ready(&self, peer: &PeerId) -> bool {
+        self.game_endpoint_by_peer.contains_key(peer) && self.game_keys.contains_key(peer)
+    }
+
     /// Reused across punch attempts so both sides agree (§6.1).
     fn local_game_pubkey(&mut self, peer: PeerId) -> [u8; 32] {
         self.key_agreements.entry(peer).or_default().public_key()
@@ -1638,7 +1744,10 @@ impl Engine {
         }
         let keys = self.key_agreements.entry(peer).or_default().derive(&peer_pub);
         self.game_keys.insert(peer, keys);
-        tracing::debug!(%peer, "game-plane keys established");
+        tracing::info!(%peer, "game-plane keys established");
+        if let Some(addr) = self.game_endpoint_by_peer.get(&peer).copied() {
+            self.complete_game_plane(peer, addr);
+        }
     }
 
     /// `None` when there are no keys — the caller drops it. No plaintext
@@ -1728,7 +1837,7 @@ impl Engine {
                 // our *replies* take the tunnel: without it the return traffic
                 // would sit in the punch queue until it aged out, and only the
                 // side that degraded first would ever be heard.
-                if !self.game_endpoint_by_peer.contains_key(&peer) {
+                if !self.game_plane_ready(&peer) {
                     self.tunnel_fallback(peer);
                 }
                 self.announce_peer(peer);
@@ -1786,7 +1895,7 @@ impl Engine {
             .punch_deadline
             .iter()
             .filter(|(peer, deadline)| {
-                Instant::now() >= **deadline && !self.game_endpoint_by_peer.contains_key(peer)
+                Instant::now() >= **deadline && !self.game_plane_ready(peer)
             })
             .map(|(peer, _)| *peer)
             .collect();
@@ -1805,7 +1914,7 @@ impl Engine {
         let Some(current) = &self.current_shard else {
             tracing::info!(
                 candidates = self.shard_candidates.len(),
-                swept = self.shard_swept,
+                swept = self.shard_swept_at.is_some(),
                 "shard: none yet"
             );
             return;
@@ -1889,6 +1998,12 @@ impl Engine {
         let candidates = self.local_candidates();
         self.pending_punch_nonce.insert(nonce, peer);
         let eph_pub = self.local_game_pubkey(peer);
+        tracing::info!(
+            %peer,
+            candidates = ?candidates,
+            local_addr = %format_vip(self.local_vip()),
+            "punch offer sent"
+        );
         let id = self
             .swarm
             .behaviour_mut()
@@ -1932,12 +2047,14 @@ impl Engine {
         let mut punching = 0usize;
         for peer in members {
             match self.game_endpoint_by_peer.get(&peer).copied() {
-                Some(endpoint) => {
+                Some(endpoint) if self.game_keys.contains_key(&peer) => {
                     if let Some(frame) = self.seal_datagram(peer, src_port, dst_port, data) {
                         let _ = self.game_socket.try_send_to(&frame, endpoint);
                         sent += 1;
                     }
                 }
+                // Punched but not yet keyed. Skipped quietly: the beat repeats.
+                Some(_) => {}
                 None => {
                     if self.pending_punch_offers.values().all(|p| *p != peer) {
                         self.begin_punch(peer);
@@ -1953,6 +2070,10 @@ impl Engine {
     /// game matches the subnet we are actually on.
     fn announce_local_address(&mut self) {
         let vip = self.local_vip();
+        if self.announced_vip == Some(vip) {
+            return;
+        }
+        self.announced_vip = Some(vip);
         tracing::info!(addr = %format_vip(vip), "local address");
         self.emit(Event::LocalAddress { virtual_ip: vip });
     }
@@ -1968,7 +2089,7 @@ impl Engine {
                 return subnet::address(VIP_NETWORK_BASE, &current.shard_id, *host);
             }
         }
-        VIP_NETWORK_BASE | (u32::from(subnet::RESERVED_SUBNET) << 8) | 0xFE
+        self.reserved_vip_for(self.swarm.local_peer_id())
     }
 
     /// Candidate endpoints for the punch: every local interface we listen on
@@ -2021,11 +2142,27 @@ impl Engine {
         if self.game_endpoint_by_peer.contains_key(&peer) {
             return; // first authenticated pair wins (§8.4)
         }
-        tracing::info!(%peer, %addr, "game endpoint punched");
+        tracing::info!(
+            %peer, %addr,
+            peer_addr = %format_vip(self.vip_by_peer.get(&peer).copied().unwrap_or(0)),
+            "game endpoint punched"
+        );
         self.game_endpoint_by_peer.insert(peer, addr);
         self.peer_by_game_endpoint.insert(addr, peer);
         self.vip_for(peer);
-        // A late punch still beats the tunnel: prefer it from here on.
+        // The probe travels direct while the punch answer comes back over the
+        // control connection, so the endpoint can map before keys exist.
+        // Whichever lands second finishes the job; until then the deadline
+        // stays armed so the watchdog can still fall back to the tunnel.
+        if self.game_keys.contains_key(&peer) {
+            self.complete_game_plane(peer, addr);
+        } else {
+            tracing::warn!(%peer, %addr, "endpoint punched but no keys yet; holding traffic");
+        }
+    }
+
+    /// Endpoint and keys are both in place: the plane can carry traffic.
+    fn complete_game_plane(&mut self, peer: PeerId, addr: SocketAddr) {
         self.punch_deadline.remove(&peer);
         if self.tunneled_peers.remove(&peer) {
             tracing::info!(%peer, "punch succeeded; leaving the degraded tunnel");
@@ -2046,7 +2183,11 @@ impl Engine {
                 if frame.len() < 1 + crypto::CRYPTO_OVERHEAD {
                     return;
                 }
-                let Some(peer) = self.peer_by_game_endpoint.get(&addr).copied() else {
+                // Unmapped, or mapped but not yet keyed because the probe beat
+                // the punch answer. Either way hold rather than drop: this
+                // window is exactly when a join's opening handshake arrives.
+                let mapped = self.peer_by_game_endpoint.get(&addr).copied();
+                let Some(peer) = mapped.filter(|p| self.game_keys.contains_key(p)) else {
                     // The two sides complete their punches independently, and
                     // the peer flushes whatever it queued the instant *its*
                     // side completes -- which can be milliseconds before ours.
@@ -2118,9 +2259,10 @@ impl Engine {
                 // request-response below dials if not yet connected.
                 self.wanted_peers.insert(peer);
                 self.announce_peer(peer);
-                if let Some(endpoint) = self.game_endpoint_by_peer.get(&peer) {
+                if self.game_plane_ready(&peer) {
+                    let endpoint = self.game_endpoint_by_peer[&peer];
                     if let Some(reply) = reply {
-                        let _ = reply.send(Ok(*endpoint));
+                        let _ = reply.send(Ok(endpoint));
                     } else {
                         self.emit(Event::PunchResult { peer, ok: true });
                     }
@@ -2144,7 +2286,8 @@ impl Engine {
                     return true;
                 };
                 let peer = *peer;
-                if let Some(endpoint) = self.game_endpoint_by_peer.get(&peer).copied() {
+                if self.game_plane_ready(&peer) {
+                    let endpoint = self.game_endpoint_by_peer[&peer];
                     if let Some(frame) = self.seal_datagram(peer, src_port, dst_port, &data) {
                         let _ = self.game_socket.try_send_to(&frame, endpoint);
                     }
@@ -2290,7 +2433,7 @@ impl Engine {
                     self.shard_leave();
                     self.shard_candidates.clear();
                     self.pending_shard_search = None;
-                    self.shard_swept = false;
+                    self.shard_swept_at = None;
                     tracing::info!("ambient shard disabled");
                 }
             }
@@ -2715,7 +2858,11 @@ impl Engine {
                 request_response::Message::Request { request, channel, .. } => {
                     // Responder half of §8.4: answer with our candidates
                     // under the offer's nonce, then probe toward theirs.
-                    tracing::info!(%peer, "punch offer received");
+                    tracing::info!(
+                        %peer,
+                        theirs = ?request.candidates,
+                        "punch offer received"
+                    );
                     self.announce_peer(peer);
                     let candidates = self.local_candidates();
                     let nonce = request.nonce;
@@ -2812,7 +2959,12 @@ impl Engine {
                 let Some(source) = message.source else { return };
                 match postcard::from_bytes::<ShardBeat>(&message.data) {
                     Ok(beat) if beat.schema == 1 => {
-                        self.shard_member_peers.insert(source);
+                        if self.shard_member_peers.insert(source) {
+                            // A peer we already knew off-shard belongs on our
+                            // /24 now, and their arrival can shift placement
+                            // for everyone, so re-derive from one snapshot.
+                            self.readdress_all();
+                        }
                         self.shard_ensure_reachable(source);
                         self.shard_warm_game_plane(source);
                         self.emit(Event::ShardPresence {
@@ -2923,7 +3075,7 @@ impl Engine {
                         // are no descriptor queries outstanding, so this
                         // settles into creating one immediately -- the first
                         // node in should not wait a full rescan interval.
-                        self.shard_swept = true;
+                        self.shard_swept_at = Some(Instant::now());
                         self.shard_settle();
                     }
                 }

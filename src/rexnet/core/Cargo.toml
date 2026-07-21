@@ -14,6 +14,57 @@ crate-type = ["staticlib", "rlib"]
 name = "rexnet-cli"
 path = "src/bin/rexnet_cli.rs"
 
+[features]
+# Integration tests that stand up real libp2p nodes. They bind sockets, speak
+# mDNS on whatever network the machine is attached to, and take tens of seconds
+# each, so they are off unless asked for:
+#
+#     cargo test --features net-tests
+#
+# `required-features` keeps them from being compiled at all, not merely
+# skipped, so a plain `cargo test` stays fast and offline.
+net-tests = []
+
+[[test]]
+name = "address_agreement"
+path = "tests/address_agreement.rs"
+required-features = ["net-tests"]
+
+[[test]]
+name = "game_plane_encryption"
+path = "tests/game_plane_encryption.rs"
+required-features = ["net-tests"]
+
+[[test]]
+name = "guest_tcp"
+path = "tests/guest_tcp.rs"
+required-features = ["net-tests"]
+
+[[test]]
+name = "shard_broadcast"
+path = "tests/shard_broadcast.rs"
+required-features = ["net-tests"]
+
+[[test]]
+name = "shard_convergence"
+path = "tests/shard_convergence.rs"
+required-features = ["net-tests"]
+
+[[test]]
+name = "shard_create_grace"
+path = "tests/shard_create_grace.rs"
+required-features = ["net-tests"]
+
+[[test]]
+name = "shard_subnet_alignment"
+path = "tests/shard_subnet_alignment.rs"
+required-features = ["net-tests"]
+
+[[test]]
+name = "tunnel_fallback"
+path = "tests/tunnel_fallback.rs"
+required-features = ["net-tests"]
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 libp2p = { version = "0.56", features = [
