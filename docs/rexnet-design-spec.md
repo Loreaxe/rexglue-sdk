@@ -1,10 +1,17 @@
 # RexNet — A Serverless Xbox Live Replacement Module for ReXGlue
 
 **Status:** Draft / RFC
-**Version:** 0.1.1 — folds in Fable 2 ground-truth fixes from the IDB decode 
-handshake port 1001, XNetConnect/
-GetConnectStatus semantics, XNetQos* mapping, unreliable-channel requirement.
-**Audience:** ReXGlue maintainers, recomp project developers (Fable2Recomp and others)
+**Version:** 0.2.0 — presence tiers, guest TCP, stream-carried tunnel, module
+build gate.
+**Audience:** ReXGlue maintainers and recomp project developers.
+
+> **Scope.** This is an SDK document and is deliberately title-agnostic.
+> Where a concrete XDK behaviour is described it is because *some* title
+> depends on it, not because any particular game is being targeted; titles
+> are cited as evidence for a requirement, never as the requirement itself.
+> Anything true of exactly one game — title IDs, port numbers, protocol
+> quirks, session-model choices — belongs in that project's `rexnet.toml`
+> (§11.1), not here.
 
 ---
 
@@ -63,12 +70,13 @@ ecosystem instead of decaying like abandoned master servers.
 | L2  FFI boundary (C ABI, cbindgen header, POD structs,        |
 |     command queue in / event queue out, catch_unwind)         |
 +---------------------------------------------------------------+
-| L1  rexnet-core (Rust cdylib, tokio, rust-libp2p)             |
-|     identity, kad, identify, dcutr, relay client+service,     |
-|     mdns, request-response protocols, UDP punch engine        |
+| L1  rexnet-core (Rust staticlib, tokio, rust-libp2p)          |
+|     identity, kad, gossipsub, identify, dcutr, relay          |
+|     client+service, mdns, autonat, request-response, libp2p   |
+|     streams (guest TCP + tunnel), UDP punch engine            |
 +---------------------------------------------------------------+
 | L0  Transports: QUIC (libp2p) for control; raw UDP socket     |
-|     (ENet/GNS framing) for game traffic                       |
+|     with a 5-byte RexNet frame header for game traffic        |
 +---------------------------------------------------------------+
 | L4  Per-game config (TOML): session model, channel mode,      |
 |     presence mapping, quirk flags (title ID + ports are       |
@@ -78,6 +86,9 @@ ecosystem instead of decaying like abandoned master servers.
 
 `rexnet-core` contains **no Xbox concepts** beyond an opaque namespace tag.
 Non-recomp projects may adopt it, widening the mesh.
+
+The whole stack is **optional**: RexNet is the SDK's only Rust dependency, and
+it is compiled out entirely unless asked for. See §19.
 
 ---
 
@@ -176,8 +187,8 @@ traffic. ENet or GameNetworkingSockets framing runs on the game socket to
 provide optional reliable channels, sequencing, and (with GNS) encryption.
 
 Many 360 titles run their own reliability protocol on top of UDP (e.g. the
-XDK's XRNM library, which Fable 2 uses for all game traffic: its own acks,
-SACKs, retries, and probes). For such games the framing MUST be a
+XDK's XRNM library: its own acks, SACKs,
+retries, and probes). For such games the framing MUST be a
 pure-unreliable channel — stacking a reliable carrier underneath a
 retransmitting protocol double-buffers loss recovery and adds retransmit
 latency at the worst moments. The per-game config selects the channel mode
@@ -235,7 +246,7 @@ struct KV { key: u16, value: Value }   // Value: U32 | I32 | Str(<=64B)
 ```
 
 `rich` carries whatever the XAM shim translates from XUserSetContext /
-XUserSetProperty — for Fable 2, region and quest-state for orb rendering.
+XUserSetProperty; the meaning of each context id is the title's own.
 Presence is pushed to mutual friends on change and heartbeated every 30 s;
 peers treat a record older than 90 s as stale.
 
@@ -315,8 +326,8 @@ up to 5 s; first authenticated probe pair wins.
   properties are filtered client-side per the game's config mapping.
 - Private/friends sessions never touch the DHT; joins occur via presence
   (`joinable` state + `game_endpoints_hint`) or invites.
-- Fable 2 uses only the private/invite path; the DHT session directory
-  exists because the *generic* module must support lobby-browser titles.
+- Many titles use only the private/invite path; the DHT session directory
+  exists because the *generic* module must also support lobby-browser titles.
 - **Not to be confused with the ambient title shards of §17.3**, which
   live under a separate `/shards` DHT key precisely so they never
   surface to `XSessionSearch`.
@@ -344,8 +355,8 @@ struct SessionDesc {
 |---|---|
 | `XNetStartup` / `XNetCleanup` | init/teardown module handle |
 | `XNetXnAddrToInAddr` / `InAddrToXnAddr` | virtual-IP table: each peer is assigned an address in `10.77.0.0/16`; XNADDR carries PeerId hash |
-| `XNetConnect` | initiates connect/punch to the peer behind the virtual IP (`rexnet_connect_peer`). **Not a no-op:** XRNM's link state machine calls this itself (`CXrnmLink_StartConnectSequence`) |
-| `XNetGetConnectStatus` | `XNET_CONNECT_STATUS_PENDING` while punching, `_CONNECTED` once the game socket (or tunnel fallback) is up, `_LOST` on drop. Load-bearing: XRNM gates every send on it (`CXrnmLink_CreateNextSend`); also gives games truthful disconnect behavior for free |
+| `XNetConnect` | initiates connect/punch to the peer behind the virtual IP (`rexnet_connect_peer`). **Not a no-op:** XRNM-style link state machines call it themselves as part of bringing a link up |
+| `XNetGetConnectStatus` | `XNET_CONNECT_STATUS_PENDING` while punching, `_CONNECTED` once the game socket (or tunnel fallback) is up, `_LOST` on drop. Load-bearing: XRNM-style netcode gates every send on it; also gives games truthful disconnect behavior for free |
 | `sendto`/`recvfrom` on virtual IPs | routed to that peer's punched game socket (or tunnel fallback) |
 | `XNetQosListen` / `XNetQosRelease` | success no-ops (hosts call Listen on session create; joiners Release their lookup handle) |
 | `XNetQosLookup` | synthetic-but-sane results, ideally populated with the real RTT measured by the punch engine |
@@ -391,54 +402,63 @@ What genuinely cannot be derived stays in config: `session_model`,
 `game_channel` (own-reliability cannot be safely inferred from traffic),
 the presence context mapping, and quirks.
 
-### 11.1 Per-game configuration (example: Fable 2)
+### 11.1 Per-game configuration
+
+Everything title-specific lives in the consuming project's `rexnet.toml`.
+The SDK ships no per-title data and no built-in title list: a recomp project
+describes its own game, and the module stays generic.
 
 ```toml
 [game]
 # title_id: auto-derived from the XEX execution-info header (§11.0).
-# Optional override for multi-region/alternate-ID packaging only.
-#title_id     = 0x4D5307D5        # Fable II (GOTY TU1 baseline)
+# Override only for multi-region or alternate-ID packaging.
+#title_id     = 0x00000000
 
-# udp_ports: auto-learned from NetDll_bind/sendto (§11.0). Optional hint,
+# udp_ports: auto-learned from NetDll_bind/sendto (§11.0). An optional hint,
 # used only for opportunistic UPnP pre-mapping and documentation.
-# Fable 2 ground truth: 1000 = XRNM game link; 1001 = CXboxLive
-# join-handshake datagrams (msgJoinSession / JOINRESPONSE_*).
 #udp_ports    = [1000, 1001]
 
-session_model = "private-invite"  # no public lobby browser
-game_channel  = "unreliable"      # XRNM does its own reliability (§6);
-                                  # never wrap it in a reliable carrier
+session_model = "private-invite"  # or "public-browser"
+game_channel  = "unreliable"      # set for titles that run their own
+                                  # reliability layer (§6); such traffic must
+                                  # never be wrapped in a reliable carrier
 
 [presence.rich]                   # XUserSetContext id -> rich KV key
-region      = { context = 0x0001, key = 1, type = "str" }
-quest_state = { context = 0x0002, key = 2, type = "u32" }
+# context ids and their meanings are defined by the title, not by RexNet
+#region      = { context = 0x0001, key = 1, type = "str" }
+
+[shard]                           # ambient title shard (§17.3), opt-in
+enabled           = false
+cap               = 255
+surface_as_friends = false
 
 [quirks]
 # e.g. relaxed_session_state = true for titles that call Start twice
 ```
 
-### 11.2 Fable 2 ground-truth notes (from the IDB decode)
+### 11.2 What a bring-up actually requires
 
-Facts from `Refii_Networking_Volume_v0.2.md` that shaped the mappings above
-and de-risk bring-up (§15 milestone 5):
+Generalised from the titles audited in §18. The pattern has held across every
+one of them, which is why it belongs here rather than in a per-title note:
 
-- The join flow is entirely application-level guest code: joiner sends
-  `msgJoinSession` (XUID + gamertag) to host UDP:1001, host validates
-  version/DLC/slots itself and answers JOINRESPONSE_*, and only then does the
-  XRNM link on UDP:1000 come up. RexNet supplies discovery and datagram
-  routing; it implements none of the handshake.
-- The only data RexNet must inject is the host's XNADDR / port / XNKID into
-  the joiner's session results — `CXboxLive` reads them from its context and
-  does the rest.
-- Lionhead's own `SendMessage` rewrites local-address targets to
-  `127.0.0.1`; same-machine two-instance testing is a first-class topology
-  (and under virtual IPs, guest port collisions don't exist host-side).
-- Voice is carried **in-band** as an XRNM channel (guaranteed/unguaranteed/
-  voice counters in the send path), so v1's voice stub costs capture/encode
-  (XHV), not transport.
-- Prerequisite in ReXGlue proper, independent of RexNet: XRNM receives via
-  overlapped `WSARecvFrom` completions (`CNwmIo`), which `xam_net.cpp` must
-  complete properly (currently a TODO).
+- **The join handshake is the title's own code.** In every title examined,
+  session join is application-level traffic between guest sockets — RexNet
+  supplies discovery and datagram routing and implements none of the
+  handshake. A shim that tried to emulate the handshake would be writing the
+  game's netcode for it.
+- **The only data the shim must inject** is the host's XNADDR / port / session
+  key into whatever structure the title reads its results from. Everything
+  downstream is guest code.
+- **Some titles rewrite local-address targets to `127.0.0.1`** in their own
+  send path. Observed in one title so far, but it makes same-machine
+  two-instance testing a first-class topology worth supporting regardless:
+  under virtual IPs, guest port collisions do not exist host-side, which is
+  what makes that topology work at all.
+- **Voice may be carried in-band** by the title's own transport rather than
+  through XHV — again seen in one title. Where that holds, a voice stub costs
+  capture/encode rather than transport. Do not assume it without checking.
+- **The blocker is usually the wake-up path, not the data path** — see §18.
+  This one *is* general: it held in three of the five titles audited.
 
 ---
 
@@ -469,13 +489,36 @@ void rexnet_send_datagram(RexNetHandle*, uint32_t virtual_ip,
    MUST pass false when the game config sets game_channel = "unreliable"
    (games running their own reliability, e.g. XRNM — see §6). */
 
+/* guest TCP (§18.1) — a stream socket whose peer is a virtual IP */
+void rexnet_stream_connect(RexNetHandle*, uint32_t virtual_ip,
+                           uint16_t src_port, uint16_t dst_port);
+void rexnet_stream_send(RexNetHandle*, uint64_t stream_id,
+                        const uint8_t* data, uint32_t len);
+void rexnet_stream_close(RexNetHandle*, uint64_t stream_id);
+
 /* events (drain once per frame) */
 bool rexnet_poll_event(RexNetHandle*, RexNetEvent* out);  // fixed-size POD union
 ```
 
 `RexNetEvent` kinds: `PeerConnected`, `PeerDisconnected`, `PresenceUpdated`,
-`FriendRequest`, `FriendAccepted`, `InviteReceived`, `InviteReplied`,
-`PunchResult`, `SessionFound`, `Datagram`, `Degraded(tunnel)`, `Error`.
+`FriendRequest`, `FriendAccepted`, `FriendRemoved`, `InviteReceived`,
+`InviteReplied`, `PunchResult`, `SessionFound`, `Datagram`,
+`Degraded(tunnel)`, `Error`, plus:
+
+- `StreamOpened` / `StreamData` / `StreamClosed` / `StreamConnectFailed` —
+  guest TCP (§18.1).
+- `LocalAddress` — our own virtual IP changed because we joined, left or
+  migrated a shard (§17.3.5). The shim reports this as the local XNADDR.
+- `RelayStatus` — a peer started or stopped carrying our traffic (§17.2).
+  Drives the `relay` label, the one case where a non-friend is named at all,
+  and it is named by role rather than identity.
+- `ShardPresence` — ambient presence from the title shard (§17.3.4).
+  Deliberately carries no display name: the shim renders a pseudonym unless
+  the peer is a friend.
+
+Stream ids are allocated locally and never sent, so the two ends number the
+same connection differently. Zero is reserved for "no stream", because a
+zeroed event field is otherwise indistinguishable from a real id.
 
 Voice: reserved event kinds `VoiceFrameIn/Out` for a future Opus channel on
 the game socket; absent in v1.
@@ -512,17 +555,33 @@ the game socket; absent in v1.
 
 ## 15. Milestones
 
-1. **P2P core proof (pure Rust CLI):** identity, FindPeer across real NATs,
+Status is recorded here deliberately. "Implemented" and "observed working"
+are different claims, and a spec that blurs them stops being useful as a
+record of what is actually true.
+
+1. ✅ **P2P core proof (pure Rust CLI):** identity, FindPeer across real NATs,
    DCUtR, echo over a stream. De-risks everything not under our control.
-2. **FFI + event queue** integrated into the ReXGlue runtime.
-3. **Second-socket punch** with ENet/GNS carrying live traffic; tunnel
-   fallback.
-4. **XAM shim generic module:** XNet virtual IPs, XSession private path,
+2. ✅ **FFI + event queue** integrated into the ReXGlue runtime.
+3. ✅ **Second-socket punch** carrying live traffic; tunnel fallback (§5).
+   *GNS is not in this path — see §16.*
+4. ✅ **XAM shim generic module:** XNet virtual IPs, XSession private path,
    XNotify plumbing.
-5. **Fable 2 bring-up:** config file, presence→orbs, invites; first
-   cross-internet co-op session.
-6. **Session directory + search** for lobby-browser titles; relay service
+5. 🟡 **First title bring-up:** config file, invites and two-instance co-op
+   working end to end on one title. Passive presence is **not** yet driving a
+   title's own in-game presence display; that path runs over the title's own
+   protocol and needs gates the shim does not yet satisfy. Diagnosis of any
+   specific title belongs in that project, not here.
+6. 🟡 **Presence tiers (§17):** Linked and Connected implemented, shard
+   convergence tested node-to-node. Untuned at scale (§17.6).
+7. 🟡 **Guest TCP (§18.1):** Rust half tested node-to-node; the C++ half —
+   `XSocket` connect/accept/recv/send — is compile-checked only and has
+   never executed. No System Link title has been recompiled to exercise it.
+8. ⬜ **Session directory + search** for lobby-browser titles; relay service
    opt-in; spec v1.0 published as its own repo.
+
+**Never exercised at all:** LAN across separate machines, real NAT/CGNAT
+between different networks, and a `force_tunnel` session carrying an actual
+game. Every result so far is loopback or same-host.
 
 ## 16. Open questions
 
@@ -535,9 +594,21 @@ the game socket; absent in v1.
   major versions (proposal: ReXGlue org, two-maintainer rule).
 - GNS vs. ENet as the blessed game-socket framing (GNS: encryption built
   in; ENet: smaller). Current lean: GNS — with the caveat that for
-  own-reliability titles (Fable 2/XRNM, §6) only its unreliable channel and
-  encryption are used, so ENet's reliability features carry no weight in the
-  comparison.
+  own-reliability titles (§6) only its unreliable channel and encryption are
+  used, so ENet's reliability features carry no weight in the comparison.
+  **Neither is in the path today:** the game plane uses a plain 5-byte RexNet
+  header, and `REXGLUE_REXNET_GNS` defaults OFF. Co-op has been made to work
+  without either, so this is now a question about game-traffic encryption
+  rather than framing, and should be decided on that basis.
+- **`libp2p-stream` is pinned at `0.4.0-alpha`** and carries both guest TCP
+  (§18.1) and the tunnel (§5). An alpha crate under a preservation project is
+  the wrong shape of dependency: the whole point is to still build in ten
+  years. Options are to vendor it, to wait for a stable release, or to
+  re-implement the two narrow uses directly on a `NetworkBehaviour`.
+- Whether the tunnel should reduce head-of-line blocking by striping across a
+  small fixed pool of streams rather than one (§5). One stream is correct for
+  substream budget and wrong for loss recovery; nobody has measured which
+  matters more on a real CGNAT link, because no such link has been tested.
 
 ---
 
@@ -570,8 +641,9 @@ discovery and the relay policy. The only new behaviour is a **display rule**:
 ### 17.3 Connected (title shard)
 
 An ambient, automatically-joined group of up to 255 peers playing the same
-title. It is *not* the game's session: it carries passive presence (Fable 2
-orbs), and is the population that matchmaking/lobby UIs draw from. A player
+title. It is *not* the game's session: it carries passive presence — the
+ambient "other players exist" layer some titles render in-world — and is the
+population that matchmaking/lobby UIs draw from. A player
 stays in their shard across Active sessions.
 
 **Opt-in per title** (§17.5). Titles that declare no use for it never join a
@@ -582,7 +654,7 @@ shard and pay no ambient traffic.
 Published under `rexnet/v1/title/<advertised_title_id>/shards`, deliberately
 **not** the `/sessions` key used by §10. Ambient shards must never appear to
 `XSessionSearch` / `XSessionSearchByID`, or a title would try to join a
-255-person shard as if it were a co-op game (Fable 2 would).
+255-person shard as if it were a co-op game (several titles would).
 
 ```rust
 struct ShardDesc {
@@ -636,7 +708,7 @@ A 255-peer shard is a *logical* group, never a full mesh: 255 peers fully
 connected is ~32k links and would exhaust NAT state long before that.
 
 - One gossipsub topic per shard, `rexnet/v1/shard/<shard_id>`, carrying
-  low-rate ambient data (liveness, per-title rich KVs such as orb state).
+  low-rate ambient data (liveness, per-title rich KVs).
 - **Membership implies reachability.** Gossipsub meshes with only ~6 peers
   whatever the topic size, so being in a shard would otherwise leave most
   members as bare peer ids: no address, no connection, and an invite to them
@@ -799,9 +871,9 @@ Enforcement is layered, and both halves matter:
 
 ### 17.4 Active
 
-Game-driven, unchanged: the title opens its own connections (Fable 2: XRNM
+Game-driven, unchanged: the title opens its own connections (an XRNM
 on the game plane) via §10 sessions and §8.3 invites. The manual invite
-button stays — several titles, Fable 2 among them, support direct join.
+button stays — a number of titles support direct join.
 
 ### 17.5 Configuration (extends §11.1)
 
@@ -817,22 +889,22 @@ cap = 255        # optional override
   causes churn, too lazy leaves the population fragmented.
 - Whether `created_at` needs to resist a wrong/hostile clock, given ties
   already fall back to `shard_id`.
-- Gossipsub message rates for orb-density titles at a full 255.
+- Gossipsub message rates for presence-dense titles at a full 255.
 
 ---
 
 ## 18. Guest socket surface (evidence from real titles)
 
 The XDK surface a title actually uses varies far more than "it does
-multiplayer" suggests, and each shape breaks somewhere different. Four titles
-audited so far, and every one exposed a gap the previous ones did not:
+multiplayer" suggests, and each shape breaks somewhere different. Five titles
+audited so far:
 
-| | Fable II | SoulCalibur IV | Armored Core 4 | Fable III |
-|---|---|---|---|---|
-| I/O model | overlapped + APC | `select` | **`WSAEventSelect`** | overlapped + `select` |
-| Transport | UDP (XRNM) | **TCP** + UDP | UDP | **TCP** + UDP |
-| `XSession*` imports | via XGI messages | **none** | **none** | **none** |
-| Notable | `XNetConnect` gating | `listen`/`accept` on 1001 | DNS, `XNetGetOpt` | `XNetQosListen`, `XNetRandom` |
+| | Fable II | SoulCalibur IV | Armored Core 4 | Fable III | Sonic Unleashed |
+|---|---|---|---|---|---|
+| I/O model | overlapped + APC | `select` | **`WSAEventSelect`** | overlapped + `select` | `select` + `__WSAFDIsSet` |
+| Transport | UDP (XRNM) | **TCP** + UDP | UDP | **TCP** + UDP | **TCP only** |
+| `XSession*` imports | via XGI messages | **none** | **none** | **none** | **none** |
+| Notable | `XNetConnect` gating | `listen`/`accept` on 1001 | DNS, `XNetGetOpt` | `XNetQosListen`, `XNetRandom` | Havok VDB, not multiplayer |
 
 What that cost us, in order of discovery:
 
@@ -846,13 +918,33 @@ What that cost us, in order of discovery:
   would wait forever on an event nothing ever signalled.
 - **Fable III** — a superset of the others; no new gap, which is the first
   time the audit came back clean.
+- **Sonic Unleashed** — clean, and instructive for a different reason. Its
+  entire socket surface belongs to `hkBsdSocket.cpp`: it is **Havok's Visual
+  Debugger**, not multiplayer. Sixteen imports, no `sendto`/`recvfrom`
+  anywhere in the binary. The lesson is that a socket import table proves a
+  title *has* networking, never that it has *netplay* — and that "TCP-only
+  title" is a real shape the SDK must handle.
+
+  It is nonetheless the best available exercise for §18.1: it binds, listens,
+  and polls with `select`/`__WSAFDIsSet`/`accept` — precisely the untested
+  path — and needs no second player, since the game is the server and a
+  host-side VDB connects in. Caveat: `hkBsdSocket` being linked does not
+  prove the listener starts, as retail builds often disable VDB startup.
 
 The recurring shape is worth naming: **every blocker was at the layer that
 wakes the game up** — a completion routine, a readable event, a signalled
 handle. Data arriving is not the same as the guest being told, and a title
 that is never told simply waits, which reads as a hang rather than an error.
-Auditing a candidate title's imports costs minutes and has so far found a real
-blocker in three cases out of four.
+Auditing a candidate title's imports costs minutes and found a real blocker
+in three of the five.
+
+A note on scope, since the same binaries get proposed for other problems:
+this technique works because socket APIs are **imported by name**, so every
+call site arrives pre-labelled. It does not transfer to graphics. Xbox 360
+titles statically link D3D9 into the XEX and ship it symbol-stripped — these
+five import no D3D at all, only `Vd*` kernel calls — so there is no import
+table to read and nothing is labelled. For renderer work a title's own binary
+is the only useful source.
 
 ### 18.1 Guest TCP over libp2p streams
 
@@ -875,6 +967,83 @@ Guest-visible behaviour follows Winsock rather than convenience:
   "nothing yet" from "never again".
 - readability covers pending data, pending accepts, **and** close, for both
   `select()` and `WSAEventSelect`.
+
+---
+
+## 19. Build integration
+
+RexNet is the SDK's **only** Rust dependency. That is a real cost to impose
+on someone who just wants to recompile a single-player game, so the module is
+opt-in and compiles out completely.
+
+```
+cmake -DREXGLUE_ENABLE_REXNET=ON ...     # netplay; requires a Rust toolchain
+cmake -DREXGLUE_ENABLE_REXNET=OFF ...    # default; no Rust needed at all
+```
+
+**What OFF actually means** — verified, not assumed: cargo is invoked zero
+times, no Rust staticlib is produced, no RexNet objects are compiled, and no
+`RexNetOverlay` symbols appear in the runtime library. The XAM entry points
+keep their offline behaviour and the F6 overlay bind is not registered, since
+a keybind that opens nothing reads as a broken feature rather than an absent
+one.
+
+### 19.1 Toolchain gate
+
+`cmake/rex_rust.cmake` runs **before** `thirdparty/` pulls in corrosion, so a
+missing toolchain is reported as a missing toolchain. Without it the failure
+surfaces from inside corrosion's own configure and never mentions Rust.
+
+It distinguishes four cases, because they need four different fixes: cargo or
+rustc absent; a rustup shim on PATH with no toolchain installed (`rustc`
+exists but fails to run); a toolchain older than the minimum; and a version
+string it cannot parse, which warns and continues rather than refusing a
+nightly that would probably work.
+
+The minimum is **Rust 1.88.0**, and it is *derived*: the highest
+`rust-version` declared across the resolved lockfile (`time` 0.3.53).
+Re-derive it after a dependency bump rather than raising it on a hunch —
+
+```sh
+# for each package in Cargo.lock, read its declared rust-version
+grep -h '^rust-version' ~/.cargo/registry/src/*/<pkg>/Cargo.toml
+```
+
+### 19.2 The public-header rule
+
+`REXGLUE_ENABLE_REXNET` is `PUBLIC` on `rexruntime`, because consumers compile
+their own copy of `rex_app.cpp` and must agree with the library they link.
+
+That is only safe while **no public header changes shape with it**.
+`rex_app.h` therefore holds the RexNet overlay as `ui::ImGuiDialog` rather
+than the concrete dialog type, exactly as `achievements_overlay_` beside it
+already does, so the struct layout is identical either way. If a public
+header ever branches on this define, a consumer built without it will
+silently disagree about object layout — which fails as memory corruption, not
+as a link error. Keep the define out of installed headers.
+
+The *link* stays `PRIVATE`: `rexnet` is an OBJECT library absorbed into
+`rexruntime`, so consumers never link it and exporting it would only add a
+target they cannot resolve.
+
+### 19.3 Cargo and ninja job control
+
+Ninja treats the entire cargo invocation as **one edge**. It therefore runs
+its full parallel width of C++ compiles alongside it, while cargo — told
+nothing — spawns one rustc per core inside that single edge. On a 16-core
+host that is roughly 18 C++ jobs plus 16 rustc jobs at once, and rustc is
+memory-hungry, so the failure mode is an OOM during a full build rather than
+merely slow compilation.
+
+Cargo is therefore capped at half the logical cores by default, overridable
+via `REXGLUE_REXNET_CARGO_JOBS` (0 disables the cap). Ninja 1.13 added a GNU
+jobserver that solves this properly; this is the portable fix until that is
+the floor.
+
+Incremental behaviour is as it should be: editing a `.rs` file propagates
+through cargo to a relink. Note that cargo runs on *every* build even when
+nothing changed — corrosion delegates up-to-date checking to cargo itself, so
+ninja can never report "no work to do" for this target.
 
 ---
 
