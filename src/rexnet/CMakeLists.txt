@@ -55,6 +55,16 @@ target_link_libraries(rexnet
 
 # The Rust staticlib pulls in libc/pthread/dl on Linux; corrosion handles
 # most of it, but Windows needs the usual socket/crypt system libs.
+#
+# Derived from the `#[link(name = ...)]` declarations in the resolved
+# dependency tree rather than guessed: ws2_32 (tokio/socket2), bcrypt and
+# advapi32 (getrandom), ntdll + userenv (Rust std). advapi32 is in CMake's
+# default MSVC library set, but that default does not apply under every
+# Windows toolchain configuration, and naming it costs nothing.
+#
+# Crates using windows-sys (if-watch's interface-change notifications, for
+# example) need no entry here: windows-targets links via `raw-dylib`, so no
+# import library is involved.
 if(WIN32)
-    target_link_libraries(rexnet PRIVATE ws2_32 bcrypt ntdll userenv)
+    target_link_libraries(rexnet PRIVATE ws2_32 bcrypt advapi32 ntdll userenv)
 endif()
