@@ -19,9 +19,13 @@ add_executable(unit_tests
     codegen/manifest_test.cpp
     rexglue/migration_scan_test.cpp
     rexglue/ui_test.cpp
+    net/pseudonym_test.cpp
 )
 
 target_sources(unit_tests PRIVATE
+    # Pure function, deliberately compiled in directly rather than linking the
+    # rexnet target: that would drag in the Rust staticlib for no benefit.
+    ${PROJECT_SOURCE_DIR}/src/rexnet/pseudonym.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/commands/migration_scan.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp

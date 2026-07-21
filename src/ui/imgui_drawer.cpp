@@ -22,6 +22,7 @@
 #include <rex/ui/ui_event.h>
 #include <rex/ui/window.h>
 
+#include <SDL3/SDL.h>
 #include <imgui.h>
 
 namespace rex {
@@ -104,6 +105,23 @@ void ImGuiDrawer::Initialize() {
   // imgui assumes paths are char* so we can't throw a good path at it on
   // Windows.
   io.IniFilename = nullptr;
+
+  // Bridge the clipboard to SDL. ImGui only has built-in clipboard support
+  // on Win32/macOS; everywhere else Copy buttons and Ctrl+C/V in InputText
+  // are silent no-ops until these are installed.
+  auto& platform_io = ImGui::GetPlatformIO();
+  platform_io.Platform_SetClipboardTextFn = [](ImGuiContext*, const char* text) {
+    SDL_SetClipboardText(text ? text : "");
+  };
+  platform_io.Platform_GetClipboardTextFn = [](ImGuiContext*) -> const char* {
+    // SDL hands back a malloc'd copy; ImGui wants a pointer that lives
+    // until the next call.
+    static std::string clipboard;
+    char* text = SDL_GetClipboardText();
+    clipboard = text ? text : "";
+    SDL_free(text);
+    return clipboard.c_str();
+  };
 
   // Setup the font glyphs.
   ImFontConfig font_config;
@@ -601,19 +619,22 @@ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
   if (auto imGuiKey = VirtualKeyToImGuiKey(virtual_key); imGuiKey) {
     io.AddKeyEvent(*imGuiKey, is_down);
   }
+  // Modifiers must be submitted as ImGuiMod_* events: io.KeyCtrl and
+  // friends are outputs recomputed from the event queue every frame, so
+  // writing them directly is discarded and keyboard shortcuts (Ctrl+C/V in
+  // InputText) never trigger.
   switch (virtual_key) {
     case VirtualKey::kShift:
-      io.KeyShift = is_down;
+      io.AddKeyEvent(ImGuiMod_Shift, is_down);
       break;
     case VirtualKey::kControl:
-      io.KeyCtrl = is_down;
+      io.AddKeyEvent(ImGuiMod_Ctrl, is_down);
       break;
     case VirtualKey::kMenu:
-      // FIXME(Triang3l): Doesn't work in xenia-ui-window-demo.
-      io.KeyAlt = is_down;
+      io.AddKeyEvent(ImGuiMod_Alt, is_down);
       break;
     case VirtualKey::kLWin:
-      io.KeySuper = is_down;
+      io.AddKeyEvent(ImGuiMod_Super, is_down);
       break;
     default:
       break;

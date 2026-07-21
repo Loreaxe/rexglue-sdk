@@ -19,6 +19,12 @@ namespace xam {
 
 bool xeXamIsUIActive();
 
+// xam_friends.cpp: build an XONLINE_FRIEND enumerator from the RexNet
+// friend mirror (shared by the export and XLiveBase message 0x58020).
+X_RESULT xeXFriendsCreateEnumerator(uint32_t user_index, uint32_t starting_index,
+                                    uint32_t friends_to_return, uint32_t* buffer_size_out,
+                                    uint32_t* handle_out);
+
 rex::runtime::Export* RegisterExport_xam(rex::runtime::Export* export_entry);
 
 // Registration functions, one per file.

@@ -37,6 +37,21 @@ class App {
   virtual X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                         uint32_t buffer_length) = 0;
 
+  /// Overlapped-aware dispatch (XMsgStartIORequest). An app that starts a
+  /// genuinely asynchronous operation sets *out_deferred and takes
+  /// ownership of completing `overlapped_ptr` (e.g. via
+  /// KernelState::CompleteOverlappedDeferred*); the caller must then NOT
+  /// complete it. Default: synchronous dispatch, not deferred.
+  virtual X_HRESULT DispatchMessageAsync(uint32_t message, uint32_t buffer_ptr,
+                                         uint32_t buffer_length, uint32_t overlapped_ptr,
+                                         bool* out_deferred) {
+    (void)overlapped_ptr;
+    if (out_deferred) {
+      *out_deferred = false;
+    }
+    return DispatchMessageSync(message, buffer_ptr, buffer_length);
+  }
+
   virtual ~App() = default;
 
  protected:
@@ -54,7 +69,8 @@ class AppManager {
   X_HRESULT DispatchMessageSync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
                                 uint32_t buffer_length);
   X_HRESULT DispatchMessageAsync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
-                                 uint32_t buffer_length);
+                                 uint32_t buffer_length, uint32_t overlapped_ptr = 0,
+                                 bool* out_deferred = nullptr);
 
  private:
   std::vector<std::unique_ptr<App>> apps_;

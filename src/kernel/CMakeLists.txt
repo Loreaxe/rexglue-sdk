@@ -19,6 +19,7 @@ set(REXKERNEL_SOURCES
     xam/xam_party.cpp
     xam/xam_task.cpp
     xam/xam_ui.cpp
+    xam/xam_friends.cpp
     xam/xam_user.cpp
     xam/xam_video.cpp
     xam/xam_voice.cpp
@@ -67,3 +68,11 @@ list(TRANSFORM REXKERNEL_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 target_sources(rexruntime PRIVATE ${REXKERNEL_SOURCES})
 
 target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput imgui)
+
+if(REXGLUE_ENABLE_REXNET)
+    # RexNet netplay module: XNetStartup/XNetCleanup manage the shared
+    # instance (see xam/xam_net.cpp). Definition is PRIVATE — public headers
+    # must not depend on it.
+    target_link_libraries(rexruntime PRIVATE rexnet)
+    target_compile_definitions(rexruntime PRIVATE REXGLUE_ENABLE_REXNET=1)
+endif()

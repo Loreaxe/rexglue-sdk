@@ -80,6 +80,13 @@ std::optional<std::filesystem::path> Runtime::FindMetadataPath(
       return candidate;
     }
   }
+  // Say where we looked. A per-title metadata file that exists in the source
+  // tree but not under this install's game_data_root silently disables every
+  // per-title behaviour, and "not found" alone gives no way to tell that from
+  // "this title has none".
+  for (const auto& candidate : candidates) {
+    REXSYS_DEBUG("metadata '{}' not at '{}'", relative_path.string(), candidate.string());
+  }
   return std::nullopt;
 }
 

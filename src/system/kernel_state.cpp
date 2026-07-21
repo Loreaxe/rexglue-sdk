@@ -1229,6 +1229,12 @@ void KernelState::CompleteOverlappedDeferredEx(
   dispatch_cond_.notify_all();
 }
 
+void KernelState::PostToDispatchThread(std::function<void()> fn) {
+  auto global_lock = global_critical_region_.Acquire();
+  dispatch_queue_.push_back(std::move(fn));
+  dispatch_cond_.notify_all();
+}
+
 DPCImpersonationScope KernelState::BeginDPCImpersonation() {
   auto* thread = XThread::GetCurrentThread();
   auto* ctx = thread->thread_state()->context();

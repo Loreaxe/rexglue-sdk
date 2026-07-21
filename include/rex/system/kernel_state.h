@@ -321,6 +321,12 @@ class KernelState {
       std::function<X_RESULT(uint32_t&, uint32_t&)> completion_callback, uint32_t overlapped_ptr,
       std::function<void()> pre_callback = nullptr, std::function<void()> post_callback = nullptr);
 
+  // Run a callback on the kernel dispatch thread (an XHostThread with a valid
+  // guest PPC context). Use this to marshal work that must touch guest kernel
+  // state — e.g. queuing an APC to a guest thread — off of a pure host thread
+  // (RexNet datagram / socket poller) where EnqueueApc has no caller context.
+  void PostToDispatchThread(std::function<void()> fn);
+
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 

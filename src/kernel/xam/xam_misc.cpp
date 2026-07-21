@@ -214,7 +214,6 @@ REX_EXPORT_STUB(__imp__XCustomUnregisterDynamicActions);
 REX_EXPORT_STUB(__imp__XDebugError);
 REX_EXPORT_STUB(__imp__XDebugWarning);
 REX_EXPORT_STUB(__imp__XDebugWarning_);
-REX_EXPORT_STUB(__imp__XFriendsCreateEnumerator);
 REX_EXPORT_STUB(__imp__XGGetTextureDesc);
 REX_EXPORT_STUB(__imp__XGOffsetResourceAddress);
 REX_EXPORT_STUB(__imp__XGSetTextureHeader);

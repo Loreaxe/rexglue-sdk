@@ -54,15 +54,20 @@ struct XMSGSTARTIOREQUEST_UNKNOWNARG {
 X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overlapped_ptr,
                                  uint32_t buffer_ptr, uint32_t buffer_length,
                                  XMSGSTARTIOREQUEST_UNKNOWNARG* unknown) {
-  auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageAsync(app, message, buffer_ptr,
-                                                                        buffer_length);
+  bool deferred = false;
+  auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageAsync(
+      app, message, buffer_ptr, buffer_length, overlapped_ptr, &deferred);
   if (result == X_E_NOTFOUND) {
     REXKRNL_ERROR("XMsgStartIORequestEx: app {:08X} undefined", app);
     result = X_E_INVALIDARG;
     XThread::SetLastError(X_ERROR_NOT_FOUND);
   }
   if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, result);
+    if (!deferred) {
+      REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, result);
+    }
+    // Deferred: the app owns the overlapped and completes it when the
+    // operation finishes (result is already IO_PENDING inside it).
     result = X_ERROR_IO_PENDING;
   }
   if (result == X_ERROR_SUCCESS || result == X_ERROR_IO_PENDING) {

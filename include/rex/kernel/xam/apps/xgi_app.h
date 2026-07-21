@@ -24,6 +24,11 @@ class XgiApp : public system::xam::App {
 
   X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                 uint32_t buffer_length) override;
+
+  // XSessionSearch/-Ex complete asynchronously (DHT lookup + per-host
+  // descriptor queries), deferring the overlapped to the dispatch thread.
+  X_HRESULT DispatchMessageAsync(uint32_t message, uint32_t buffer_ptr, uint32_t buffer_length,
+                                 uint32_t overlapped_ptr, bool* out_deferred) override;
 };
 
 }  // namespace apps

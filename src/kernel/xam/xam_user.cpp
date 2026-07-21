@@ -71,6 +71,14 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
     if (user_index == 0) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       signin_state = user_profile->signin_state();
+      // Titles gate their whole Live stack on this; log transitions so
+      // netplay bring-up can see what the guest saw (0 none / 1 local /
+      // 2 signed in to Live).
+      static uint32_t last_logged_state = UINT32_MAX;
+      if (signin_state != last_logged_state) {
+        last_logged_state = signin_state;
+        REXKRNL_INFO("XamUserGetSigninState(0) -> {}", signin_state);
+      }
     }
   }
   return signin_state;
@@ -154,9 +162,8 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   } else {
     assert_true(xuid_count == 1);
     assert_not_null(xuids);
-    // TODO(gibbed): allow proper lookup of arbitrary XUIDs
-    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid());
+    // NOTE: any XUID is legal here, not just the signed-in user -- reading
+    // another player's profile is what this API is for (see is_local_xuid).
     // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
     // until it's implemented for release builds...
     xuid_count = 1;
@@ -223,21 +230,35 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
 
+  // A title may read settings for ANY XUID, not just the signed-in user --
+  // that is the point of this API. In a multiplayer session the host reads a
+  // joining player's profile to populate their gamercard. We hold no local
+  // copy of a remote player's profile, so report the requested settings as
+  // "not set" (from = 0) with the requested XUID echoed back. Absent profile
+  // data for a remote player is a normal response on hardware and titles
+  // handle it; asserting local-only here aborted the host the moment a peer
+  // joined.
+  const bool is_local_xuid =
+      !xuids || static_cast<uint64_t>(xuids[0]) == user_profile->xuid();
+
   // First call asks for size (fill buffer_size_ptr).
   // Second call asks for buffer contents with that size.
 
   // TODO(gibbed): setting validity checking without needing a user profile
-  // object.
+  // object. Only meaningful for the local profile; a remote XUID reports
+  // every setting as unset rather than failing the call.
   bool any_missing = false;
-  for (uint32_t i = 0; i < setting_count; ++i) {
-    auto setting_id = static_cast<uint32_t>(setting_ids[i]);
-    auto setting = user_profile->GetSetting(setting_id);
-    if (!setting) {
-      any_missing = true;
-      REXKRNL_ERROR(
-          "xeXamUserReadProfileSettingsEx requested unimplemented setting "
-          "{:08X}",
-          setting_id);
+  if (is_local_xuid) {
+    for (uint32_t i = 0; i < setting_count; ++i) {
+      auto setting_id = static_cast<uint32_t>(setting_ids[i]);
+      auto setting = user_profile->GetSetting(setting_id);
+      if (!setting) {
+        any_missing = true;
+        REXKRNL_ERROR(
+            "xeXamUserReadProfileSettingsEx requested unimplemented setting "
+            "{:08X}",
+            setting_id);
+      }
     }
   }
   if (any_missing) {
@@ -259,12 +280,14 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
                                             buffer_size, needed_header_size);
   for (uint32_t n = 0; n < setting_count; ++n) {
     uint32_t setting_id = setting_ids[n];
-    auto setting = user_profile->GetSetting(setting_id);
+    UserProfile::Setting* setting =
+        is_local_xuid ? user_profile->GetSetting(setting_id) : nullptr;
 
     std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
     out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
     if (xuids) {
-      out_setting->xuid = user_profile->xuid();
+      out_setting->xuid = is_local_xuid ? user_profile->xuid()
+                                        : static_cast<uint64_t>(xuids[0]);
     } else {
       out_setting->user_index = static_cast<uint32_t>(user_index);
     }
@@ -382,8 +405,17 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // Privileges gate online features. A signed-in-to-Live profile (netplay
+  // active) must report them GRANTED — titles treat a denied
+  // XPRIVILEGE_MULTIPLAYER_SESSIONS (0xFE) as "this account may not play
+  // online" and refuse to host/join sessions (Fable 2's NLivePresence
+  // raises a fatal EError 6 and abandons its whole presence machine). When
+  // only signed in locally (offline), keep denying so single-player titles
+  // don't wander into online paths.
+  const auto& profile = REX_KERNEL_STATE()->user_profile();
+  const bool signed_in_to_live =
+      profile && profile->signin_state() == 2;  // eXamUserSigninState_SignedInToLive
+  *out_value = signed_in_to_live ? 1 : 0;
   return X_ERROR_SUCCESS;
 }
 

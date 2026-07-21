@@ -218,10 +218,23 @@ class UserProfile {
 
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }
-  uint32_t signin_state() const { return 1; }
+  uint32_t signin_state() const { return signin_state_; }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
+
+  // Adopt the netplay identity (RexNet module init): stable XUID derived
+  // from the player's keypair and the self-asserted display name. With a
+  // netplay identity present the profile reports signed-in-to-Live (2),
+  // so titles enable their Live/multiplayer paths; without one it stays
+  // signed-in-locally (1).
+  void set_identity(uint64_t xuid, const std::string& name) {
+    xuid_ = xuid;
+    if (!name.empty()) {
+      name_ = name;
+    }
+    signin_state_ = 2;
+  }
 
   void AddSetting(std::unique_ptr<Setting> setting);
   Setting* GetSetting(uint32_t setting_id);
@@ -229,6 +242,7 @@ class UserProfile {
  private:
   uint64_t xuid_;
   std::string name_;
+  uint32_t signin_state_ = 1;
   std::vector<std::unique_ptr<Setting>> setting_list_;
   std::unordered_map<uint32_t, Setting*> settings_;
   KernelState* kernel_state_ = nullptr;

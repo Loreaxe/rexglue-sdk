@@ -24,6 +24,7 @@
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/overlay/rexnet_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
@@ -412,6 +413,13 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       achievements_overlay_.reset();
     } else {
       achievements_overlay_ = CreateAchievementsOverlay();
+    }
+  });
+  rex::ui::RegisterBind("bind_rexnet", "F6", "Toggle RexNet overlay", [this] {
+    if (rexnet_overlay_) {
+      rexnet_overlay_.reset();
+    } else {
+      rexnet_overlay_ = std::make_unique<ui::RexNetOverlayDialog>(imgui_drawer_.get());
     }
   });
 

@@ -1,0 +1,49 @@
+[package]
+name = "rexnet-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Serverless P2P control plane for RexNet (libp2p). Contains no Xbox concepts."
+publish = false
+
+[lib]
+name = "rexnet_core"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "rexnet-cli"
+path = "src/bin/rexnet_cli.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+libp2p = { version = "0.56", features = [
+    "tokio",
+    "quic",
+    "tcp",
+    "dns",
+    "noise",
+    "yamux",
+    "kad",
+    "gossipsub",
+    "identify",
+    "mdns",
+    "relay",
+    "dcutr",
+    "autonat",
+    "upnp",
+    "request-response",
+    "cbor",
+    "macros",
+    "ed25519",
+    "rsa",
+] }
+libp2p-stream = "0.4.0-alpha"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
