@@ -57,8 +57,7 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       // during multiplayer voice setup. We keep no mute list, and the guest
       // stub pre-zeroes its result (= not muted), so succeeding reports
       // "nobody muted" — the right generic answer for any title.
-      REXKRNL_DEBUG("XUserMuteListQuery({:08X}, {:08X}) -> not muted", buffer_ptr,
-                    buffer_length);
+      REXKRNL_DEBUG("XUserMuteListQuery({:08X}, {:08X}) -> not muted", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
     case 0x00058007: {
@@ -117,8 +116,8 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
         return X_HRESULT_FROM_WIN32(result);
       }
       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args[4]), handle);
-      REXKRNL_INFO("CXLiveFriends::Enumerate(user {}, start {}, max {}): {} bytes",
-                   user_index, starting_index, friends_to_return, buffer_size);
+      REXKRNL_INFO("CXLiveFriends::Enumerate(user {}, start {}, max {}): {} bytes", user_index,
+                   starting_index, friends_to_return, buffer_size);
       return X_E_SUCCESS;
     }
     case 0x00058023: {
@@ -144,8 +143,7 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
         if (list_ptr && memory_->LookupHeap(list_ptr)) {
           const uint8_t* list = memory_->TranslateVirtual(list_ptr);
           const uint32_t arg_count = memory::load_and_swap<uint32_t>(list + 512);
-          if (arg_count >= 2 &&
-              memory::load_and_swap<uint32_t>(list + 16 * 1) == 4) {
+          if (arg_count >= 2 && memory::load_and_swap<uint32_t>(list + 16 * 1) == 4) {
             info_ptr = memory::load_and_swap<uint32_t>(list + 16 * 1 + 12);
           }
         }
@@ -166,17 +164,16 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
         // guest's +0x10 title check read session bytes and always failed.
         uint8_t* info = memory_->TranslateVirtual(info_ptr);
         memory::store_and_swap<uint64_t>(info + 0x00, net::RexNet::XuidFromPeer(accepted->host));
-        memory::store_and_swap<uint64_t>(info + 0x08,
-                                         kernel_state_->user_profile()->xuid());
+        memory::store_and_swap<uint64_t>(info + 0x08, kernel_state_->user_profile()->xuid());
         memory::store_and_swap<uint32_t>(info + 0x10, kernel_state_->title_id());
-        net::RexNet::FillGuestSessionInfo(info + 0x14, accepted->session_id,
-                                          accepted->host_vip, accepted->host);
+        net::RexNet::FillGuestSessionInfo(info + 0x14, accepted->session_id, accepted->host_vip,
+                                          accepted->host);
         memory::store_and_swap<uint32_t>(info + 0x50, 1);  // fFromGameInvite
-        REXKRNL_INFO("XMessageGameInviteGetAcceptedInfo: filled XINVITE_INFO "
-                     "titleID={:08X} host_vip=10.77.{}.{} (guest checks +0x10 "
-                     "== its title id)",
-                     kernel_state_->title_id(), (accepted->host_vip >> 8) & 0xFF,
-                     accepted->host_vip & 0xFF);
+        REXKRNL_INFO(
+            "XMessageGameInviteGetAcceptedInfo: filled XINVITE_INFO "
+            "titleID={:08X} host_vip=10.77.{}.{} (guest checks +0x10 "
+            "== its title id)",
+            kernel_state_->title_id(), (accepted->host_vip >> 8) & 0xFF, accepted->host_vip & 0xFF);
         return X_E_SUCCESS;
       }
 #endif

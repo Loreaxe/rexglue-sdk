@@ -240,8 +240,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   // data for a remote player is a normal response on hardware and titles
   // handle it; asserting local-only here aborted the host the moment a peer
   // joined.
-  const bool is_local_xuid =
-      !xuids || static_cast<uint64_t>(xuids[0]) == user_profile->xuid();
+  const bool is_local_xuid = !xuids || static_cast<uint64_t>(xuids[0]) == user_profile->xuid();
 
   // First call asks for size (fill buffer_size_ptr).
   // Second call asks for buffer contents with that size.
@@ -282,14 +281,12 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
                                             buffer_size, needed_header_size);
   for (uint32_t n = 0; n < setting_count; ++n) {
     uint32_t setting_id = setting_ids[n];
-    UserProfile::Setting* setting =
-        is_local_xuid ? user_profile->GetSetting(setting_id) : nullptr;
+    UserProfile::Setting* setting = is_local_xuid ? user_profile->GetSetting(setting_id) : nullptr;
 
     std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
     out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
     if (xuids) {
-      out_setting->xuid = is_local_xuid ? user_profile->xuid()
-                                        : static_cast<uint64_t>(xuids[0]);
+      out_setting->xuid = is_local_xuid ? user_profile->xuid() : static_cast<uint64_t>(xuids[0]);
     } else {
       out_setting->user_index = static_cast<uint32_t>(user_index);
     }

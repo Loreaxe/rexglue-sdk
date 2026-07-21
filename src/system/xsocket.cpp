@@ -350,8 +350,7 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
   constexpr uint32_t kX_FIONREAD = 0x4004667F;
   switch (cmd) {
     case kX_FIONBIO: {
-      const uint32_t enable =
-          arg_ptr ? memory::load_and_swap<uint32_t>(arg_ptr) : 1;
+      const uint32_t enable = arg_ptr ? memory::load_and_swap<uint32_t>(arg_ptr) : 1;
 #if REX_PLATFORM_WIN32
       u_long value = enable ? 1 : 0;
       if (ioctlsocket(native_handle_, FIONBIO, &value) != 0) {
@@ -362,8 +361,7 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
       if (flags < 0) {
         return X_STATUS_UNSUCCESSFUL;
       }
-      const int updated =
-          enable ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+      const int updated = enable ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
       if (fcntl(static_cast<int>(native_handle_), F_SETFL, updated) != 0) {
         return X_STATUS_UNSUCCESSFUL;
       }
@@ -469,9 +467,10 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
     ephemeral.sin_port = 0;  // OS picks an unprivileged ephemeral port
     ephemeral.sin_addr = 0;  // INADDR_ANY
     if (bind(native_handle_, (sockaddr*)&ephemeral, name_len) < 0) {
-      REXSYS_WARN("XSocket::Bind: ephemeral native bind failed (errno {}); "
-                  "guest port {} still routed via RexNet",
-                  errno, static_cast<uint16_t>(name->sin_port));
+      REXSYS_WARN(
+          "XSocket::Bind: ephemeral native bind failed (errno {}); "
+          "guest port {} still routed via RexNet",
+          errno, static_cast<uint16_t>(name->sin_port));
     }
     bound_ = true;
     bound_port_ = name->sin_port;  // guest (virtual) port for RexNet routing
@@ -684,8 +683,7 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
   // RexNet game socket instead of the host network (design spec §11).
   if (to && type_ == Type::SOCK_DGRAM) {
     const uint32_t dst_ip = to->sin_addr;  // logical host-order value
-    const bool is_virtual =
-        (dst_ip & 0xFFFF0000u) == rex::net::VirtualIpTable::kNetworkBase;
+    const bool is_virtual = (dst_ip & 0xFFFF0000u) == rex::net::VirtualIpTable::kNetworkBase;
     // SO_BROADCAST is required of the caller, as real Winsock requires.
     const bool limited_broadcast = dst_ip == 0xFFFFFFFFu && broadcast_socket_;
     // Our own address sits in 10.77/16, so a title deriving a subnet
@@ -719,7 +717,8 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
       char ohead[40] = {};
       if (dport == 1000 || dport == 1001) {
         const uint32_t n = buf_len < 12 ? buf_len : 12;
-        for (uint32_t i = 0; i < n; ++i) std::snprintf(ohead + i * 3, 4, "%02X ", buf[i]);
+        for (uint32_t i = 0; i < n; ++i)
+          std::snprintf(ohead + i * 3, 4, "%02X ", buf[i]);
       }
       if (sent_count[dport]++ < 40) {
         if (limited_broadcast) {
@@ -727,8 +726,8 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
                       static_cast<uint16_t>(bound_port_), dport, buf_len, ohead);
         } else {
           REXSYS_INFO("RexNet OUT: :{} -> 10.77.{}.{}:{} ({} bytes) head[{}]",
-                      static_cast<uint16_t>(bound_port_), (dst_ip >> 8) & 0xFF,
-                      dst_ip & 0xFF, dport, buf_len, ohead);
+                      static_cast<uint16_t>(bound_port_), (dst_ip >> 8) & 0xFF, dst_ip & 0xFF,
+                      dport, buf_len, ohead);
         }
       }
       return (int)buf_len;
@@ -800,8 +799,8 @@ int XSocket::TryRecvFrom(uint8_t* buf, uint32_t buf_len, N_XSOCKADDR_IN* from) {
   }
   sockaddr_in nfrom;
   socklen_t nfromlen = sizeof(nfrom);
-  int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, 0,
-                     (sockaddr*)&nfrom, &nfromlen);
+  int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, 0, (sockaddr*)&nfrom,
+                     &nfromlen);
   if (ret < 0) {
     return -1;
   }

@@ -85,8 +85,7 @@ X_RESULT xeXFriendsCreateEnumerator(uint32_t user_index, uint32_t starting_index
     *buffer_size_out = static_cast<uint32_t>(sizeof(X_ONLINE_FRIEND)) * friends_to_return;
   }
 
-  auto e = make_object<XStaticEnumerator<X_ONLINE_FRIEND>>(REX_KERNEL_STATE(),
-                                                           friends_to_return);
+  auto e = make_object<XStaticEnumerator<X_ONLINE_FRIEND>>(REX_KERNEL_STATE(), friends_to_return);
   auto result = e->Initialize(user_index, 0xFA, 0x58021, 0x58022, 0);
   if (XFAILED(result)) {
     return result;
@@ -95,8 +94,8 @@ X_RESULT xeXFriendsCreateEnumerator(uint32_t user_index, uint32_t starting_index
 #if REXGLUE_ENABLE_REXNET
   if (auto* rexnet = net::RexNet::shared()) {
     auto friends = rexnet->SnapshotFriends();
-    for (size_t i = starting_index;
-         i < friends.size() && e->item_count() < friends_to_return; ++i) {
+    for (size_t i = starting_index; i < friends.size() && e->item_count() < friends_to_return;
+         ++i) {
       const auto& info = friends[i];
       auto* item = e->AppendItem();
       std::memset(item, 0, sizeof(*item));
@@ -105,9 +104,8 @@ X_RESULT xeXFriendsCreateEnumerator(uint32_t user_index, uint32_t starting_index
       item->xuid_lo = static_cast<uint32_t>(xuid);
       // Presence display name when seen; otherwise a peer-id prefix so the
       // entry is still recognizable against the F6 overlay.
-      std::string name = info.display_name.empty()
-                             ? net::RexNet::PeerIdString(info.peer)
-                             : info.display_name;
+      std::string name =
+          info.display_name.empty() ? net::RexNet::PeerIdString(info.peer) : info.display_name;
       std::strncpy(item->gamertag, name.c_str(), sizeof(item->gamertag) - 1);
       uint32_t state = 0;
       if (info.online) {
@@ -124,9 +122,8 @@ X_RESULT xeXFriendsCreateEnumerator(uint32_t user_index, uint32_t starting_index
         std::memcpy(item->session_id, info.session_id.data(), 8);
       }
       item->friend_state = state;
-      REXKRNL_INFO("  friend[{}]: '{}' online={} playing={} joinable={} title={:08X}",
-                   i, name, info.online, info.title_id != 0, info.has_session,
-                   info.title_id);
+      REXKRNL_INFO("  friend[{}]: '{}' online={} playing={} joinable={} title={:08X}", i, name,
+                   info.online, info.title_id != 0, info.has_session, info.title_id);
     }
     // Ambient shard members (§17.3). Fable 2 builds its passive orbs from
     // this enumerator, so without appending them here a shard is invisible
@@ -138,42 +135,41 @@ X_RESULT xeXFriendsCreateEnumerator(uint32_t user_index, uint32_t starting_index
     // visible at all.
     size_t shard_added = 0;
     if (rexnet->game_config().shard_surface_as_friends) {
-        const uint32_t title_id = rexnet->game_config().advertised_title_id;
-        for (const auto& member : rexnet->SnapshotShardMembers()) {
-            if (e->item_count() >= friends_to_return) {
-                break;
-            }
-            // A shard member who is also a friend is already listed above;
-            // listing them twice would double their orb.
-            if (member.is_friend) {
-                continue;
-            }
-            auto* item = e->AppendItem();
-            std::memset(item, 0, sizeof(*item));
-            const uint64_t xuid = net::RexNet::XuidFromPeer(member.peer);
-            item->xuid_hi = static_cast<uint32_t>(xuid >> 32);
-            item->xuid_lo = static_cast<uint32_t>(xuid);
-            // Already §17.2-resolved: a pseudonym, never their own name.
-            std::strncpy(item->gamertag, member.display_name.c_str(),
-                         sizeof(item->gamertag) - 1);
-            uint32_t state = kFriendStateFlagOnline;
-            // Everyone in a shard is in this title by construction.
-            state |= kFriendStateFlagPlaying;
-            item->title_id = title_id;
-            if (member.has_session) {
-                state |= kFriendStateFlagJoinable;
-                std::memcpy(item->session_id, member.session_id.data(), 8);
-            }
-            item->friend_state = state;
-            ++shard_added;
-            REXKRNL_INFO("  shard[{}]: '{}' state={} joinable={}", shard_added,
-                         member.display_name, member.state, member.has_session);
+      const uint32_t title_id = rexnet->game_config().advertised_title_id;
+      for (const auto& member : rexnet->SnapshotShardMembers()) {
+        if (e->item_count() >= friends_to_return) {
+          break;
         }
+        // A shard member who is also a friend is already listed above;
+        // listing them twice would double their orb.
+        if (member.is_friend) {
+          continue;
+        }
+        auto* item = e->AppendItem();
+        std::memset(item, 0, sizeof(*item));
+        const uint64_t xuid = net::RexNet::XuidFromPeer(member.peer);
+        item->xuid_hi = static_cast<uint32_t>(xuid >> 32);
+        item->xuid_lo = static_cast<uint32_t>(xuid);
+        // Already §17.2-resolved: a pseudonym, never their own name.
+        std::strncpy(item->gamertag, member.display_name.c_str(), sizeof(item->gamertag) - 1);
+        uint32_t state = kFriendStateFlagOnline;
+        // Everyone in a shard is in this title by construction.
+        state |= kFriendStateFlagPlaying;
+        item->title_id = title_id;
+        if (member.has_session) {
+          state |= kFriendStateFlagJoinable;
+          std::memcpy(item->session_id, member.session_id.data(), 8);
+        }
+        item->friend_state = state;
+        ++shard_added;
+        REXKRNL_INFO("  shard[{}]: '{}' state={} joinable={}", shard_added, member.display_name,
+                     member.state, member.has_session);
+      }
     }
     REXKRNL_INFO(
         "XFriendsCreateEnumerator: {} entries ({} friends of {}, {} shard) (start {}, max {})",
-        e->item_count(), e->item_count() - shard_added, friends.size(), shard_added,
-        starting_index, friends_to_return);
+        e->item_count(), e->item_count() - shard_added, friends.size(), shard_added, starting_index,
+        friends_to_return);
   } else {
     REXKRNL_DEBUG("XFriendsCreateEnumerator: RexNet inactive; empty list");
   }

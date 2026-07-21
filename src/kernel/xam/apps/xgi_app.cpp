@@ -65,8 +65,8 @@ static uint32_t MarshalSearchResults(memory::Memory* memory, uint32_t results_pt
   }
   auto* rexnet = net::RexNet::shared();
   const uint32_t capacity = (buffer_size - kHeaderSize) / kResultSize;
-  const uint32_t count = std::min<uint32_t>(
-      {static_cast<uint32_t>(results.size()), max_wanted, capacity});
+  const uint32_t count =
+      std::min<uint32_t>({static_cast<uint32_t>(results.size()), max_wanted, capacity});
 
   uint8_t* base = memory->TranslateVirtual(results_ptr);
   memory::store_and_swap<uint32_t>(base + 0, count);
@@ -101,8 +101,7 @@ X_HRESULT XgiApp::DispatchMessageAsync(uint32_t message, uint32_t buffer_ptr,
 #if REXGLUE_ENABLE_REXNET
   // 0x000B0016 = XSessionSearch, 0x000B001C = XSessionSearchEx (same layout
   // + trailing num_users).
-  if ((message == 0x000B0016 || message == 0x000B001C) && overlapped_ptr &&
-      net::RexNet::shared()) {
+  if ((message == 0x000B0016 || message == 0x000B001C) && overlapped_ptr && net::RexNet::shared()) {
     auto buffer = memory_->TranslateVirtual(buffer_ptr);
     uint32_t num_results = memory::load_and_swap<uint32_t>(buffer + 8);
     uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 24);
@@ -117,8 +116,8 @@ X_HRESULT XgiApp::DispatchMessageAsync(uint32_t message, uint32_t buffer_ptr,
       *out_deferred = true;
     }
     kernel_state_->CompleteOverlappedDeferredEx(
-        [this, num_results, results_buffer_size, search_results_ptr](
-            uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+        [this, num_results, results_buffer_size, search_results_ptr](uint32_t& extended_error,
+                                                                     uint32_t& length) -> X_RESULT {
           // Dispatch thread: give the DHT lookup + descriptor queries a
           // bounded window, finishing early once we have enough.
           auto* rexnet = net::RexNet::shared();
@@ -153,7 +152,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
   auto buffer = memory_->TranslateVirtual(buffer_ptr);
   switch (message) {
     case 0x000B0006: {
-      if (buffer_length && buffer_length != 24) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 24 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 24) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 24 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
       // dword r3 user index
       // dword (unwritten?)
       // qword 0
@@ -166,8 +169,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // context ids the title publishes about itself, and rexnet.toml has to
       // map the right one into a presence rich KV for remote players to learn
       // it. Guessing the id would be worse than reading it off a live run.
-      REXKRNL_INFO("XGIUserSetContextEx(user={:08X}, context={:08X}, value={:08X})",
-                   user_index, context_id, context_value);
+      REXKRNL_INFO("XGIUserSetContextEx(user={:08X}, context={:08X}, value={:08X})", user_index,
+                   context_id, context_value);
 #if REXGLUE_ENABLE_REXNET
       if (auto* rexnet = net::RexNet::shared()) {
         // Per-game config maps context ids into presence rich KVs (§11).
@@ -197,7 +200,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_INFO("XGIUserWriteAchievements called: buf_len={} raw[0]={:08X} raw[4]={:08X}",
                    buffer_length, raw0, raw4);
 
-      if (buffer_length && buffer_length != 8) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 8 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 8) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 8 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
       uint32_t achievement_count = raw0;
       uint32_t achievements_ptr = raw4;
 
@@ -231,7 +238,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0010: {
-      if (buffer_length && buffer_length != 28) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 28 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 28) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 28 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
       // Sequence:
       // - XamSessionCreateHandle
       // - XamSessionRefObjByHandle
@@ -258,9 +269,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         const uint32_t slots_total = num_slots_public + num_slots_private;
 
         if (is_host && session_info_ptr) {
-          auto session_id = rexnet->SessionCreate(
-              is_public, static_cast<uint8_t>(std::min(slots_total, 255u)),
-              static_cast<uint8_t>(std::min(slots_total, 255u)));
+          auto session_id =
+              rexnet->SessionCreate(is_public, static_cast<uint8_t>(std::min(slots_total, 255u)),
+                                    static_cast<uint8_t>(std::min(slots_total, 255u)));
           FillSessionInfo(memory_->TranslateVirtual(session_info_ptr), session_id,
                           net::RexNet::kLocalVip, rexnet->local_peer_id());
         }
@@ -276,7 +287,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0011: {
-      if (buffer_length && buffer_length != 16) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 16 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 16) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 16 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -292,20 +307,30 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0012: {
-      if (buffer_length && buffer_length != 20) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 20 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 20) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 20 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
       uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t user_count = memory::load_and_swap<uint32_t>(buffer + 4);
       uint32_t unk_0 = memory::load_and_swap<uint32_t>(buffer + 8);
       uint32_t user_index_array = memory::load_and_swap<uint32_t>(buffer + 12);
       uint32_t private_slots_array = memory::load_and_swap<uint32_t>(buffer + 16);
 
-      if (unk_0) { REXKRNL_WARN("XGISessionJoinLocal: unk_0={} (nonzero in co-op join; tolerating)", unk_0); }
+      if (unk_0) {
+        REXKRNL_WARN("XGISessionJoinLocal: unk_0={} (nonzero in co-op join; tolerating)", unk_0);
+      }
       REXKRNL_DEBUG("XGISessionJoinLocal({:08X}, {}, {}, {:08X}, {:08X})", session_ptr, user_count,
                     unk_0, user_index_array, private_slots_array);
       return X_E_SUCCESS;
     }
     case 0x000B0014: {
-      if (buffer_length && buffer_length != 16) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 16 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 16) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 16 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -317,7 +342,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     }
     case 0x000B0015: {
       // send high scores?
-      if (buffer_length && buffer_length != 16) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 16 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 16) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 16 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -328,7 +357,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0016: {
-      if (buffer_length && buffer_length != 32) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 32 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 32) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 32 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t proc_index = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -346,7 +379,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0018: {
-      if (buffer_length && buffer_length != 16) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 16 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 16) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 16 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -359,7 +396,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B001C: {
-      if (buffer_length && buffer_length != 36) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 36 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 36) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 36 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       // session_search
       uint32_t proc_index = memory::load_and_swap<uint32_t>(buffer + 0);
@@ -381,7 +422,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B001D: {
-      if (buffer_length && buffer_length != 24) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 24 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 24) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 24 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t details_buffer_size = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -396,7 +441,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B001E: {
-      if (buffer_length && buffer_length != 24) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 24 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 24) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 24 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t session_info_ptr = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -411,7 +460,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0019: {
-      if (buffer_length && buffer_length != 8) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 8 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 8) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 8 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t session_info_ptr = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -422,7 +475,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B001A: {
-      if (buffer_length && buffer_length != 28) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 28 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 28) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 28 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -448,19 +505,22 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // Fable 2 reaches this from the friends-list/orb join
       // (NLivePresence::FindSessionFromId) with the XNKID it read from our
       // XONLINE_FRIEND record.
-      if (buffer_length && buffer_length != 20) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 20 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 20) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 20 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t session_id_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
       uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 12);
       uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
 
-      REXKRNL_INFO("XSessionSearchByID(user {}, xnkid @{:08X}, {} bytes into {:08X})",
-                   user_index, session_id_ptr, results_buffer_size, search_results_ptr);
+      REXKRNL_INFO("XSessionSearchByID(user {}, xnkid @{:08X}, {} bytes into {:08X})", user_index,
+                   session_id_ptr, results_buffer_size, search_results_ptr);
 
 #if REXGLUE_ENABLE_REXNET
-      if (auto* rexnet = net::RexNet::shared();
-          rexnet && session_id_ptr && search_results_ptr) {
+      if (auto* rexnet = net::RexNet::shared(); rexnet && session_id_ptr && search_results_ptr) {
         const uint8_t* xnkid = memory_->TranslateVirtual(session_id_ptr);
         std::vector<net::RexNet::SessionResult> results;
         if (auto found = rexnet->FindFriendSessionByXnkid(xnkid)) {
@@ -506,7 +566,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B001F: {
-      if (buffer_length && buffer_length != 24) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 24 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 24) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 24 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t array_count = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -521,7 +585,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0020: {
-      if (buffer_length && buffer_length != 8) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 8 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 8) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 8 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t view_id = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -531,7 +599,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0021: {
-      if (buffer_length && buffer_length != 28) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 28 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 28) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 28 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t title_id = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t xuids_count = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -547,7 +619,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0025: {
-      if (buffer_length && buffer_length != 20) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 20 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 20) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 20 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 4);
@@ -560,7 +636,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0026: {
-      if (buffer_length && buffer_length != 20) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 20 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 20) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 20 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 4);
@@ -581,7 +661,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_FAIL;
     }
     case 0x000B003D: {
-      if (buffer_length && buffer_length != 16) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 16 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 16) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 16 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t AnId_buffer_size = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -594,7 +678,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0041: {
-      if (buffer_length && buffer_length != 32) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 32 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 32) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 32 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
       // 00000000 2789fecc 00000000 00000000 200491e0 00000000 200491f0 20049340
       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t context_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
@@ -609,7 +697,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_FAIL;
     }
     case 0x000B0060: {
-      if (buffer_length && buffer_length != 32) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 32 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 32) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 32 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t num_session_ids = memory::load_and_swap<uint32_t>(buffer + 4);
@@ -627,7 +719,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0065: {
-      if (buffer_length && buffer_length != 52) { REXKRNL_WARN("XGI msg {:08X}: buffer_length {} != expected 52 (netplay bring-up: tolerating)", message, buffer_length); }
+      if (buffer_length && buffer_length != 52) {
+        REXKRNL_WARN(
+            "XGI msg {:08X}: buffer_length {} != expected 52 (netplay bring-up: tolerating)",
+            message, buffer_length);
+      }
 
       uint32_t proc_index = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 4);

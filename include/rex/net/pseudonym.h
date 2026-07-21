@@ -40,8 +40,7 @@ inline constexpr uint32_t kPseudonymAdjectives = 64;
 inline constexpr uint32_t kPseudonymNouns = 64;
 /// 4096 distinct names. In a full 255-member shard (§17.3) expect ~8 pairs to
 /// collide by birthday; callers resolve that with PseudonymWithDiscriminator.
-inline constexpr uint32_t kPseudonymCombinations =
-    kPseudonymAdjectives * kPseudonymNouns;
+inline constexpr uint32_t kPseudonymCombinations = kPseudonymAdjectives * kPseudonymNouns;
 
 /// Domain-separation prefix. Mixed in so a pseudonym never correlates with
 /// the other values derived from these same bytes (OnlineKey, EnetAddr).

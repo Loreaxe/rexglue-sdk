@@ -27,14 +27,14 @@ namespace rex::ui {
 
 struct RexNetOverlayStatus {
   bool active = false;
-  std::string peer_id;        // base58 identity
-  std::string friend_code;    // REXN-… rendering of the same identity
+  std::string peer_id;      // base58 identity
+  std::string friend_code;  // REXN-… rendering of the same identity
   uint32_t friend_count = 0;
   bool session_active = false;
-  std::string session_kind;   // "public" / "private" / ""
+  std::string session_kind;  // "public" / "private" / ""
   struct Peer {
-    std::string virtual_ip;   // "10.77.x.y"
-    std::string status;       // "connected" / "pending" / "lost" / "idle"
+    std::string virtual_ip;  // "10.77.x.y"
+    std::string status;      // "connected" / "pending" / "lost" / "idle"
     // Safe to render as-is (§17.2): a friend's own name, else a pseudonym.
     std::string name;
     bool is_friend = false;
@@ -43,33 +43,33 @@ struct RexNetOverlayStatus {
 
   /// Ambient shard roster (§17.3). Empty when the title has not opted in.
   struct ShardMember {
-    std::string name;   // §17.2-resolved: friend name or pseudonym
+    std::string name;  // §17.2-resolved: friend name or pseudonym
     bool is_friend = false;
     uint8_t state = 0;  // 0 offline, 1 online, 2 in-game, 3 joinable
     bool has_session = false;
   };
   std::vector<ShardMember> shard_members;
 
-  std::string display_name;   // local self-asserted name (may be empty)
+  std::string display_name;  // local self-asserted name (may be empty)
 
   // All action callbacks are keyed by the base58 peer id.
   struct Friend {
     std::string peer_id;
-    std::string name;         // presence display name; empty until seen
+    std::string name;  // presence display name; empty until seen
     bool online = false;
-    uint32_t title_id = 0;    // last presence, 0 = unknown
-    std::string title_name;   // advertised game name, may be empty
+    uint32_t title_id = 0;   // last presence, 0 = unknown
+    std::string title_name;  // advertised game name, may be empty
   };
   std::vector<Friend> friends;
   struct FriendRequest {
     std::string peer_id;
-    std::string name;         // requester's self-asserted name
+    std::string name;  // requester's self-asserted name
     std::string note;
   };
   std::vector<FriendRequest> friend_requests;
   struct Invite {
     std::string peer_id;
-    std::string name;         // inviter presence name if known
+    std::string name;  // inviter presence name if known
     uint32_t title_id = 0;
   };
   std::vector<Invite> invites;

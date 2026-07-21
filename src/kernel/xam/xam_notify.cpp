@@ -59,8 +59,7 @@ uint32_t xeXamNotifyCreateListener(uint64_t mask, uint32_t is_system, uint32_t m
   if (seed_live) {
     // Param is the exact success code the guest compares
     // (XONLINE_S_LOGON_CONNECTION_ESTABLISHED).
-    listener->EnqueueNotification(0x02000001 /* XN_LIVE_CONNECTIONCHANGED */,
-                                  0x001510F0);
+    listener->EnqueueNotification(0x02000001 /* XN_LIVE_CONNECTIONCHANGED */, 0x001510F0);
   }
 
   // Handle ref is incremented, so return that.

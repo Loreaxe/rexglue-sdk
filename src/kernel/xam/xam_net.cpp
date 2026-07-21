@@ -252,13 +252,11 @@ void RexNetStartup() {
     options.display_name = REXCVAR_GET(rexnet_display_name);
 
     auto user_root = kernel_state->emulator()->user_data_root();
-    options.data_dir =
-        (user_root.empty() ? std::filesystem::path(".") : user_root) / "rexnet";
+    options.data_dir = (user_root.empty() ? std::filesystem::path(".") : user_root) / "rexnet";
 
     // A name set from the F6 overlay (display_name.txt) outlives the
     // session and wins over the cvar default.
-    if (std::ifstream name_file(options.data_dir / "display_name.txt");
-        name_file.good()) {
+    if (std::ifstream name_file(options.data_dir / "display_name.txt"); name_file.good()) {
       std::string saved((std::istreambuf_iterator<char>(name_file)),
                         std::istreambuf_iterator<char>());
       while (!saved.empty() && (saved.back() == '\n' || saved.back() == '\r')) {
@@ -278,7 +276,8 @@ void RexNetStartup() {
       options.use_default_bootstrap = false;
       for (size_t pos = 0; pos < bootstrap.size();) {
         size_t comma = bootstrap.find(',', pos);
-        if (comma == std::string::npos) comma = bootstrap.size();
+        if (comma == std::string::npos)
+          comma = bootstrap.size();
         if (comma > pos) {
           options.bootstrap.emplace_back(bootstrap.substr(pos, comma - pos));
         }
@@ -288,8 +287,9 @@ void RexNetStartup() {
 
     auto* rexnet = net::RexNet::InitializeShared(options);
     if (!rexnet) {
-      REXKRNL_ERROR("XNetStartup: RexNet initialization failed; "
-                    "networking exports will behave as offline");
+      REXKRNL_ERROR(
+          "XNetStartup: RexNet initialization failed; "
+          "networking exports will behave as offline");
       return;
     }
 
@@ -304,8 +304,8 @@ void RexNetStartup() {
             return false;
           }
           listener->QueueAcceptedStream(stream_id, peer_vip, remote_port);
-          REXKRNL_INFO("guest TCP: accepted connection on port {} from 10.77.{}.{}:{}",
-                       local_port, (peer_vip >> 8) & 0xFF, peer_vip & 0xFF, remote_port);
+          REXKRNL_INFO("guest TCP: accepted connection on port {} from 10.77.{}.{}:{}", local_port,
+                       (peer_vip >> 8) & 0xFF, peer_vip & 0xFF, remote_port);
           return true;
         },
         [](uint64_t stream_id, const uint8_t* data, uint32_t len) {
@@ -337,8 +337,7 @@ void RexNetStartup() {
             socket->OnStreamConnectFailed();
           }
           REXKRNL_INFO("guest TCP: connect to 10.77.{}.{}:{} {}", (peer_vip >> 8) & 0xFF,
-                       peer_vip & 0xFF, dst_port,
-                       stream_id ? "established" : "failed");
+                       peer_vip & 0xFF, dst_port, stream_id ? "established" : "failed");
         });
 
     rexnet->SetDatagramSink([](uint32_t src_vip, uint16_t src_port, uint16_t dst_port,
@@ -411,9 +410,10 @@ void RexNetStartup() {
       kernel_state->BroadcastNotification(net::kXNotifySystemSignInChanged, 1);
       kernel_state->BroadcastNotification(net::kXNotifyLiveConnectionChanged,
                                           net::kXOnlineLogonConnectionEstablished);
-      REXKRNL_INFO("XNetStartup: profile signed in to Live (xuid {:016X}); "
-                   "signin-changed + connection-established broadcast",
-                   profile->xuid());
+      REXKRNL_INFO(
+          "XNetStartup: profile signed in to Live (xuid {:016X}); "
+          "signin-changed + connection-established broadcast",
+          profile->xuid());
     }
   }
   ++rexnet_startup_count;
@@ -642,8 +642,7 @@ u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> b
   uint32_t copied = 0;
   for (uint32_t i = 0; i < buffer_count && copied < (uint32_t)received; i++) {
     uint32_t chunk = std::min<uint32_t>(buffers_ptr[i].len, (uint32_t)received - copied);
-    std::memcpy(REX_KERNEL_MEMORY()->TranslateVirtual(buffers_ptr[i].buf_ptr), tmp + copied,
-                chunk);
+    std::memcpy(REX_KERNEL_MEMORY()->TranslateVirtual(buffers_ptr[i].buf_ptr), tmp + copied, chunk);
     copied += chunk;
   }
   if (from_addr) {
@@ -862,8 +861,7 @@ u32 NetDll_getsockname_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_
   return 0;
 }
 
-u32 NetDll_WSAEventSelect_entry(u32 caller, u32 socket_handle, u32 event_handle,
-                                u32 event_mask) {
+u32 NetDll_WSAEventSelect_entry(u32 caller, u32 socket_handle, u32 event_handle, u32 event_mask) {
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     XThread::SetLastError(0x2736);  // WSAENOTSOCK
@@ -953,8 +951,7 @@ void FillRexNetXnAddr(XNADDR* addr, uint32_t virtual_ip, const RexNetPeerId& pee
 // may still be holding an address it obtained earlier, and mistaking our own
 // address for a peer's would send us punching at ourselves.
 static bool IsLocalVip(net::RexNet* rexnet, uint32_t in_addr) {
-  return in_addr == net::RexNet::kLocalVip ||
-         (rexnet && in_addr == rexnet->local_vip());
+  return in_addr == net::RexNet::kLocalVip || (rexnet && in_addr == rexnet->local_vip());
 }
 #endif
 
@@ -999,8 +996,7 @@ u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   return XnAddrStatus::XNET_GET_XNADDR_NONE;
 }
 
-u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr,
-                                       mapped_u64 id_ptr) {
+u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, mapped_u64 id_ptr) {
   // Derive a stable 64-bit machine id from the XNADDR's online identity so
   // sessions that key peers by machine id (Fable 2's NLivePresence raises a
   // fatal EError 7 if this fails) get a consistent, unique value. Real
@@ -1057,9 +1053,10 @@ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mappe
       if (!IsLocalVip(rexnet, virtual_ip)) {
         rexnet->Connect(virtual_ip);
       }
-      REXKRNL_INFO("XNetXnAddrToInAddr -> 10.77.{}.{} (peer connect starting, "
-                   "punching game plane)",
-                   (virtual_ip >> 8) & 0xFF, virtual_ip & 0xFF);
+      REXKRNL_INFO(
+          "XNetXnAddrToInAddr -> 10.77.{}.{} (peer connect starting, "
+          "punching game plane)",
+          (virtual_ip >> 8) & 0xFF, virtual_ip & 0xFF);
       return 0;
     }
     REXKRNL_WARN("XNetXnAddrToInAddr: unknown XNADDR (peer not yet registered)");
@@ -1103,8 +1100,8 @@ u32 NetDll_XNetConnect_entry(u32 caller, u32 in_addr) {
       return 0;  // self-connect is trivially up
     }
     const bool ok = rexnet->Connect(in_addr);
-    REXKRNL_INFO("XNetConnect(10.77.{}.{}) -> {} (punching game plane)",
-                 (in_addr >> 8) & 0xFF, in_addr & 0xFF, ok ? "started" : "unknown-vip");
+    REXKRNL_INFO("XNetConnect(10.77.{}.{}) -> {} (punching game plane)", (in_addr >> 8) & 0xFF,
+                 in_addr & 0xFF, ok ? "started" : "unknown-vip");
     return ok ? 0 : 1;
   }
 #endif
@@ -1147,8 +1144,8 @@ u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 in_addr) {
                          : status == net::ConnectStatus::kPending ? "PENDING"
                          : status == net::ConnectStatus::kLost    ? "LOST"
                                                                   : "IDLE";
-      REXKRNL_INFO("XNetGetConnectStatus(10.77.{}.{}) = {}", (in_addr >> 8) & 0xFF,
-                   in_addr & 0xFF, name);
+      REXKRNL_INFO("XNetGetConnectStatus(10.77.{}.{}) = {}", (in_addr >> 8) & 0xFF, in_addr & 0xFF,
+                   name);
     }
     return static_cast<u32>(status);
   }
@@ -1295,8 +1292,7 @@ u32 NetDll_XNetQosLookup_entry(u32 caller, u32 cxna, mapped_void apxna, mapped_v
   if (net::RexNet::shared()) {
     const uint32_t count = cxna + cina;
     if (pqos) {
-      const uint32_t size =
-          sizeof(XNQOS) + (count > 1 ? (count - 1) * sizeof(XNQOSINFO) : 0);
+      const uint32_t size = sizeof(XNQOS) + (count > 1 ? (count - 1) * sizeof(XNQOSINFO) : 0);
       auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(size);
       auto qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_guest);
       std::memset(qos, 0, size);
@@ -1890,8 +1886,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
 REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
-REX_EXPORT(__imp__NetDll_XNetUnregisterInAddr,
-           rex::kernel::xam::NetDll_XNetUnregisterInAddr_entry)
+REX_EXPORT(__imp__NetDll_XNetUnregisterInAddr, rex::kernel::xam::NetDll_XNetUnregisterInAddr_entry)
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);

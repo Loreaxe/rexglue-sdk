@@ -64,8 +64,7 @@ void RexNetOverlayDialog::OnDraw(ImGuiIO& /*io*/) {
   RexNetOverlayStatus status = provider ? provider() : RexNetOverlayStatus{};
 
   if (!status.active) {
-    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f),
-                       "RexNet is not active.");
+    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "RexNet is not active.");
     ImGui::TextWrapped(
         "The module starts on the first XNetStartup from guest code (or when "
         "a title initializes networking). Identity and peers appear here once "
@@ -124,8 +123,8 @@ void RexNetOverlayDialog::OnDraw(ImGuiIO& /*io*/) {
   // Inbound requests/invites first: they are actionable and time-sensitive.
   if (!status.friend_requests.empty()) {
     ImGui::Separator();
-    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Friend requests (%zu):",
-                       status.friend_requests.size());
+    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                       "Friend requests (%zu):", status.friend_requests.size());
     for (const auto& request : status.friend_requests) {
       ImGui::PushID(request.peer_id.c_str());
       if (!request.name.empty()) {
@@ -152,8 +151,7 @@ void RexNetOverlayDialog::OnDraw(ImGuiIO& /*io*/) {
 
   if (!status.invites.empty()) {
     ImGui::Separator();
-    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Invites (%zu):",
-                       status.invites.size());
+    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Invites (%zu):", status.invites.size());
     for (const auto& invite : status.invites) {
       ImGui::PushID(invite.peer_id.c_str());
       if (!invite.name.empty()) {
@@ -178,8 +176,7 @@ void RexNetOverlayDialog::OnDraw(ImGuiIO& /*io*/) {
   ImGui::Text("Friends (%u):", status.friend_count);
   if (!status.friends.empty() &&
       ImGui::BeginTable("##friends", 3,
-                        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                            ImGuiTableFlags_ScrollY,
+                        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
                         ImVec2(0, 110))) {
     ImGui::TableSetupColumn("Name", ImGuiTableFlags_None);
     ImGui::TableSetupColumn("Status");
@@ -189,8 +186,8 @@ void RexNetOverlayDialog::OnDraw(ImGuiIO& /*io*/) {
       ImGui::TableNextRow();
       ImGui::PushID(friend_info.peer_id.c_str());
       ImGui::TableNextColumn();
-      const char* name = !friend_info.name.empty() ? friend_info.name.c_str()
-                                                   : friend_info.peer_id.c_str();
+      const char* name =
+          !friend_info.name.empty() ? friend_info.name.c_str() : friend_info.peer_id.c_str();
       ImGui::TextUnformatted(name);
       if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("%s", friend_info.peer_id.c_str());
@@ -204,8 +201,7 @@ void RexNetOverlayDialog::OnDraw(ImGuiIO& /*io*/) {
         ImGui::TextUnformatted(friend_info.online ? "online" : "offline");
       }
       ImGui::TableNextColumn();
-      const bool can_invite =
-          status.session_active && friend_info.online && actions.invite_friend;
+      const bool can_invite = status.session_active && friend_info.online && actions.invite_friend;
       if (!can_invite) {
         ImGui::BeginDisabled();
       }
@@ -226,8 +222,7 @@ void RexNetOverlayDialog::OnDraw(ImGuiIO& /*io*/) {
 
   ImGui::TextDisabled("Add friend (friend code or peer id)");
   ImGui::SetNextItemWidth(-70.0f);
-  const bool add_submit = ImGui::InputText("##addfriend", add_friend_buf_,
-                                           sizeof(add_friend_buf_),
+  const bool add_submit = ImGui::InputText("##addfriend", add_friend_buf_, sizeof(add_friend_buf_),
                                            ImGuiInputTextFlags_EnterReturnsTrue);
   ImGui::SameLine();
   const bool can_add = actions.send_friend_request && add_friend_buf_[0] != '\0';
@@ -244,18 +239,17 @@ void RexNetOverlayDialog::OnDraw(ImGuiIO& /*io*/) {
     ImGui::EndDisabled();
   }
   if (add_friend_error_) {
-    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
-                       "Not a valid friend code or peer id.");
+    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Not a valid friend code or peer id.");
   }
 
   ImGui::Separator();
   ImGui::Text("Shard (%zu):", status.shard_members.size());
   if (status.shard_members.empty()) {
     ImGui::TextDisabled("not in a shard (opt in via rexnet.toml [shard])");
-  } else if (ImGui::BeginTable("##shard", 3,
-                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                                   ImGuiTableFlags_ScrollY,
-                               ImVec2(0, 120))) {
+  } else if (ImGui::BeginTable(
+                 "##shard", 3,
+                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                 ImVec2(0, 120))) {
     ImGui::TableSetupColumn("Name");
     ImGui::TableSetupColumn("State");
     ImGui::TableSetupColumn("Joinable");
@@ -281,8 +275,7 @@ void RexNetOverlayDialog::OnDraw(ImGuiIO& /*io*/) {
   ImGui::Separator();
   ImGui::Text("Peers (%zu):", status.peers.size());
   if (ImGui::BeginTable("##peers", 3,
-                        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                            ImGuiTableFlags_ScrollY,
+                        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
                         ImVec2(0, 140))) {
     ImGui::TableSetupColumn("Virtual IP");
     ImGui::TableSetupColumn("Status");

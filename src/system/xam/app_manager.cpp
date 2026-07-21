@@ -68,8 +68,7 @@ X_HRESULT AppManager::DispatchMessageAsync(uint32_t app_id, uint32_t message, ui
       app->DispatchMessageAsync(message, buffer_ptr, buffer_length, overlapped_ptr, out_deferred);
   if (REXCVAR_GET(xam_trace_msgs)) {
     REXSYS_INFO("XMsg async app={:08X} msg={:08X} len={} deferred={} -> {:08X}", app_id, message,
-                buffer_length, out_deferred && *out_deferred,
-                static_cast<uint32_t>(result));
+                buffer_length, out_deferred && *out_deferred, static_cast<uint32_t>(result));
   }
   return result;
 }
