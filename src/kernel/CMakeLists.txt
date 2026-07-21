@@ -71,8 +71,19 @@ target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexa
 
 if(REXGLUE_ENABLE_REXNET)
     # RexNet netplay module: XNetStartup/XNetCleanup manage the shared
-    # instance (see xam/xam_net.cpp). Definition is PRIVATE — public headers
-    # must not depend on it.
+    # instance (see xam/xam_net.cpp).
+    #
+    # PUBLIC, so consumers that compile SDK reference sources (rex_app.cpp is
+    # not built here — apps compile their own copy) can gate on it and agree
+    # with the library they link. This is safe *because* no public header's
+    # layout depends on it: rex_app.h deliberately holds the RexNet overlay
+    # as its base type so the struct is identical either way. Keep it that
+    # way — if a public header ever branches on this define, a consumer built
+    # without it will silently disagree about object layout.
+    # The link stays PRIVATE: rexnet is an OBJECT library absorbed into this
+    # shared library, so consumers never link it themselves and exporting it
+    # would only add a target they cannot resolve. Only the *define* needs to
+    # travel outward.
     target_link_libraries(rexruntime PRIVATE rexnet)
-    target_compile_definitions(rexruntime PRIVATE REXGLUE_ENABLE_REXNET=1)
+    target_compile_definitions(rexruntime PUBLIC REXGLUE_ENABLE_REXNET=1)
 endif()

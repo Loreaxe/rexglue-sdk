@@ -8,6 +8,33 @@ corrosion_import_crate(
     CRATE_TYPES staticlib
 )
 
+# Keep cargo from oversubscribing the machine.
+#
+# Ninja sees the whole cargo invocation as *one* edge, so it happily runs its
+# full parallel width of C++ compiles alongside it — while cargo, told
+# nothing, spawns one rustc per core inside that single edge. On a 16-core
+# host that is ~18 C++ jobs plus 16 rustc jobs at once. Ninja gained a GNU
+# jobserver in 1.13 that would solve this properly; until the floor moves
+# there, capping cargo is the portable fix. rustc is memory-hungry, so the
+# failure this prevents is an OOM during a full build, not merely slow.
+#
+# 0 means "do not pass a limit" (cargo's own default: one job per core).
+if(NOT DEFINED REXGLUE_REXNET_CARGO_JOBS)
+    cmake_host_system_information(RESULT _rexnet_host_cores QUERY NUMBER_OF_LOGICAL_CORES)
+    if(_rexnet_host_cores GREATER 1)
+        math(EXPR _rexnet_default_jobs "${_rexnet_host_cores} / 2")
+    else()
+        set(_rexnet_default_jobs 1)
+    endif()
+    set(REXGLUE_REXNET_CARGO_JOBS "${_rexnet_default_jobs}" CACHE STRING
+        "Parallel cargo jobs when building rexnet-core (0 = cargo's default)")
+endif()
+
+if(REXGLUE_REXNET_CARGO_JOBS GREATER 0)
+    corrosion_set_env_vars(rexnet_core "CARGO_BUILD_JOBS=${REXGLUE_REXNET_CARGO_JOBS}")
+    message(STATUS "RexNet: cargo limited to ${REXGLUE_REXNET_CARGO_JOBS} parallel jobs")
+endif()
+
 add_library(rexnet OBJECT
     rexnet.cpp
     pseudonym.cpp

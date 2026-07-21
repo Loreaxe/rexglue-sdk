@@ -29,8 +29,14 @@ set(REXUI_OVERLAY_SOURCES
     overlay/console_overlay.cpp
     overlay/console_commands.cpp
     overlay/settings_overlay.cpp
-    overlay/rexnet_overlay.cpp
 )
+
+# RexNet's overlay is part of the optional netplay module: without it there is
+# nothing for the panel to show, so it is not compiled rather than shipped as
+# an empty window.
+if(REXGLUE_ENABLE_REXNET)
+    list(APPEND REXUI_OVERLAY_SOURCES overlay/rexnet_overlay.cpp)
+endif()
 
 # Vulkan UI backend
 set(REXUI_VULKAN_SOURCES
@@ -91,6 +97,13 @@ endif()
 
 add_library(rexui OBJECT ${REXUI_SOURCES})
 add_library(rex::ui ALIAS rexui)
+
+# rexui compiles the overlay itself, so it needs the define at its own compile
+# time — it is a dependency of rexruntime, not a dependent, so the definition
+# set there does not reach it.
+if(REXGLUE_ENABLE_REXNET)
+    target_compile_definitions(rexui PUBLIC REXGLUE_ENABLE_REXNET=1)
+endif()
 
 target_include_directories(rexui PUBLIC
     $<BUILD_INTERFACE:${REXGLUE_ROOT}/include>

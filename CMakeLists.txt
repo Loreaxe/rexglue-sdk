@@ -191,6 +191,14 @@ if(REXGLUE_BUILD_TESTS)
     list(APPEND CMAKE_MODULE_PATH "${REXGLUE_ROOT}/thirdparty/catch2/extras")
 endif()
 
+# RexNet is the SDK's only Rust dependency. Check for a toolchain *before*
+# thirdparty pulls in corrosion, so a missing or stale install is reported as
+# itself rather than as a corrosion failure that never mentions Rust.
+if(REXGLUE_ENABLE_REXNET)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_rust.cmake)
+    rexglue_require_rust_toolchain()
+endif()
+
 # Third-party dependencies (vendored sources only)
 add_subdirectory(thirdparty)
 

@@ -52,7 +52,6 @@ namespace ui {
 class AchievementNotificationDialog;
 class ConsoleDialog;
 class SettingsDialog;
-class RexNetOverlayDialog;
 }  // namespace ui
 
 /// Base class for recompiled Xbox 360 applications.
@@ -300,7 +299,14 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
-  std::unique_ptr<ui::RexNetOverlayDialog> rexnet_overlay_;
+  // Held as the base type, like achievements_overlay_ above: RexNet is an
+  // optional module, and naming the concrete dialog here would make this
+  // header's meaning depend on REXGLUE_ENABLE_REXNET. That define is PRIVATE
+  // to the runtime and is not exported to consumers, so a header that changed
+  // shape with it would silently disagree with the library it was built
+  // against. A unique_ptr is a unique_ptr either way — the layout is
+  // identical whether or not the module is compiled in.
+  std::unique_ptr<ui::ImGuiDialog> rexnet_overlay_;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
   uint64_t achievement_notification_listener_ = 0;
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;
