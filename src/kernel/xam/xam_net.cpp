@@ -305,6 +305,25 @@ void RexNetStartup() {
       }
     }
 
+    // Per-game configuration (§11.1) is read *before* the engine starts:
+    // its [network] lists are engine construction parameters, and loading it
+    // afterwards would leave them silently inert.
+    std::optional<net::GameConfig> game_config;
+    auto config_path = kernel_state->emulator()->FindMetadataPath("rexnet.toml");
+    if (config_path) {
+      game_config = net::RexNet::LoadGameConfig(*config_path);
+    }
+    if (game_config) {
+      options.relays = game_config->relays;
+      options.bootstrap.insert(options.bootstrap.end(), game_config->bootstrap.begin(),
+                               game_config->bootstrap.end());
+      if (!game_config->bootstrap.empty()) {
+        // Project-supplied entry points are additional, not a replacement:
+        // the public set stays unless the user turned it off.
+        REXKRNL_INFO("rexnet.toml: {} extra bootstrap peer(s)", game_config->bootstrap.size());
+      }
+    }
+
     auto* rexnet = net::RexNet::InitializeShared(options);
     if (!rexnet) {
       REXKRNL_ERROR(
@@ -401,9 +420,9 @@ void RexNetStartup() {
     // Per-game configuration (design spec §11.1): session model, channel
     // mode, presence context mapping, quirks. Found via the runtime's
     // per-title metadata discovery.
-    if (auto config_path = kernel_state->emulator()->FindMetadataPath("rexnet.toml")) {
-      if (auto config = net::RexNet::LoadGameConfig(*config_path)) {
-        rexnet->SetGameConfig(std::move(*config));
+    if (config_path) {
+      if (game_config) {
+        rexnet->SetGameConfig(std::move(*game_config));
       }
     } else {
       // WARN, not INFO: for a title that ships one this means every

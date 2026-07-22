@@ -379,6 +379,64 @@ up to 5 s; first authenticated probe pair wins.
 - Relay discovery: relays register as providers under
   `rexnet/v1/relays` in addition to standard libp2p relay discovery.
 
+### 9.1 Hosted relays: accelerant, never authority
+
+Nothing stops a project pointing at relays somebody runs and pays for, and
+there are good reasons to: reservations established in advance make CGNAT
+players connect reliably, which no amount of cleverness in the punch can
+guarantee on its own.
+
+The rule that keeps this from becoming the thing RexNet exists to avoid is
+that **losing a hosted relay must cost speed, never capability**. Concretely,
+enforced rather than intended:
+
+- Configured relays live in the consuming project's `rexnet.toml`
+  (`[network] relays`), never in the SDK. Shipping an address would make the
+  module depend on infrastructure somebody has to keep funding.
+- Every failure is non-fatal — unparseable, unreachable, withdrawn. A relay
+  cannot prevent the engine starting, cannot suppress the direct listeners,
+  and cannot stop discovery.
+- Reservations are held on **all** configured relays at once rather than one
+  being chosen. A reservation costs a round trip to establish, so finding out
+  a relay is dead at the moment you need it is already too late.
+- A relay with no live reservation is re-dialled slowly (60 s). Reservations
+  lapse when a relay restarts and nothing else notices, because the node keeps
+  working over direct paths.
+- `tests/relay_optional.rs` points two nodes at relays that do not exist and
+  requires them to find each other *and* carry game traffic anyway. It is
+  verified to fail if relay handling is made fatal.
+
+**Ordering matters, and the tempting order is wrong.** Preferring hosted
+infrastructure and treating peer-to-peer as the fallback inverts §1's first
+two pillars. The danger is not that it works badly — it is that it works
+*well*, for years, while the P2P path rots unexercised. Then the server goes
+away and the fallback turns out to have broken months earlier. That is exactly
+how the services this module replaces died: everything depended on them, and
+nothing had ever run without them. Hosted nodes therefore accelerate the same
+code path everyone else takes; they never become a different one.
+
+### 9.2 A directory is not a relay
+
+Worth stating because the two get conflated when borrowing from other
+projects. Xenia's netplay fork uses a **REST directory** (`FindPlayer`, a
+session registry, MAC-keyed address caching): it brokers who is playing what
+and where, and peers then connect to each other directly. It forwards no
+packets.
+
+That is our §10 session directory, not our relay. The failure modes differ:
+losing a directory means you cannot find new peers, while ones you already
+know still work; losing a relay means unreachable players cannot connect at
+all, however good discovery is.
+
+Adopting another project's directory also raises a compatibility question a
+relay does not. Peers found through a shared directory can only play if the
+peer-to-peer protocol matches — and RexNet's does not match Xenia's, which
+uses real IPs and an unencrypted game plane (§6.1) rather than virtual
+addressing. Listing sessions in a directory whose users cannot join them
+degrades that service for its own users, which is the substantive reason such
+an arrangement needs the operator's agreement rather than merely their
+tolerance.
+
 ---
 
 ## 10. Sessions and matchmaking

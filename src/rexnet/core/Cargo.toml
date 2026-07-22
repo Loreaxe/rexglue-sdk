@@ -41,6 +41,11 @@ path = "tests/guest_tcp.rs"
 required-features = ["net-tests"]
 
 [[test]]
+name = "relay_optional"
+path = "tests/relay_optional.rs"
+required-features = ["net-tests"]
+
+[[test]]
 name = "shard_broadcast"
 path = "tests/shard_broadcast.rs"
 required-features = ["net-tests"]

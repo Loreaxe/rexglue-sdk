@@ -59,6 +59,10 @@ struct RexNetOptions {
   std::string display_name;
   /// Bootstrap multiaddrs; empty is valid (LAN/manual/v6 still work).
   std::vector<std::string> bootstrap;
+  /// Circuit-v2 relays to hold reservations on (§9). Several are held at
+  /// once rather than one chosen; empty is fully supported. Accelerant, never
+  /// authority — a dead entry costs speed, never capability.
+  std::vector<std::string> relays;
   /// Also merge in the standard public (Amino) bootstrap set.
   bool use_default_bootstrap = true;
   /// Skip hole punching; run game traffic over the control tunnel (§14).
@@ -115,6 +119,12 @@ struct GameConfig {
 
   /// Ambient title shard, §17.3/§17.5. Opt-in: a title that has no use for
   /// passive presence never joins one and pays no ambient traffic.
+  /// [network] relays — hosted circuit-v2 relays, merged with anything the
+  /// host passed programmatically. Per-project, so the SDK ships no
+  /// addresses of its own and depends on nobody's infrastructure.
+  std::vector<std::string> relays;
+  /// [network] bootstrap — extra DHT entry points, same reasoning.
+  std::vector<std::string> bootstrap;
   bool shard_enabled = false;
   /// 0 = spec default (255). Lower it for titles whose ambient payload is
   /// heavy enough that a full shard would be noisy.

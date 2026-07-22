@@ -91,6 +91,10 @@ const FRAME_PROBE_ACK: u8 = 0x03;
 /// Shard rescan cadence and migration cooldown (§17.3.3, §17.6 open item:
 /// untuned). The sweep is cheap -- one provider lookup -- but a migration is
 /// a resubscribe, so moves are rate-limited far more aggressively than scans.
+/// How often a relay with no live reservation is re-dialled. Slow on purpose:
+/// relays are an accelerant, and a node with none still works.
+const RELAY_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
 const SHARD_RESCAN_INTERVAL: Duration = Duration::from_secs(20);
 /// How long to keep looking after a fruitless sweep before founding a shard.
 ///
@@ -307,9 +311,14 @@ pub struct EngineConfig {
     pub listen_port: u16,
     /// Fixed game-plane UDP port; 0 = ephemeral.
     pub game_port: u16,
-    /// Relay to hold a circuit-v2 reservation on (enables inbound relayed
-    /// connections and DCUtR upgrades while behind NAT).
-    pub relay: Option<String>,
+    /// Circuit-v2 relays to hold reservations on. Several are held at once
+    /// rather than one being chosen: a reservation takes a round trip to
+    /// establish, so discovering a dead relay at the moment you need it is
+    /// too late.
+    ///
+    /// Accelerant, never authority (§9). An empty list is fully supported and
+    /// a configured relay that never answers must cost nothing but speed.
+    pub relays: Vec<String>,
     /// Skip hole punching and carry all game traffic over the control tunnel
     /// (§14 degraded path).
     ///
@@ -872,9 +881,31 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
         }
     }
 
-    if let Some(relay) = &config.relay {
-        let addr: Multiaddr = relay.parse()?;
-        swarm.listen_on(addr.with(Protocol::P2pCircuit))?;
+    // Deliberately non-fatal, all of it. A relay that is unparseable, down,
+    // or withdrawn must not stop the engine starting -- that would make hosted
+    // infrastructure a dependency, which is the thing §9 exists to prevent.
+    let mut relay_addrs: Vec<(PeerId, Multiaddr)> = Vec::new();
+    for entry in &config.relays {
+        let addr: Multiaddr = match entry.parse() {
+            Ok(addr) => addr,
+            Err(err) => {
+                tracing::warn!(entry, %err, "bad relay multiaddr, skipped");
+                continue;
+            }
+        };
+        let Some(Protocol::P2p(peer)) = addr.iter().last() else {
+            // Without a peer id we cannot tell whether its reservation is
+            // live, so it could never be retried or reported.
+            tracing::warn!(%addr, "relay addr lacks /p2p/, skipped");
+            continue;
+        };
+        if let Err(err) = swarm.listen_on(addr.clone().with(Protocol::P2pCircuit)) {
+            tracing::warn!(%addr, %err, "relay reservation could not be started");
+        }
+        relay_addrs.push((peer, addr));
+    }
+    if !relay_addrs.is_empty() {
+        tracing::info!(count = relay_addrs.len(), "relays configured");
     }
 
     // Game-plane socket: one UDP socket multiplexing every guest port; the
@@ -942,6 +973,8 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             local_session: None,
             pending_session_search: None,
             relays: HashSet::new(),
+            relay_addrs,
+            relay_retry_at: HashMap::new(),
             rexnet_peers: HashSet::new(),
             shard_enabled: false,
             shard_cap: DEFAULT_SHARD_CAP,
@@ -1024,6 +1057,12 @@ struct Engine {
     // --- Ambient title shard, §17.3 -------------------------------------
     /// Peers currently carrying our traffic as a circuit relay (§9, §17.2).
     relays: HashSet<PeerId>,
+    /// Configured relays and their addresses, for retrying a reservation that
+    /// never came up or has since lapsed.
+    relay_addrs: Vec<(PeerId, Multiaddr)>,
+    /// When each relay was last dialled, so a dead one is retried slowly
+    /// rather than hammered.
+    relay_retry_at: HashMap<PeerId, Instant>,
     /// Connected peers whose identify shows they speak our shard protocol --
     /// i.e. other RexNet nodes, as opposed to the public DHT peers we are
     /// also connected to. Asked directly during shard discovery.
@@ -1135,6 +1174,7 @@ impl Engine {
         let mut shard_rescan = tokio::time::interval(SHARD_RESCAN_INTERVAL);
         let mut punch_watchdog = tokio::time::interval(PUNCH_WATCHDOG_INTERVAL);
         let mut shard_status = tokio::time::interval(SHARD_STATUS_INTERVAL);
+        let mut relay_check = tokio::time::interval(RELAY_RETRY_INTERVAL);
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
@@ -1153,6 +1193,7 @@ impl Engine {
                 }
                 _ = punch_watchdog.tick() => self.check_punch_deadlines(),
                 _ = shard_status.tick() => self.log_shard_status(),
+                _ = relay_check.tick() => self.retry_dead_relays(),
                 _ = shard_rescan.tick() => {
                     // Sweep, then settle on the *next* tick once descriptors
                     // have arrived; shard_settle also runs when a sweep
@@ -1168,13 +1209,41 @@ impl Engine {
     /// Record (or clear) a peer's relay role, announcing only real changes.
     /// DCUtR upgrades relayed connections to direct as soon as it can, so
     /// this flips more than once in a normal session.
+    /// Re-dial configured relays with no live reservation.
+    ///
+    /// Reservations lapse when a relay restarts or the network drops, and
+    /// nothing else notices: the node keeps working over direct paths, which
+    /// is exactly why a silently dead relay would otherwise stay dead until
+    /// the next launch.
+    fn retry_dead_relays(&mut self) {
+        let now = Instant::now();
+        let dead: Vec<(PeerId, Multiaddr)> = self
+            .relay_addrs
+            .iter()
+            .filter(|(peer, _)| !self.relays.contains(peer))
+            .filter(|(peer, _)| self.relay_retry_at.get(peer).is_none_or(|at| now >= *at))
+            .cloned()
+            .collect();
+        for (peer, addr) in dead {
+            self.relay_retry_at.insert(peer, now + RELAY_RETRY_INTERVAL);
+            match self.swarm.listen_on(addr.clone().with(Protocol::P2pCircuit)) {
+                Ok(_) => tracing::debug!(%addr, "retrying relay reservation"),
+                Err(err) => tracing::debug!(%addr, %err, "relay retry failed"),
+            }
+        }
+    }
+
     fn mark_relay(&mut self, peer: PeerId, is_relay: bool) {
         let changed =
             if is_relay { self.relays.insert(peer) } else { self.relays.remove(&peer) };
         if !changed {
             return;
         }
-        tracing::debug!(%peer, is_relay, "relay role changed");
+        tracing::info!(
+            %peer, is_relay,
+            live = self.relays.len(), configured = self.relay_addrs.len(),
+            "relay role changed"
+        );
         // A relay is app-relevant even when it is nothing else to us: the UI
         // has to be able to show it.
         if is_relay {

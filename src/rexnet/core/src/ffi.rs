@@ -136,6 +136,10 @@ pub struct RexNetConfig {
     /// Bootstrap multiaddrs; empty list is valid (LAN/manual/v6 still work).
     pub bootstrap: *const *const c_char,
     pub bootstrap_len: u32,
+    /// Circuit-v2 relays to hold reservations on (§9). Accelerant, never
+    /// authority: empty is supported and a dead entry costs only speed.
+    pub relays: *const *const c_char,
+    pub relays_len: u32,
     /// Also merge in [`crate::AMINO_BOOTSTRAP`] (the standard public set).
     pub use_default_bootstrap: bool,
     /// Skip hole punching; carry game traffic over the control tunnel (§14).
@@ -432,6 +436,12 @@ pub unsafe extern "C" fn rexnet_init(cfg: *const RexNetConfig) -> *mut RexNetHan
         if cfg.use_default_bootstrap {
             bootstrap.extend(crate::AMINO_BOOTSTRAP.iter().map(|s| s.to_string()));
         }
+        let mut relays = Vec::new();
+        if !cfg.relays.is_null() {
+            for i in 0..cfg.relays_len as usize {
+                relays.push(cstr_owned(*cfg.relays.add(i)));
+            }
+        }
 
         let keypair = match identity::load_or_generate(&data_dir) {
             Ok(k) => k,
@@ -463,7 +473,7 @@ pub unsafe extern "C" fn rexnet_init(cfg: *const RexNetConfig) -> *mut RexNetHan
                 bootstrap,
                 listen_port: 0,
                 game_port: 0,
-                relay: None,
+                relays,
                 force_tunnel: cfg.force_tunnel,
             },
         )) {

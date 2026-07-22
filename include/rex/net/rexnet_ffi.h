@@ -36,6 +36,11 @@ typedef struct RexNetConfig {
   /** Bootstrap multiaddrs; empty list is valid (LAN/manual/v6 still work). */
   const char* const* bootstrap;
   uint32_t bootstrap_len;
+  /** Circuit-v2 relays to hold reservations on (spec §9). Several are held
+   *  at once, not one chosen. Accelerant, never authority: an empty list is
+   *  fully supported and a dead entry costs speed, never capability. */
+  const char* const* relays;
+  uint32_t relays_len;
   /** Also merge in the standard public (Amino) bootstrap set. */
   bool use_default_bootstrap;
   /** Skip hole punching; carry game traffic over the control tunnel

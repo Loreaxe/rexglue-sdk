@@ -52,13 +52,24 @@ std::unique_ptr<RexNet> RexNet::Create(const RexNetOptions& options) {
     bootstrap.push_back(addr.c_str());
   }
 
+  std::vector<const char*> relays;
+  relays.reserve(options.relays.size());
+  for (const auto& addr : options.relays) {
+    relays.push_back(addr.c_str());
+  }
+
   RexNetConfig cfg{};
   cfg.data_dir = data_dir.c_str();
   cfg.title_id = options.title_id;
   cfg.display_name = options.display_name.c_str();
   cfg.bootstrap = bootstrap.empty() ? nullptr : bootstrap.data();
   cfg.bootstrap_len = static_cast<uint32_t>(bootstrap.size());
+  cfg.relays = relays.empty() ? nullptr : relays.data();
+  cfg.relays_len = static_cast<uint32_t>(relays.size());
   cfg.use_default_bootstrap = options.use_default_bootstrap;
+  if (!relays.empty()) {
+    REXNET_INFO("{} relay(s) configured (§9: accelerant, not a dependency)", relays.size());
+  }
   cfg.force_tunnel = options.force_tunnel;
   if (options.force_tunnel) {
     REXNET_WARN(
@@ -566,6 +577,20 @@ std::optional<GameConfig> RexNet::LoadGameConfig(const std::filesystem::path& pa
     config.game_channel = table["game"]["game_channel"].value_or(std::string("unreliable"));
     config.advertised_title_id =
         static_cast<uint32_t>(table["game"]["advertised_title_id"].value_or(int64_t(0)));
+    // [network] — §9. Hosted infrastructure is opt-in per project; the SDK
+    // ships no addresses, so nothing depends on anyone's servers by default.
+    auto read_list = [&](const char* key, std::vector<std::string>& out) {
+      if (auto arr = table["network"][key].as_array()) {
+        for (auto& node : *arr) {
+          if (auto entry = node.value<std::string>()) {
+            out.push_back(*entry);
+          }
+        }
+      }
+    };
+    read_list("relays", config.relays);
+    read_list("bootstrap", config.bootstrap);
+
     // [shard] — §17.5. Absent section means disabled, so existing configs
     // keep their current behaviour untouched.
     config.shard_enabled = table["shard"]["enabled"].value_or(false);
