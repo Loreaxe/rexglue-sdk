@@ -93,6 +93,9 @@ typedef enum RexNetEventKind {
   /** Outbound guest TCP connect failed. virtual_ip = peer, port = dst,
    *  data = UTF-8 reason. */
   REXNET_EVENT_STREAM_CONNECT_FAILED,
+  /** Measured round trip to a peer (spec §11). virtual_ip = peer,
+   *  port = milliseconds. Emitted only on a material change. */
+  REXNET_EVENT_PEER_RTT,
 } RexNetEventKind;
 
 /** Fixed-size POD event; drain once per frame with rexnet_poll_event(). */

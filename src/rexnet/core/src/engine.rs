@@ -72,6 +72,18 @@ fn format_vip(vip: u32) -> String {
 }
 
 /// Game-plane frame types (first byte on the game socket).
+/// Smallest RTT change worth telling the shim about; below this it is noise.
+const RTT_REPORT_DELTA_MS: u32 = 5;
+
+/// `[type][nonce 16][echo 8]`.
+const PROBE_FRAME_LEN: usize = 25;
+
+/// Microseconds since the process started. Only ever compared with itself.
+fn now_micros() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
 const FRAME_DATA: u8 = 0x01;
 const FRAME_PROBE: u8 = 0x02;
 const FRAME_PROBE_ACK: u8 = 0x03;
@@ -215,6 +227,7 @@ pub enum Command {
     Echo { peer: PeerId, reply: oneshot::Sender<Result<Duration, String>> },
     FindPeer { peer: PeerId, reply: oneshot::Sender<Result<Vec<Multiaddr>, String>> },
     LocalAddrs { reply: oneshot::Sender<Vec<Multiaddr>> },
+
     Shutdown,
 }
 
@@ -258,6 +271,9 @@ pub enum Event {
     StreamClosed { stream_id: StreamId },
     /// An outbound guest TCP connect failed.
     StreamConnectFailed { virtual_ip: u32, dst_port: u16, message: String },
+    /// Measured round trip to a peer, milliseconds. Emitted only on a
+    /// material change; the shim caches it for QoS.
+    PeerRtt { virtual_ip: u32, rtt_ms: u32 },
     /// Our own address on the virtual network changed — we joined, left or
     /// migrated shards (§17.3.5). The shim reports this as the local XNADDR.
     LocalAddress { virtual_ip: u32 },
@@ -951,6 +967,7 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             stream_tx,
             force_tunnel: config.force_tunnel,
             tunneled_peers: HashSet::new(),
+            peer_rtt_ms: HashMap::new(),
             tunnel_control,
             tunnel_writers: HashMap::new(),
             tunnel_tx,
@@ -1069,6 +1086,9 @@ struct Engine {
     /// Peers whose punch failed and whose traffic now rides the control
     /// connection (§14). Cleared if a later punch (or DCUtR upgrade) succeeds.
     tunneled_peers: HashSet<PeerId>,
+    /// Smoothed round-trip time per peer, milliseconds. Fed by probe acks and
+    /// read by the shim for QoS, where titles show it as ping.
+    peer_rtt_ms: HashMap<PeerId, u32>,
     /// Handle used to open outbound tunnel streams; cloned into the tasks.
     tunnel_control: libp2p_stream::Control,
     /// Write half of each peer's outbound tunnel. Bounded, because the guest
@@ -1807,6 +1827,34 @@ impl Engine {
         }
     }
 
+    /// Record a round trip measured from a probe ack.
+    ///
+    /// Smoothed rather than replaced: a single sample on a busy link is noise,
+    /// and a title showing ping wants a stable number.
+    fn note_rtt(&mut self, addr: SocketAddr, sent_micros: u64) {
+        let Some(peer) = self.peer_by_game_endpoint.get(&addr).copied() else {
+            return;
+        };
+        let now = now_micros();
+        if now < sent_micros {
+            return; // stamp from a previous engine, or a forged ack
+        }
+        let sample = ((now - sent_micros) / 1000).min(u32::MAX as u64) as u32;
+        let smoothed = match self.peer_rtt_ms.get(&peer) {
+            // 1/4 weight on the newest sample, as TCP's SRTT does.
+            Some(prev) => (prev * 3 + sample) / 4,
+            None => sample,
+        };
+        let changed = self
+            .peer_rtt_ms
+            .insert(peer, smoothed)
+            .map_or(true, |prev| prev.abs_diff(smoothed) >= RTT_REPORT_DELTA_MS);
+        if changed {
+            let virtual_ip = self.vip_for(peer);
+            self.emit(Event::PeerRtt { virtual_ip, rtt_ms: smoothed });
+        }
+    }
+
     /// Carry one datagram over the control connection (§14 degraded path).
     fn send_tunneled(&mut self, peer: PeerId, src_port: u16, dst_port: u16, data: Vec<u8>) {
         let Some(frame) = tunnel::encode(src_port, dst_port, &data) else {
@@ -2120,10 +2168,14 @@ impl Engine {
     fn spawn_probes(&self, nonce: [u8; 16], candidates: Vec<SocketAddr>) {
         let socket = self.game_socket.clone();
         tokio::spawn(async move {
-            let mut probe = Vec::with_capacity(17);
-            probe.push(FRAME_PROBE);
-            probe.extend_from_slice(&nonce);
             for _ in 0..PROBE_ROUNDS {
+                // Stamped per round: the peer echoes it back untouched, so the
+                // round trip is measured entirely against our own clock and
+                // needs no agreement about time.
+                let mut probe = Vec::with_capacity(PROBE_FRAME_LEN);
+                probe.push(FRAME_PROBE);
+                probe.extend_from_slice(&nonce);
+                probe.extend_from_slice(&now_micros().to_be_bytes());
                 for addr in &candidates {
                     let _ = socket.send_to(&probe, addr).await;
                 }
@@ -2209,16 +2261,22 @@ impl Engine {
                 let virtual_ip = self.vip_for(peer);
                 self.emit(Event::Datagram { virtual_ip, src_port, dst_port, data });
             }
-            Some(FRAME_PROBE) | Some(FRAME_PROBE_ACK) if frame.len() == 17 => {
+            Some(FRAME_PROBE) | Some(FRAME_PROBE_ACK) if frame.len() == PROBE_FRAME_LEN => {
                 let mut nonce = [0u8; 16];
                 nonce.copy_from_slice(&frame[1..17]);
                 let is_probe = frame[0] == FRAME_PROBE;
                 self.lock_game_endpoint(nonce, addr);
                 if is_probe {
-                    let mut ack = Vec::with_capacity(17);
+                    // Echo the stamp back verbatim; its meaning is the
+                    // sender's alone.
+                    let mut ack = Vec::with_capacity(PROBE_FRAME_LEN);
                     ack.push(FRAME_PROBE_ACK);
-                    ack.extend_from_slice(&nonce);
+                    ack.extend_from_slice(&frame[1..PROBE_FRAME_LEN]);
                     let _ = self.game_socket.try_send_to(&ack, addr);
+                } else {
+                    let mut stamp = [0u8; 8];
+                    stamp.copy_from_slice(&frame[17..PROBE_FRAME_LEN]);
+                    self.note_rtt(addr, u64::from_be_bytes(stamp));
                 }
             }
             _ => tracing::trace!(%addr, len = frame.len(), "bad game frame dropped"),
@@ -2623,6 +2681,7 @@ impl Engine {
                     self.close_tunnel(&peer_id);
                     // A reconnect negotiates fresh keys, so counters and the
                     // replay window are never reused.
+                    self.peer_rtt_ms.remove(&peer_id);
                     self.key_agreements.remove(&peer_id);
                     self.game_keys.remove(&peer_id);
                     // Allow a retry if they come back on the topic.

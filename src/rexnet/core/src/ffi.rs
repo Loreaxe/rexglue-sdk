@@ -209,6 +209,8 @@ pub enum RexNetEventKind {
     StreamClosed,
     /// Outbound guest TCP connect failed. virtual_ip = peer, port = dst.
     StreamConnectFailed,
+    /// Measured round trip to a peer. virtual_ip = peer, port = milliseconds.
+    PeerRtt,
 }
 
 /// Fixed-size POD event, drained once per frame via [`rexnet_poll_event`].
@@ -296,6 +298,11 @@ fn fill_event(out: &mut RexNetEvent, event: Event) {
             out.virtual_ip = virtual_ip;
             out.port = dst_port;
             set_data(out, message.as_bytes());
+        }
+        Event::PeerRtt { virtual_ip, rtt_ms } => {
+            out.kind = RexNetEventKind::PeerRtt;
+            out.virtual_ip = virtual_ip;
+            out.port = rtt_ms.min(u16::MAX as u32) as u16;
         }
         Event::LocalAddress { virtual_ip } => {
             out.kind = RexNetEventKind::LocalAddress;

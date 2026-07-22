@@ -17,6 +17,8 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <random>
 #include <ctime>
 #include <fstream>
 
@@ -55,6 +57,24 @@
 #endif
 
 namespace rex {
+
+namespace {
+// The XNKID's top byte is a session-type tag the guest reads back, not
+// opaque bytes: 0x00 system link, 0xAE online, 0xC0 server. A title asking
+// "is this a system-link session" gets a wrong answer if we mint noise.
+static constexpr uint8_t kXnkidSystemLink = 0x00;
+static constexpr uint8_t kXnkidOnline = 0xAE;
+
+// The session the guest last registered, so XNetInAddrToXnAddr can report a
+// real XNKID rather than zeros.
+static std::mutex g_session_key_mutex;
+static uint8_t g_session_xnkid[8] = {};
+static bool g_session_registered = false;
+
+// Set by XNetSetSystemLinkPort; a non-zero value means the title is doing
+// System Link, which is what decides the XNKID tag above.
+static std::atomic<uint32_t> g_system_link_port{0};
+}  // namespace
 namespace kernel {
 namespace xam {
 using namespace rex::system;
@@ -961,8 +981,11 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
     // Our address on the virtual network -- our host on the shard's /24 when
     // we are on one, else the reserved-range default.
     FillRexNetXnAddr(addr_ptr, rexnet->local_vip(), rexnet->local_peer_id());
-    return XnAddrStatus::XNET_GET_XNADDR_STATIC | XnAddrStatus::XNET_GET_XNADDR_GATEWAY |
-           XnAddrStatus::XNET_GET_XNADDR_DNS | XnAddrStatus::XNET_GET_XNADDR_ONLINE;
+    // ETHERNET included: a title checking for a physical link finds none
+    // without it, and the virtual adapter is always "plugged in".
+    return XnAddrStatus::XNET_GET_XNADDR_ETHERNET | XnAddrStatus::XNET_GET_XNADDR_STATIC |
+           XnAddrStatus::XNET_GET_XNADDR_GATEWAY | XnAddrStatus::XNET_GET_XNADDR_DNS |
+           XnAddrStatus::XNET_GET_XNADDR_ONLINE;
   }
 #endif
 
@@ -1072,8 +1095,22 @@ u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, u32 in_addr, ppc_ptr_t<XNADDR> x
   auto* rexnet = net::RexNet::shared();
   if (rexnet && xn_addr) {
     if (xid) {
-      // XNKID: filled with the real session id once XSession lands.
-      std::memset(xid, 0, 8);
+      // Report the session the guest registered; zeros would tell a title its
+      // own session does not exist.
+      std::lock_guard<std::mutex> lock(g_session_key_mutex);
+      if (g_session_registered) {
+        std::memcpy(static_cast<void*>(xid), g_session_xnkid, sizeof(g_session_xnkid));
+      } else {
+        std::memset(xid, 0, 8);
+      }
+    }
+    // System Link discovery resolves the broadcast address before it knows any
+    // peer. Failing here leaves the title with nothing to address, so answer
+    // with our own identity on the broadcast address.
+    const bool is_broadcast = in_addr == 0xFFFFFFFFu || (in_addr & 0xFFu) == 0xFFu;
+    if (is_broadcast) {
+      FillRexNetXnAddr(xn_addr, in_addr, rexnet->local_peer_id());
+      return 0;
     }
     if (IsLocalVip(rexnet, in_addr)) {
       FillRexNetXnAddr(xn_addr, in_addr, rexnet->local_peer_id());
@@ -1156,22 +1193,38 @@ u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 in_addr) {
 // Key registration is a no-op: the RexNet transport is already encrypted
 // end-to-end, and XNKID/XNKEY only survive as opaque session identifiers.
 u32 NetDll_XNetCreateKey_entry(u32 caller, mapped_void xnkid, mapped_void xnkey) {
-  // Non-constant so two hosts don't mint identical session ids.
-  static std::atomic<uint32_t> counter{0};
-  uint32_t n = counter.fetch_add(1) + static_cast<uint32_t>(time(nullptr));
+  // A title that declared a system-link port is running System Link; anything
+  // else is treated as online, which is what RexNet presents itself as.
+  // Derived from what the guest did rather than configured per title (§11.0).
+  const uint8_t tag =
+      g_system_link_port.load(std::memory_order_relaxed) ? kXnkidSystemLink : kXnkidOnline;
+
+  std::random_device rd;
+  uint8_t kid[8];
+  kid[0] = tag;
+  for (int i = 1; i < 8; i++) {
+    kid[i] = static_cast<uint8_t>(rd());
+  }
   if (xnkid) {
-    uint8_t* kid = static_cast<uint8_t*>(static_cast<void*>(xnkid));
-    for (int i = 0; i < 8; i++) {
-      kid[i] = static_cast<uint8_t>(n >> ((i % 4) * 8)) ^ static_cast<uint8_t>(0xA5 + i);
-    }
+    std::memcpy(static_cast<void*>(xnkid), kid, sizeof(kid));
   }
   if (xnkey) {
-    std::memset(xnkey, 0xBB, 16);
+    uint8_t key[16];
+    for (auto& b : key) {
+      b = static_cast<uint8_t>(rd());
+    }
+    std::memcpy(static_cast<void*>(xnkey), key, sizeof(key));
   }
+  REXKRNL_INFO("XNetCreateKey -> {} session", tag == kXnkidSystemLink ? "system-link" : "online");
   return 0;
 }
 
 u32 NetDll_XNetRegisterKey_entry(u32 caller, mapped_void xnkid, mapped_void xnkey) {
+  if (xnkid) {
+    std::lock_guard<std::mutex> lock(g_session_key_mutex);
+    std::memcpy(g_session_xnkid, static_cast<const void*>(xnkid), sizeof(g_session_xnkid));
+    g_session_registered = true;
+  }
   return 0;
 }
 
@@ -1187,7 +1240,6 @@ u32 NetDll_XNetUnregisterKey_entry(u32 caller, mapped_void xnkid) {
 // The port is stored verbatim and returned verbatim by XNetGetSystemLinkPort,
 // so a title that sets and reads it back sees exactly what it wrote,
 // whichever byte order it chose.
-static std::atomic<uint32_t> g_system_link_port{0};
 
 u32 NetDll_XNetSetSystemLinkPort_entry(u32 caller, u32 port) {
   g_system_link_port.store(port, std::memory_order_relaxed);
@@ -1281,9 +1333,10 @@ u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32
   return X_ERROR_FUNCTION_FAILED;
 }
 
-// Synthetic-but-sane QoS results (design spec §11): every target reports as
-// contacted with plausible RTT/bandwidth so join screens proceed.
-// TODO(rexnet): populate rtt from the punch engine's measured RTT.
+// QoS results (design spec §11): every target reports as contacted so join
+// screens proceed. Round trip is the punch engine's measured value where a
+// probe has come back, and a plausible default until then — a title showing
+// ping would otherwise rank every peer identically.
 u32 NetDll_XNetQosLookup_entry(u32 caller, u32 cxna, mapped_void apxna, mapped_void apxnkid,
                                mapped_void apxnkey, u32 cina, mapped_void aina,
                                mapped_void adwServiceId, u32 probe_count, u32 bits_per_sec,
@@ -1298,13 +1351,29 @@ u32 NetDll_XNetQosLookup_entry(u32 caller, u32 cxna, mapped_void apxna, mapped_v
       std::memset(qos, 0, size);
       qos->count = count;
       qos->count_pending = 0;
+      // Targets arrive as XNADDRs first, then raw in_addrs; both carry the
+      // virtual IP we key measurements by.
+      auto* xnaddrs = static_cast<const XNADDR*>(static_cast<void*>(apxna));
+      auto* inaddrs = static_cast<const rex::be<uint32_t>*>(static_cast<void*>(aina));
       for (uint32_t i = 0; i < count; i++) {
+        uint32_t target_vip = 0;
+        if (i < cxna) {
+          if (xnaddrs) {
+            target_vip = ntohl(xnaddrs[i].ina.s_addr);
+          }
+        } else if (inaddrs) {
+          target_vip = ntohl(inaddrs[i - cxna]);
+        }
+        const uint32_t measured = target_vip ? net::RexNet::shared()->PeerRttMs(target_vip) : 0;
+
         auto& info = qos->info[i];
         info.flags = 0x01 | 0x02;  // XNET_XNQOSINFO_COMPLETE | _TARGET_CONTACTED
         info.probes_xmit = static_cast<uint16_t>(probe_count ? probe_count : 8);
         info.probes_recv = info.probes_xmit;
-        info.rtt_min_in_msecs = 30;
-        info.rtt_med_in_msecs = 50;
+        // Until a probe has come back there is nothing honest to report, so
+        // fall back to a plausible figure rather than claim a 0 ms link.
+        info.rtt_min_in_msecs = static_cast<uint32_t>(measured ? measured : 30);
+        info.rtt_med_in_msecs = static_cast<uint32_t>(measured ? measured : 50);
         info.up_bits_per_sec = bits_per_sec ? bits_per_sec : 1024 * 1024;
         info.down_bits_per_sec = bits_per_sec ? bits_per_sec : 1024 * 1024;
       }

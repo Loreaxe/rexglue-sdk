@@ -1017,6 +1017,12 @@ std::optional<uint32_t> RexNet::VipFromOnlineKey(const uint8_t key[20]) {
   return virtual_ips_.FindByOnlineKey(key);
 }
 
+uint32_t RexNet::PeerRttMs(uint32_t virtual_ip) const {
+  std::lock_guard lock(mutex_);
+  auto it = peer_rtt_ms_.find(virtual_ip);
+  return it == peer_rtt_ms_.end() ? 0 : it->second;
+}
+
 std::optional<RexNetPeerId> RexNet::PeerFromVip(uint32_t virtual_ip) {
   std::lock_guard lock(mutex_);
   return virtual_ips_.Lookup(virtual_ip);
@@ -1146,8 +1152,11 @@ void RexNet::HandleEvent(const RexNetEvent& event) {
       break;
     }
     case REXNET_EVENT_INVITE_REPLIED:
-      // TODO(rexnet): notify_sink_ -> XN_LIVE_INVITE_ACCEPTED once the
-      // accepted-invite bridge into XamInviteGetAcceptedInfo exists.
+      // Deliberately no XN_LIVE_INVITE_ACCEPTED here: that notification tells
+      // a title the *local* user accepted an invite and should now join. This
+      // is the far side answering an invite we sent, so raising it would send
+      // us to join our own session. The accept path is handled where the
+      // session descriptor arrives.
       REXNET_INFO("invite {}", event.flag ? "accepted" : "declined");
       break;
     case REXNET_EVENT_PRESENCE_UPDATED: {
@@ -1407,13 +1416,16 @@ void RexNet::HandleEvent(const RexNetEvent& event) {
       }
       break;
     }
+    case REXNET_EVENT_PEER_RTT: {
+      std::lock_guard lock(mutex_);
+      peer_rtt_ms_[event.virtual_ip] = event.port;
+      break;
+    }
     case REXNET_EVENT_ERROR:
       REXNET_WARN("{}",
                   std::string_view(reinterpret_cast<const char*>(event.data), event.data_len));
       break;
     default:
-      // TODO(rexnet, milestone 5): invites/presence/session results ->
-      // guest XNotify queue via notify_sink_.
       break;
   }
 }

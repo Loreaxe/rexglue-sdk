@@ -356,6 +356,10 @@ class RexNet {
   /// Peer behind a virtual IP.
   std::optional<RexNetPeerId> PeerFromVip(uint32_t virtual_ip);
 
+  /// Measured round trip to a peer in milliseconds, 0 when unmeasured.
+  /// Fed by punch probe acks; titles surface it as ping (spec §11).
+  uint32_t PeerRttMs(uint32_t virtual_ip) const;
+
   const RexNetPeerId& local_peer_id() const { return local_peer_id_; }
   static std::string PeerIdString(const RexNetPeerId& peer);
   /// Parse a base58 peer id or a REXN- friend code (nullopt on malformed
@@ -441,7 +445,8 @@ class RexNet {
   RexNetPeerId local_peer_id_{};
 
   // Guards the tables below: the pump thread writes, guest threads read.
-  std::mutex mutex_;
+  // mutable: const accessors (PeerRttMs) still need to lock.
+  mutable std::mutex mutex_;
   VirtualIpTable virtual_ips_;
   std::unordered_map<uint32_t, ConnectStatus> statuses_;
   std::optional<std::array<uint8_t, 16>> session_id_;
@@ -454,6 +459,8 @@ class RexNet {
   std::unordered_map<std::string, bool> relays_;
   /// Written by the pump thread on LocalAddress, read from guest threads.
   std::atomic<uint32_t> local_vip_{kLocalVip};
+  /// vip -> round trip in ms, mirrored from REXNET_EVENT_PEER_RTT.
+  std::unordered_map<uint32_t, uint32_t> peer_rtt_ms_;
 
   StreamAcceptSink stream_accept_sink_;
   StreamDataSink stream_data_sink_;
