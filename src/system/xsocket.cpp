@@ -747,6 +747,24 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
 }
 
 bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len) {
+  {
+    // A real UDP socket discards arrivals once its receive buffer is full, so
+    // drop the newcomer rather than evicting data the guest has not read yet.
+    // Unbounded, a peer that sends faster than the title reads grows this
+    // without limit -- every other RexNet queue is capped, this was the one
+    // that was not.
+    std::lock_guard<std::mutex> lock(incoming_packet_mutex_);
+    if (incoming_packets_.size() >= kMaxQueuedPackets) {
+      // Loud once, then rare: a full queue means the title is not draining,
+      // which is worth knowing but repeats every datagram once it starts.
+      if (++dropped_packets_ == 1 || dropped_packets_ % 1000 == 0) {
+        REXLOG_WARN("socket :{} receive queue full ({}); {} datagrams dropped", bound_port_,
+                    kMaxQueuedPackets, dropped_packets_);
+      }
+      return false;
+    }
+  }
+
   packet* pkt = reinterpret_cast<packet*>(new uint8_t[sizeof(packet) + len]);
   pkt->src_ip = src_ip;
   pkt->src_port = src_port;
@@ -757,7 +775,6 @@ bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf
   {
     std::lock_guard<std::mutex> lock(incoming_packet_mutex_);
     incoming_packets_.push((uint8_t*)pkt);
-    // TODO: Limit on number of incoming packets?
   }
 
   // An overlapped receive may be waiting on exactly this.

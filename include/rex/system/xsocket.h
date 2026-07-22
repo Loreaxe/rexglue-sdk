@@ -129,8 +129,15 @@ class XSocket : public XObject {
     uint8_t data[1];
   };
 
+  /// Receive-queue depth. Datagrams are capped at 2048 by the game plane, so
+  /// this bounds a socket at roughly half a megabyte. Generous enough for a
+  /// burst while a title is busy, small enough that a flood cannot grow
+  /// memory without limit.
+  static constexpr size_t kMaxQueuedPackets = 256;
+
   // Queue a packet into our internal buffer (src values host byte order).
-  // Also completes a pending overlapped receive, if any.
+  // Also completes a pending overlapped receive, if any. False when the queue
+  // is full and the datagram was dropped, as a real socket would.
   bool QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len);
   bool HasQueuedPackets();
 
@@ -244,6 +251,9 @@ class XSocket : public XObject {
   std::atomic<uint32_t> wsa_event_mask_{0};
   std::mutex incoming_packet_mutex_;
   std::queue<uint8_t*> incoming_packets_;
+  /// Datagrams refused because the queue was full. Counted so a title that
+  /// silently stops receiving is diagnosable.
+  uint64_t dropped_packets_ = 0;
 
   // --- Guest TCP state (§18) ---
   /// Non-zero once this socket owns a RexNet stream.

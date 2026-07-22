@@ -1271,7 +1271,11 @@ struct XEthernetStatus {
 };
 
 u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
-  return 0;
+  // Zero reads as "cable unplugged", which contradicts the ETHERNET bit
+  // XNetGetTitleXnAddr reports and stops link-checking titles before they
+  // start. The virtual adapter is always up.
+  return XEthernetStatus::XNET_ETHERNET_LINK_ACTIVE | XEthernetStatus::XNET_ETHERNET_LINK_100MBPS |
+         XEthernetStatus::XNET_ETHERNET_LINK_FULL_DUPLEX;
 }
 
 u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
