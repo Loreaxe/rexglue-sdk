@@ -11,6 +11,7 @@
 #include "rex/net/rexnet.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -38,6 +39,14 @@ REXCVAR_DEFINE_BOOL(rexnet_force_tunnel, false, "RexNet",
                     "Skip NAT hole punching and carry game traffic over the "
                     "control connection (the degraded path a CGNAT player "
                     "gets). For testing that path without a CGNAT.");
+REXCVAR_DEFINE_UINT32(rexnet_listen_port, 0, "RexNet",
+                      "Fixed control-plane (QUIC/TCP) listen port; 0 = ephemeral. "
+                      "Set a stable port so a UPnP mapping or manual forward stays "
+                      "valid across launches -- then the address a peer pastes for "
+                      "a direct connect keeps working.");
+REXCVAR_DEFINE_UINT32(rexnet_game_port, 0, "RexNet",
+                      "Fixed game-plane UDP port; 0 = ephemeral. Pin it alongside "
+                      "rexnet_listen_port when forwarding a port by hand.");
 
 namespace rex::net {
 
@@ -71,6 +80,8 @@ std::unique_ptr<RexNet> RexNet::Create(const RexNetOptions& options) {
     REXNET_INFO("{} relay(s) configured (§9: accelerant, not a dependency)", relays.size());
   }
   cfg.force_tunnel = options.force_tunnel;
+  cfg.listen_port = options.listen_port;
+  cfg.game_port = options.game_port;
   if (options.force_tunnel) {
     REXNET_WARN(
         "force_tunnel: hole punching disabled; all game traffic "
@@ -132,6 +143,7 @@ static ui::RexNetOverlayStatus BuildOverlayStatus() {
   status.peer_id = RexNet::PeerIdString(net->local_peer_id());
   status.display_name = net->display_name();
   status.friend_code = RexNet::FriendCode(net->local_peer_id(), status.display_name);
+  status.public_endpoints = net->PublicEndpoints();
   if (auto sid = net->current_session_id()) {
     status.session_active = true;
   }
@@ -885,7 +897,72 @@ uint64_t RexNet::XuidFromPeer(const RexNetPeerId& peer) {
   return xuid;
 }
 
-void RexNet::ConnectManual(const std::string& multiaddr) {
+// Accept the everyday case -- a bare "host:port" a peer read off their overlay
+// -- as well as a full libp2p multiaddr for power users. A leading '/' means it
+// is already a multiaddr; otherwise build a QUIC dial address, since that is
+// what the control plane listens on. IPv6 must be bracketed ("[::1]:47100") so
+// the port stays unambiguous. Returns empty on malformed input.
+static std::string NormalizeConnectTarget(const std::string& input) {
+  std::string s = input;
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+    s.erase(s.begin());
+  }
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+    s.pop_back();
+  }
+  if (s.empty()) {
+    return {};
+  }
+  if (s.front() == '/') {
+    return s;  // already a multiaddr; pass through untouched
+  }
+
+  std::string host;
+  std::string port;
+  if (s.front() == '[') {
+    const auto close = s.find(']');
+    if (close == std::string::npos || close + 1 >= s.size() || s[close + 1] != ':') {
+      return {};
+    }
+    host = s.substr(1, close - 1);
+    port = s.substr(close + 2);
+  } else {
+    const auto colon = s.rfind(':');
+    if (colon == std::string::npos) {
+      return {};
+    }
+    host = s.substr(0, colon);
+    port = s.substr(colon + 1);
+  }
+  if (host.empty() || port.empty()) {
+    return {};
+  }
+  for (const char c : port) {
+    if (!std::isdigit(static_cast<unsigned char>(c))) {
+      return {};
+    }
+  }
+
+  // "[...]" or a colon in the host marks IPv6; digits-and-dots marks IPv4;
+  // anything else is a DNS name libp2p resolves at dial time.
+  const char* proto;
+  if (input.find('[') != std::string::npos || host.find(':') != std::string::npos) {
+    proto = "/ip6/";
+  } else if (host.find_first_not_of("0123456789.") == std::string::npos) {
+    proto = "/ip4/";
+  } else {
+    proto = "/dns/";
+  }
+  return std::string(proto) + host + "/udp/" + port + "/quic-v1";
+}
+
+void RexNet::ConnectManual(const std::string& target) {
+  const std::string multiaddr = NormalizeConnectTarget(target);
+  if (multiaddr.empty()) {
+    REXNET_WARN("connect: '{}' is neither a host:port nor a multiaddr", target);
+    return;
+  }
+  REXNET_INFO("connect: dialing {}", multiaddr);
   rexnet_connect_manual(handle_, multiaddr.c_str());
 }
 
@@ -1444,6 +1521,13 @@ void RexNet::HandleEvent(const RexNetEvent& event) {
     case REXNET_EVENT_PEER_RTT: {
       std::lock_guard lock(mutex_);
       peer_rtt_ms_[event.virtual_ip] = event.port;
+      break;
+    }
+    case REXNET_EVENT_EXTERNAL_ADDRESS: {
+      std::string endpoint(reinterpret_cast<const char*>(event.data), event.data_len);
+      REXNET_INFO("public endpoint {} (share for a direct connect)", endpoint);
+      std::lock_guard lock(mutex_);
+      public_endpoints_.insert(std::move(endpoint));
       break;
     }
     case REXNET_EVENT_ERROR:

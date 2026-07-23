@@ -114,6 +114,24 @@ void RexNetOverlayDialog::OnDraw(ImGuiIO& /*io*/) {
     ImGui::SetClipboardText(status.peer_id.c_str());
   }
 
+  // Your directly dialable public address(es): hand one to a peer to let them
+  // skip discovery and connect straight to you.
+  if (!status.public_endpoints.empty()) {
+    ImGui::Text("Your address (share for direct connect):");
+    for (size_t i = 0; i < status.public_endpoints.size(); ++i) {
+      const std::string& endpoint = status.public_endpoints[i];
+      ImGui::TextWrapped("%s", endpoint.c_str());
+      ImGui::PushID(static_cast<int>(i));
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Copy##endpoint")) {
+        ImGui::SetClipboardText(endpoint.c_str());
+      }
+      ImGui::PopID();
+    }
+  } else {
+    ImGui::TextDisabled("Your address: not yet reachable (waiting on UPnP/NAT)");
+  }
+
   if (status.session_active) {
     ImGui::Text("Session: active (%s)", status.session_kind.c_str());
   } else {
@@ -299,10 +317,11 @@ void RexNetOverlayDialog::OnDraw(ImGuiIO& /*io*/) {
   }
 
   ImGui::Separator();
-  ImGui::TextDisabled("Manual connect (multiaddr)");
+  ImGui::TextDisabled("Direct connect (host:port, or a full multiaddr)");
   ImGui::SetNextItemWidth(-70.0f);
-  const bool submit = ImGui::InputText("##multiaddr", connect_buf_, sizeof(connect_buf_),
-                                       ImGuiInputTextFlags_EnterReturnsTrue);
+  const bool submit = ImGui::InputTextWithHint("##multiaddr", "203.0.113.7:47100", connect_buf_,
+                                               sizeof(connect_buf_),
+                                               ImGuiInputTextFlags_EnterReturnsTrue);
   ImGui::SameLine();
   const bool can_connect = actions.connect_manual && connect_buf_[0] != '\0';
   if (!can_connect) {

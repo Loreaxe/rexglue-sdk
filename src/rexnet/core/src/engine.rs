@@ -41,8 +41,8 @@ use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{
-    autonat, connection_limits, dcutr, gossipsub, identify, kad, mdns, relay, Multiaddr, PeerId,
-    StreamProtocol, Swarm,
+    autonat, connection_limits, dcutr, gossipsub, identify, kad, mdns, relay, upnp, Multiaddr,
+    PeerId, StreamProtocol, Swarm,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -71,6 +71,53 @@ fn format_vip(vip: u32) -> String {
     )
 }
 
+/// Reduce a listen/external multiaddr to the bare `host:port` a player pastes
+/// into the direct-connect field. IPv6 is bracketed so the port stays
+/// unambiguous. Returns `None` for addresses without an ip+port pair (e.g. a
+/// relay circuit address), which are not directly dialable.
+fn dialable_endpoint(addr: &Multiaddr) -> Option<String> {
+    let mut host: Option<String> = None;
+    let mut port: Option<u16> = None;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Ip4(ip) => host = Some(ip.to_string()),
+            Protocol::Ip6(ip) => host = Some(format!("[{ip}]")),
+            Protocol::Udp(p) | Protocol::Tcp(p) => port = Some(p),
+            _ => {}
+        }
+    }
+    Some(format!("{}:{}", host?, port?))
+}
+
+/// Conservative "reachable from the public internet" test for a multiaddr:
+/// reject loopback, RFC1918 private, link-local, ULA and unspecified ranges.
+/// Used so an auto relay reservation is only held on a peer other NAT'd peers
+/// could actually reach us through.
+fn multiaddr_is_global(addr: &Multiaddr) -> bool {
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Ip4(ip) => {
+                return !(ip.is_loopback()
+                    || ip.is_private()
+                    || ip.is_link_local()
+                    || ip.is_unspecified()
+                    || ip.is_broadcast()
+                    || ip.is_documentation());
+            }
+            Protocol::Ip6(ip) => {
+                // Stable Rust has no is_unique_local/is_global for v6, so test
+                // the fc00::/7 ULA and fe80::/10 link-local prefixes by hand.
+                let seg = ip.segments();
+                let is_ula = (seg[0] & 0xfe00) == 0xfc00;
+                let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
+                return !(ip.is_loopback() || ip.is_unspecified() || is_ula || is_link_local);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Game-plane frame types (first byte on the game socket).
 /// Smallest RTT change worth telling the shim about; below this it is noise.
 const RTT_REPORT_DELTA_MS: u32 = 5;
@@ -94,6 +141,11 @@ const FRAME_PROBE_ACK: u8 = 0x03;
 /// How often a relay with no live reservation is re-dialled. Slow on purpose:
 /// relays are an accelerant, and a node with none still works.
 const RELAY_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Cap on automatic circuit reservations held on mesh peers (§9 torrent model).
+/// A couple is enough redundancy for DCUtR to find a rendezvous path; more
+/// would turn a large swarm into an N-squared reservation storm.
+const MAX_AUTO_RELAYS: usize = 2;
 
 const SHARD_RESCAN_INTERVAL: Duration = Duration::from_secs(20);
 /// How long to keep looking after a fruitless sweep before founding a shard.
@@ -281,6 +333,10 @@ pub enum Event {
     /// Our own address on the virtual network changed — we joined, left or
     /// migrated shards (§17.3.5). The shim reports this as the local XNADDR.
     LocalAddress { virtual_ip: u32 },
+    /// A directly dialable public endpoint for us was confirmed (UPnP mapping
+    /// or AutoNAT). `addr` is a bare `host:port` the player can hand to a peer
+    /// for a manual direct connect. Emitted on each newly confirmed endpoint.
+    ExternalAddress { addr: String },
     /// A peer started or stopped carrying our traffic as a circuit relay
     /// (§17.2). Drives the `relay` label: a non-friend relay is the one
     /// non-friend the UI names at all, and it is named by role, not identity.
@@ -720,7 +776,19 @@ struct Behaviour {
     kad: kad::Behaviour<MemoryStore>,
     mdns: mdns::tokio::Behaviour,
     autonat: autonat::Behaviour,
+    /// Automatic NAT port mapping (§9 torrent-model reachability). On a
+    /// UPnP/IGD router this opens the listen port unattended, so a peer becomes
+    /// directly dialable without hand-forwarding anything -- the "seed if you
+    /// can" half of the mesh.
+    upnp: upnp::tokio::Behaviour,
     relay_client: relay::client::Behaviour,
+    /// Circuit-v2 relay *server* (§9 torrent model): every node offers to relay
+    /// for others, so a publicly reachable peer brokers rendezvous + DCUtR for
+    /// NAT'd peers with no dedicated server. A NAT'd node still runs it, but no
+    /// one can reach it to reserve, so relaying is self-selecting -- reachable
+    /// peers seed, firewalled peers cannot, exactly like a torrent swarm.
+    /// Reservation/data/time caps in `relay::Config` bound what we carry.
+    relay_server: relay::Behaviour,
     dcutr: dcutr::Behaviour,
     echo: request_response::cbor::Behaviour<EchoPayload, EchoPayload>,
     punch: request_response::cbor::Behaviour<PunchOffer, PunchAnswer>,
@@ -780,7 +848,9 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
                 ),
                 mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_id)?,
                 autonat: autonat::Behaviour::new(local_id, autonat::Config::default()),
+                upnp: upnp::tokio::Behaviour::default(),
                 relay_client,
+                relay_server: relay::Behaviour::new(local_id, relay::Config::default()),
                 dcutr: dcutr::Behaviour::new(local_id),
                 echo: request_response::cbor::Behaviour::new(
                     [(
@@ -988,6 +1058,8 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             last_shard_move: None,
             listen_addrs: Vec::new(),
             external_ips: Vec::new(),
+            announced_external: HashSet::new(),
+            auto_relays: HashSet::new(),
             vip_by_peer: HashMap::new(),
             peer_by_vip: HashMap::new(),
             pending_datagrams: HashMap::new(),
@@ -1095,6 +1167,12 @@ struct Engine {
     last_shard_move: Option<Instant>,
     listen_addrs: Vec<Multiaddr>,
     external_ips: Vec<IpAddr>,
+    /// Bare `host:port` endpoints already surfaced via [`Event::ExternalAddress`],
+    /// so a re-confirmation of the same address does not re-emit.
+    announced_external: HashSet<String>,
+    /// Mesh peers we hold an automatic circuit reservation on (§9 torrent
+    /// model), distinct from configured relays. Capped at [`MAX_AUTO_RELAYS`].
+    auto_relays: HashSet<PeerId>,
 
     // Virtual-IP allocation (authoritative; the C++ shim mirrors it).
     vip_by_peer: HashMap<PeerId, u32>,
@@ -2185,6 +2263,72 @@ impl Engine {
 
     /// Tell the shim our current address, so the XNADDR it reports to the
     /// game matches the subnet we are actually on.
+    /// Record a confirmed public endpoint (from UPnP or AutoNAT) and, the first
+    /// time we see it, surface a bare `host:port` for the player to hand to a
+    /// peer for a manual direct connect (§9 direct path).
+    fn note_external_addr(&mut self, address: Multiaddr) {
+        for proto in address.iter() {
+            match proto {
+                Protocol::Ip4(ip) => self.external_ips.push(ip.into()),
+                Protocol::Ip6(ip) => self.external_ips.push(ip.into()),
+                _ => {}
+            }
+        }
+        self.external_ips.sort();
+        self.external_ips.dedup();
+
+        if let Some(endpoint) = dialable_endpoint(&address) {
+            if self.announced_external.insert(endpoint.clone()) {
+                self.emit(Event::ExternalAddress { addr: endpoint });
+            }
+        }
+    }
+
+    /// Hold an automatic circuit reservation on a connected, publicly reachable
+    /// mesh peer that offers the circuit-v2 hop (§9 torrent model). This is how
+    /// a NAT'd node gets a relay from the swarm itself, with no configured
+    /// server. Capped at [`MAX_AUTO_RELAYS`] so a large mesh does not become an
+    /// N-squared reservation storm.
+    fn maybe_auto_reserve_relay(
+        &mut self,
+        peer_id: PeerId,
+        protocols: &[StreamProtocol],
+        listen_addrs: &[Multiaddr],
+    ) {
+        if self.auto_relays.len() >= MAX_AUTO_RELAYS || self.auto_relays.contains(&peer_id) {
+            return;
+        }
+        // Peer must speak the circuit-v2 hop, or it cannot relay for us.
+        let offers_hop = protocols
+            .iter()
+            .any(|p| p.as_ref() == "/libp2p/circuit/relay/0.2.0/hop");
+        if !offers_hop {
+            return;
+        }
+        // Reserve only through a globally routable address: a LAN-only relay is
+        // useless to a NAT'd peer elsewhere that must reach us through it.
+        let Some(base) = listen_addrs.iter().find(|a| multiaddr_is_global(a)) else {
+            return;
+        };
+        // Circuit = <relay transport>/p2p/<relay>/p2p-circuit. Drop any trailing
+        // /p2p the relay already advertised so it is not duplicated.
+        let mut circuit = base.clone();
+        if matches!(circuit.iter().last(), Some(Protocol::P2p(_))) {
+            circuit.pop();
+        }
+        let circuit = circuit.with(Protocol::P2p(peer_id)).with(Protocol::P2pCircuit);
+        match self.swarm.listen_on(circuit.clone()) {
+            Ok(_) => {
+                self.auto_relays.insert(peer_id);
+                tracing::info!(%peer_id, %circuit,
+                    "mesh relay: auto-reserving a circuit through a reachable peer");
+            }
+            Err(err) => {
+                tracing::debug!(%peer_id, %err, "auto relay reservation failed to start");
+            }
+        }
+    }
+
     fn announce_local_address(&mut self) {
         let vip = self.local_vip();
         if self.announced_vip == Some(vip) {
@@ -2671,15 +2815,7 @@ impl Engine {
             }
             SwarmEvent::ExternalAddrConfirmed { address } => {
                 tracing::info!(%address, "external address confirmed");
-                for proto in address.iter() {
-                    match proto {
-                        Protocol::Ip4(ip) => self.external_ips.push(ip.into()),
-                        Protocol::Ip6(ip) => self.external_ips.push(ip.into()),
-                        _ => {}
-                    }
-                }
-                self.external_ips.sort();
-                self.external_ips.dedup();
+                self.note_external_addr(address);
             }
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                 // Debug, not info: the public DHT crawl connects to hundreds of
@@ -2758,6 +2894,9 @@ impl Engine {
                     if self.relays.remove(&peer_id) {
                         self.emit(Event::RelayStatus { peer: peer_id, is_relay: false });
                     }
+                    // Free the auto-relay slot so another reachable peer can take
+                    // its place next time one identifies.
+                    self.auto_relays.remove(&peer_id);
                     if self.announced.remove(&peer_id) {
                         self.emit(Event::PeerDisconnected { peer: peer_id });
                     }
@@ -2800,6 +2939,10 @@ impl Engine {
                         }
                     }
                 }
+                // Torrent-model relaying: if this peer offers the circuit-v2
+                // hop on a routable address, hold a reservation on it so a NAT'd
+                // node gets a relay from the mesh itself, no configured server.
+                self.maybe_auto_reserve_relay(peer_id, &info.protocols, &info.listen_addrs);
                 // Feed identify-learned addresses into the routing table so
                 // kad queries and dials can use them.
                 for addr in info.listen_addrs {
@@ -3112,12 +3255,37 @@ impl Engine {
             SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
                 relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. },
             )) => self.mark_relay(relay_peer_id, true),
+            // We are serving as someone's relay -- the "seed" half of the mesh.
+            // Logged at info because it is exactly the behaviour a player wants
+            // to confirm ("am I helping others connect?").
+            SwarmEvent::Behaviour(BehaviourEvent::RelayServer(event)) => {
+                tracing::info!(?event, "relay server (we are relaying for the mesh)");
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
                 tracing::info!(?event, "dcutr");
             }
             SwarmEvent::Behaviour(BehaviourEvent::Autonat(event)) => {
                 tracing::debug!(?event, "autonat");
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Upnp(event)) => match event {
+                upnp::Event::NewExternalAddr(addr) => {
+                    // The router mapped our port: this is a directly dialable
+                    // address. The swarm records it as an external address on
+                    // its own; we log and surface it so the player can hand the
+                    // bare host:port to a peer.
+                    tracing::info!(%addr, "upnp: external address mapped");
+                    self.note_external_addr(addr);
+                }
+                upnp::Event::ExpiredExternalAddr(addr) => {
+                    tracing::info!(%addr, "upnp: external address expired");
+                }
+                upnp::Event::GatewayNotFound => {
+                    tracing::info!("upnp: no IGD gateway found (router has UPnP off or absent)");
+                }
+                upnp::Event::NonRoutableGateway => {
+                    tracing::info!("upnp: gateway is not internet-routable (CGNAT/double NAT)");
+                }
+            },
             other => tracing::trace!(?other, "swarm event"),
         }
     }

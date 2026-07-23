@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -39,6 +40,8 @@ REXCVAR_DECLARE(bool, rexnet);
 REXCVAR_DECLARE(std::string, rexnet_display_name);
 REXCVAR_DECLARE(std::string, rexnet_bootstrap);
 REXCVAR_DECLARE(bool, rexnet_force_tunnel);
+REXCVAR_DECLARE(uint32_t, rexnet_listen_port);
+REXCVAR_DECLARE(uint32_t, rexnet_game_port);
 REXCVAR_DECLARE(bool, rexnet_syslink);
 
 REXLOG_DEFINE_CATEGORY(net)
@@ -68,6 +71,11 @@ struct RexNetOptions {
   /// Skip hole punching; run game traffic over the control tunnel (§14).
   /// For reproducing a CGNAT player's degraded path locally.
   bool force_tunnel = false;
+  /// Fixed control-plane (QUIC/TCP) listen port; 0 = ephemeral. A stable port
+  /// keeps a UPnP mapping or manual forward valid across launches.
+  uint16_t listen_port = 0;
+  /// Fixed game-plane UDP port; 0 = ephemeral.
+  uint16_t game_port = 0;
   /// Drain rexnet-core events on a dedicated ~60 Hz thread. The runtime
   /// library does not own the frame loop, so this is the default; callers
   /// that want to drive Pump() themselves can turn it off.
@@ -371,6 +379,12 @@ class RexNet {
   uint32_t PeerRttMs(uint32_t virtual_ip) const;
 
   const RexNetPeerId& local_peer_id() const { return local_peer_id_; }
+  /// Snapshot of our confirmed directly dialable public endpoints
+  /// (`host:port`), for the overlay to show and the player to share.
+  std::vector<std::string> PublicEndpoints() const {
+    std::lock_guard lock(mutex_);
+    return {public_endpoints_.begin(), public_endpoints_.end()};
+  }
   static std::string PeerIdString(const RexNetPeerId& peer);
   /// Parse a base58 peer id or a REXN- friend code (nullopt on malformed
   /// input, including checksum mismatches).
@@ -471,6 +485,10 @@ class RexNet {
   std::atomic<uint32_t> local_vip_{kLocalVip};
   /// vip -> round trip in ms, mirrored from REXNET_EVENT_PEER_RTT.
   std::unordered_map<uint32_t, uint32_t> peer_rtt_ms_;
+  /// Our confirmed directly dialable public endpoints (UPnP/AutoNAT), as bare
+  /// `host:port` strings a player hands a peer for a direct connect. A set so
+  /// re-confirmations dedup and the overlay shows a stable list.
+  std::set<std::string> public_endpoints_;
 
   StreamAcceptSink stream_accept_sink_;
   StreamDataSink stream_data_sink_;

@@ -49,6 +49,12 @@ typedef struct RexNetConfig {
    *  Field order here mirrors the Rust struct exactly -- these are two
    *  adjacent bools, so transposing them swaps silently. */
   bool force_tunnel;
+  /** Fixed control-plane (QUIC/TCP) listen port; 0 = ephemeral. A stable port
+   *  is what makes a UPnP mapping or a manual forward reusable across launches,
+   *  so the address a peer pastes stays valid. */
+  uint16_t listen_port;
+  /** Fixed game-plane UDP port; 0 = ephemeral. */
+  uint16_t game_port;
 } RexNetConfig;
 
 /** Multihash-encoded PeerId, length-prefixed. */
@@ -101,6 +107,9 @@ typedef enum RexNetEventKind {
   /** Measured round trip to a peer (spec §11). virtual_ip = peer,
    *  port = milliseconds. Emitted only on a material change. */
   REXNET_EVENT_PEER_RTT,
+  /** A directly dialable public endpoint for us was confirmed (UPnP/AutoNAT).
+   *  data = UTF-8 bare `host:port` to hand a peer for a direct connect. */
+  REXNET_EVENT_EXTERNAL_ADDRESS,
 } RexNetEventKind;
 
 /** Fixed-size POD event; drain once per frame with rexnet_poll_event(). */

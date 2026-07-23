@@ -146,6 +146,12 @@ pub struct RexNetConfig {
     /// Lets a developer reproduce a CGNAT player's degraded path on a LAN,
     /// where every punch would otherwise succeed.
     pub force_tunnel: bool,
+    /// Fixed control-plane (QUIC/TCP) listen port; 0 = ephemeral. A stable
+    /// port is what makes a UPnP mapping or a manual forward reusable across
+    /// launches, so the address a peer pastes stays valid.
+    pub listen_port: u16,
+    /// Fixed game-plane UDP port; 0 = ephemeral.
+    pub game_port: u16,
 }
 
 /// Multihash-encoded PeerId, length-prefixed (ed25519 identity hashes fit
@@ -215,6 +221,9 @@ pub enum RexNetEventKind {
     StreamConnectFailed,
     /// Measured round trip to a peer. virtual_ip = peer, port = milliseconds.
     PeerRtt,
+    /// A directly dialable public endpoint for us was confirmed (UPnP/AutoNAT).
+    /// data = UTF-8 bare `host:port` to hand a peer for a direct connect.
+    ExternalAddress,
 }
 
 /// Fixed-size POD event, drained once per frame via [`rexnet_poll_event`].
@@ -411,6 +420,10 @@ fn fill_event(out: &mut RexNetEvent, event: Event) {
             out.kind = RexNetEventKind::Error;
             set_data(out, message.as_bytes());
         }
+        Event::ExternalAddress { addr } => {
+            out.kind = RexNetEventKind::ExternalAddress;
+            set_data(out, addr.as_bytes());
+        }
     }
 }
 
@@ -471,8 +484,8 @@ pub unsafe extern "C" fn rexnet_init(cfg: *const RexNetConfig) -> *mut RexNetHan
                 title_id: cfg.title_id,
                 display_name,
                 bootstrap,
-                listen_port: 0,
-                game_port: 0,
+                listen_port: cfg.listen_port,
+                game_port: cfg.game_port,
                 relays,
                 force_tunnel: cfg.force_tunnel,
             },

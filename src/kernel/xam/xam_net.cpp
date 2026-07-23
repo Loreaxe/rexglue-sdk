@@ -268,6 +268,8 @@ void RexNetStartup() {
 
     net::RexNetOptions options;
     options.force_tunnel = REXCVAR_GET(rexnet_force_tunnel);
+    options.listen_port = static_cast<uint16_t>(REXCVAR_GET(rexnet_listen_port));
+    options.game_port = static_cast<uint16_t>(REXCVAR_GET(rexnet_game_port));
     options.title_id = kernel_state->title_id();
     options.display_name = REXCVAR_GET(rexnet_display_name);
 

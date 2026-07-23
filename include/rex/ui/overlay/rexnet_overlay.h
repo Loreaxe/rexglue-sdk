@@ -29,6 +29,10 @@ struct RexNetOverlayStatus {
   bool active = false;
   std::string peer_id;      // base58 identity
   std::string friend_code;  // REXN-… rendering of the same identity
+  // Our confirmed directly dialable public endpoints (host:port), from UPnP or
+  // AutoNAT. Hand one to a peer for a manual direct connect. Empty until a
+  // reachable address is confirmed (e.g. router has UPnP off).
+  std::vector<std::string> public_endpoints;
   uint32_t friend_count = 0;
   bool session_active = false;
   std::string session_kind;  // "public" / "private" / ""
