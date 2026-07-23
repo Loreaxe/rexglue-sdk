@@ -384,20 +384,6 @@ void RexNetStartup() {
     rexnet->SetDatagramSink([](uint32_t src_vip, uint16_t src_port, uint16_t dst_port,
                                const uint8_t* data, uint32_t len) {
       auto socket = XSocket::FindBoundUdp(dst_port);
-      // TEMP(refii netplay bring-up): trace the co-op data path. Port 1000 =
-      // XRNM link, 1001 = msgJoinSession handshake, 1002/1003 = presence.
-      // Dump the head of 1001 messages: JOINRESPONSE code is at byte +3
-      // (0=APPROVED 1=FULL 2=DIFFVER 3=NOTHOSTING 4=DIFFVER/DLC).
-      char head[40] = {};
-      if (dst_port == 1000 || dst_port == 1001) {
-        const uint32_t n = len < 12 ? len : 12;
-        for (uint32_t i = 0; i < n; ++i) {
-          std::snprintf(head + i * 3, 4, "%02X ", data[i]);
-        }
-      }
-      REXKRNL_INFO("RexNet IN: 10.77.{}.{}:{} -> :{} ({} bytes) socket={} head[{}]",
-                   (src_vip >> 8) & 0xFF, src_vip & 0xFF, src_port, dst_port, len,
-                   socket ? "bound" : "NO-BOUND-SOCKET", head);
       if (!socket) {
         return false;
       }

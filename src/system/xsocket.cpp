@@ -721,27 +721,6 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
         return -1;
       }
       rexnet->SendDatagram(dst_ip, bound_port_, to->sin_port, buf, buf_len);
-      // TEMP(refii netplay bring-up): trace the co-op data path (see the
-      // inbound sink log). Throttled to first hits per dst port to avoid
-      // flooding once the XRNM link is streaming.
-      static std::unordered_map<uint16_t, int> sent_count;
-      const uint16_t dport = static_cast<uint16_t>(to->sin_port);
-      char ohead[40] = {};
-      if (dport == 1000 || dport == 1001) {
-        const uint32_t n = buf_len < 12 ? buf_len : 12;
-        for (uint32_t i = 0; i < n; ++i)
-          std::snprintf(ohead + i * 3, 4, "%02X ", buf[i]);
-      }
-      if (sent_count[dport]++ < 40) {
-        if (limited_broadcast) {
-          REXSYS_INFO("RexNet OUT: :{} -> 255.255.255.255:{} ({} bytes) head[{}]",
-                      static_cast<uint16_t>(bound_port_), dport, buf_len, ohead);
-        } else {
-          REXSYS_INFO("RexNet OUT: :{} -> 10.77.{}.{}:{} ({} bytes) head[{}]",
-                      static_cast<uint16_t>(bound_port_), (dst_ip >> 8) & 0xFF, dst_ip & 0xFF,
-                      dport, buf_len, ohead);
-        }
-      }
       return (int)buf_len;
     }
   }

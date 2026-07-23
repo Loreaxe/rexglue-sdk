@@ -21,11 +21,10 @@
 //! the control connection. Every peer gets a virtual IP in 10.77.0.0/16
 //! (allocated here, mirrored by the C++ shim via `PeerConnected`).
 //!
-//! Still to come: the remaining §7 protocols (presence/friend/invite/
-//! session), game-plane encryption (§6: keys exported from the control
-//! session — blocked on rust-libp2p exposing an exporter; probes are
-//! currently nonce-authenticated only), and the §5 tunnel fallback for
-//! hostile-NAT pairs.
+//! The §7 presence/friend/invite/session protocols, the encrypted game plane
+//! (§6), the §5 tunnel fallback for hostile-NAT pairs, the §17 ambient shard,
+//! and the §9 mesh-relay register/discovery are all implemented; see the
+//! per-item comments below.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
