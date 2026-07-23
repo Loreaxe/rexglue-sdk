@@ -58,6 +58,34 @@ if(REXGLUE_INSTALL_FIDELITYFX_TARGETS)
     )
 endif()
 
+# RexNet control-plane staticlib (Rust, built via corrosion). It is absorbed
+# into rexruntime's shared library and is deliberately NOT part of the exported
+# target set -- consumers linking rex::runtime already have its symbols (see
+# src/kernel/CMakeLists.txt). Ship the compiled archive alongside the other SDK
+# libs anyway so the installed lib dir is a complete set for static/relink use.
+#
+# corrosion does not apply CMAKE_DEBUG_POSTFIX to its cargo byproduct, so rename
+# per configuration to match the rexruntimed / rexruntimerd naming used by the
+# rest of the SDK (and to keep multi-config installs from colliding on one name).
+#
+# corrosion_import_crate() exposes the linkable crate as an INTERFACE library
+# (rexnet_core); the concrete archive lives on the STATIC IMPORTED target it
+# wraps (rexnet_core-static), which is what $<TARGET_FILE:...> can resolve.
+if(REXGLUE_ENABLE_REXNET AND TARGET rexnet_core-static)
+    install(FILES $<TARGET_FILE:rexnet_core-static>
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        CONFIGURATIONS Debug
+        RENAME "${CMAKE_STATIC_LIBRARY_PREFIX}rexnet_core${CMAKE_DEBUG_POSTFIX}${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    install(FILES $<TARGET_FILE:rexnet_core-static>
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        CONFIGURATIONS RelWithDebInfo
+        RENAME "${CMAKE_STATIC_LIBRARY_PREFIX}rexnet_core${CMAKE_RELWITHDEBINFO_POSTFIX}${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    install(FILES $<TARGET_FILE:rexnet_core-static>
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        CONFIGURATIONS Release
+        RENAME "${CMAKE_STATIC_LIBRARY_PREFIX}rexnet_core${CMAKE_STATIC_LIBRARY_SUFFIX}")
+endif()
+
 # Install public headers
 install(DIRECTORY include/rex
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}

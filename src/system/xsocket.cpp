@@ -35,6 +35,18 @@
 #include <WinSock2.h>
 
 #include <WS2tcpip.h>
+
+// WinSock2.h defines SOCK_STREAM / SOCK_DGRAM (and AF_INET / IPPROTO_*) as
+// object-like macros. They clobber the identically named XSocket::Type /
+// AddressFamily / Protocol enumerators used below, turning Type::SOCK_DGRAM
+// into Type::2. The guest enums deliberately mirror the WinSock numeric
+// values, and this translation unit only ever names the scoped enumerators,
+// so drop the macros now that the WinSock headers have been fully parsed.
+#undef SOCK_STREAM
+#undef SOCK_DGRAM
+#undef AF_INET
+#undef IPPROTO_TCP
+#undef IPPROTO_UDP
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
