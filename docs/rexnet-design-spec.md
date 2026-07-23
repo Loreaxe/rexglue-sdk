@@ -170,6 +170,22 @@ an empty bootstrap list.
 Expected direct-connection success in the wild is roughly 70–80% via
 DCUtR + punch; IPv6 and manual strings cover much of the remainder.
 
+**Reachability knobs (all optional).**
+
+- **Fixed ports.** `rexnet_listen_port` (control plane, QUIC/TCP) and
+  `rexnet_game_port` (game plane) default to ephemeral (0). Pinning them keeps
+  a UPnP mapping or a hand-forwarded port valid across launches, so the address
+  a peer was given stays dialable.
+- **Direct connect by `host:port`.** The manual-strings path is ergonomic: the
+  overlay's connect field (and `RexNet::ConnectManual`) accept a bare
+  `203.0.113.7:47100` — or `[v6]:port`, a DNS name, or a full multiaddr — and
+  build the QUIC dial address. No peer id is needed; libp2p learns it from the
+  Noise handshake. This is what lets two players connect with nothing but one
+  side's public address, discovery bypassed entirely.
+- **Own endpoint surfaced.** When UPnP or AutoNAT confirms a directly dialable
+  address, it is shown (copyable) in the F6 overlay as a bare `host:port`, so a
+  reachable player can hand it to a peer for the path above.
+
 ---
 
 ## 6. Transport split (control plane vs. game plane)
@@ -366,18 +382,28 @@ up to 5 s; first authenticated probe pair wins.
 
 ## 9. Relay policy (opt-in mesh relays)
 
-- Relay **service** (circuit-v2) is offered only by peers that AutoNAT
-  confirms publicly reachable (or with a working port mapping / global v6).
-- **Opt-in**, default **off** on metered or battery-powered devices; a
-  single settings toggle elsewhere.
-- Hard caps via circuit-v2 limits: default 64 concurrent reservations,
-  2 min / 128 KiB per circuit — enough for signaling and punch
-  coordination, deliberately unusable for sustained game traffic.
+- Every node runs the circuit-v2 relay **server**, but only *advertises* as a
+  relay once AutoNAT or a UPnP mapping confirms it reachable (see discovery
+  below). An unreachable node's server therefore sits idle — nobody can reach
+  it to reserve — so relaying is self-selecting: reachable peers carry the
+  mesh, firewalled peers cannot, the way a torrent swarm's open-port peers do.
+- On the desktop targets (Windows/Linux) relaying runs whenever the node is
+  reachable. The metered/battery opt-out is a mobile-class concern RexNet does
+  not currently target; a single off-switch can be added when it does.
+- Hard caps via circuit-v2 limits, taken from libp2p's `relay::Config`
+  defaults: 128 concurrent reservations, **2 min / 128 KiB per circuit** —
+  enough for signaling and punch coordination, deliberately unusable for
+  sustained game traffic. (The per-circuit ceiling is the one that matters and
+  is enforced by the library; do not raise it.)
 - Relayed bytes are end-to-end encrypted; operators cannot read them.
   DCUtR upgrades relayed connections to direct as fast as possible, so
   relays mostly carry brief coordination bursts.
-- Relay discovery: relays register as providers under
-  `rexnet/v1/relays` in addition to standard libp2p relay discovery.
+- Relay discovery: a reachable node publishes a provider record under
+  `rexnet/v1/relays`; a node short of relays queries that key and dials the
+  providers it finds — including relays it has never met — reserving a circuit
+  through each on identify. Reservations through relay-capable peers we happen
+  to already be connected to are taken opportunistically on the same identify
+  path. Two mesh relays are held at once (`MAX_AUTO_RELAYS`).
 
 ### 9.1 Hosted relays: accelerant, never authority
 
@@ -941,6 +967,19 @@ address is unaffected and always belongs to RexNet.
 
 This is the one place RexNet changes what a game *is* rather than standing in
 for infrastructure it can no longer reach, so it stays an explicit choice.
+
+**The shard is the transport, so `rexnet_syslink` implies it.** A redirected
+broadcast has nowhere to land without a shard subnet, so turning the switch on
+enables the ambient shard even when no `rexnet.toml` opted into it (applied at
+`XNetStartup`, after any per-title config, and again on a live toggle). The
+reverse coupling is deliberately absent: a shard on its own never redirects LAN
+play, keeping `rexnet_syslink` the explicit, off-by-default choice above.
+
+**Toggleable at runtime.** The switch is a checkbox in the F6 overlay
+("System Link: LAN only"), not only a startup cvar — a player can move a
+LAN-only title onto the internet and back mid-session. Broadcast routing reads
+the cvar per send, so the change is immediate; flipping to WAN also brings the
+shard up at that moment (the startup coupling runs only once).
 
 #### 17.3.7 Pseudonyms
 
