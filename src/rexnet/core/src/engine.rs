@@ -1060,6 +1060,8 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             external_ips: Vec::new(),
             announced_external: HashSet::new(),
             auto_relays: HashSet::new(),
+            relay_provider_registered: false,
+            pending_relay_search: None,
             vip_by_peer: HashMap::new(),
             peer_by_vip: HashMap::new(),
             pending_datagrams: HashMap::new(),
@@ -1173,6 +1175,12 @@ struct Engine {
     /// Mesh peers we hold an automatic circuit reservation on (§9 torrent
     /// model), distinct from configured relays. Capped at [`MAX_AUTO_RELAYS`].
     auto_relays: HashSet<PeerId>,
+    /// Whether we have published a `rexnet/v1/relays` provider record (§9). Set
+    /// once we are confirmed reachable, so NAT'd peers can find us as a relay.
+    relay_provider_registered: bool,
+    /// In-flight `get_providers(rexnet/v1/relays)` query, so its result routes
+    /// to relay handling rather than the session/shard registries.
+    pending_relay_search: Option<kad::QueryId>,
 
     // Virtual-IP allocation (authoritative; the C++ shim mirrors it).
     vip_by_peer: HashMap<PeerId, u32>,
@@ -1271,7 +1279,11 @@ impl Engine {
                 }
                 _ = punch_watchdog.tick() => self.check_punch_deadlines(),
                 _ = shard_status.tick() => self.log_shard_status(),
-                _ = relay_check.tick() => self.retry_dead_relays(),
+                _ = relay_check.tick() => {
+                    self.retry_dead_relays();
+                    // Actively look for mesh relays in the DHT (§9) when short.
+                    self.discover_relays();
+                }
                 _ = shard_rescan.tick() => {
                     // Sweep, then settle on the *next* tick once descriptors
                     // have arrived; shard_settle also runs when a sweep
@@ -2282,6 +2294,34 @@ impl Engine {
                 self.emit(Event::ExternalAddress { addr: endpoint });
             }
         }
+
+        // Now that we are confirmed reachable on a routable address, advertise
+        // ourselves as a relay in the DHT (§9): NAT'd peers query the same key
+        // to find a relay to punch through, including ones they have never met.
+        if !self.relay_provider_registered && multiaddr_is_global(&address) {
+            let key = kad::RecordKey::new(&crate::protocol::RELAYS_KEY);
+            match self.swarm.behaviour_mut().kad.start_providing(key) {
+                Ok(_) => {
+                    self.relay_provider_registered = true;
+                    tracing::info!("registered as a mesh relay provider (reachable)");
+                }
+                Err(err) => tracing::debug!(%err, "relay provider registration failed"),
+            }
+        }
+    }
+
+    /// Query the DHT for `rexnet/v1/relays` providers (§9) when we still need
+    /// relays. Found providers are dialled; the identify handler then reserves a
+    /// circuit through any that offer the hop on a routable address. This is the
+    /// active half of relay discovery -- it finds relays we have never connected
+    /// to, which identify-on-existing-connections alone cannot.
+    fn discover_relays(&mut self) {
+        if self.auto_relays.len() >= MAX_AUTO_RELAYS || self.pending_relay_search.is_some() {
+            return;
+        }
+        let key = kad::RecordKey::new(&crate::protocol::RELAYS_KEY);
+        let id = self.swarm.behaviour_mut().kad.get_providers(key);
+        self.pending_relay_search = Some(id);
     }
 
     /// Hold an automatic circuit reservation on a connected, publicly reachable
@@ -3324,6 +3364,7 @@ impl Engine {
                     .pending_shard_search
                     .as_ref()
                     .is_some_and(|(qid, _)| *qid == id);
+                let is_relay = self.pending_relay_search == Some(id);
                 let local = *self.swarm.local_peer_id();
 
                 if is_session {
@@ -3373,6 +3414,28 @@ impl Engine {
                         // node in should not wait a full rescan interval.
                         self.shard_swept_at = Some(Instant::now());
                         self.shard_settle();
+                    }
+                } else if is_relay {
+                    // Relays found in the DHT (§9). Dial each one we do not
+                    // already reserve through; the identify handler then holds a
+                    // circuit reservation on any that offer the hop on a routable
+                    // address. Dialing (not reserving here) reuses that one path.
+                    if let Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) = res {
+                        for peer in providers {
+                            if peer == local || self.auto_relays.contains(&peer) {
+                                continue;
+                            }
+                            if self.auto_relays.len() >= MAX_AUTO_RELAYS {
+                                break;
+                            }
+                            self.wanted_peers.insert(peer);
+                            if let Err(err) = self.swarm.dial(peer) {
+                                tracing::debug!(%peer, %err, "dial of discovered relay failed");
+                            }
+                        }
+                    }
+                    if last {
+                        self.pending_relay_search = None;
                     }
                 }
             }
