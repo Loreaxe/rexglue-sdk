@@ -333,6 +333,12 @@ class RexNet {
   static std::optional<GameConfig> LoadGameConfig(const std::filesystem::path& path);
   void SetGameConfig(GameConfig config);
   GameConfig game_config();
+  /// Turn on the ambient title shard (§17.3) independent of the per-title
+  /// rexnet.toml opt-in. Idempotent. Used to back System Link over RexNet: the
+  /// shard subnet IS the virtual LAN that System Link broadcasts land on, so
+  /// enabling `rexnet_syslink` without a shard would be a silent no-op. Uses
+  /// the configured shard cap when one was loaded, else the core default (255).
+  void EnableAmbientShard();
 
   /// XUserSetContext: map a context id through the game config into a
   /// presence rich KV (u32) and push. Unmapped ids are ignored.

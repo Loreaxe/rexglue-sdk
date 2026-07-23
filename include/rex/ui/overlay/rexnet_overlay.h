@@ -33,6 +33,10 @@ struct RexNetOverlayStatus {
   // AutoNAT. Hand one to a peer for a manual direct connect. Empty until a
   // reachable address is confirmed (e.g. router has UPnP off).
   std::vector<std::string> public_endpoints;
+  // System Link routing (rexnet_syslink). false = LAN only (real network, the
+  // default); true = broadcasts route over RexNet so a LAN-only title plays
+  // over the internet. Mirrored so the UI toggle reflects the live cvar.
+  bool syslink_over_wan = false;
   uint32_t friend_count = 0;
   bool session_active = false;
   std::string session_kind;  // "public" / "private" / ""
@@ -95,6 +99,9 @@ struct RexNetOverlayActions {
   std::function<void(const std::string& peer_id)> invite_friend;
   std::function<void(const std::string& peer_id)> accept_invite;
   std::function<void(const std::string& peer_id)> decline_invite;
+  // Flip System Link routing live. over_wan=true redirects broadcasts over
+  // RexNet (and enables the shard that carries them); false restores LAN-only.
+  std::function<void(bool over_wan)> set_syslink;
 };
 
 // Installed by the rexnet module (no-op to clear). Thread-safe to call once

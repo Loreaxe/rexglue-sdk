@@ -317,6 +317,23 @@ void RexNetOverlayDialog::OnDraw(ImGuiIO& /*io*/) {
   }
 
   ImGui::Separator();
+  // System Link LAN/WAN switch. Default (checked) keeps System Link on the real
+  // local network; unchecking routes broadcasts over RexNet so a LAN-only title
+  // gains internet play. Enabling WAN turns on the shard that carries it.
+  bool lan_only = !status.syslink_over_wan;
+  if (ImGui::Checkbox("System Link: LAN only", &lan_only)) {
+    if (actions.set_syslink) {
+      actions.set_syslink(/*over_wan=*/!lan_only);
+    }
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "On (default): System Link uses the real local network.\n"
+        "Off: broadcasts route over RexNet so LAN-only titles play over the "
+        "internet (enables the shard that carries them).");
+  }
+
+  ImGui::Separator();
   ImGui::TextDisabled("Direct connect (host:port, or a full multiaddr)");
   ImGui::SetNextItemWidth(-70.0f);
   const bool submit = ImGui::InputTextWithHint("##multiaddr", "203.0.113.7:47100", connect_buf_,

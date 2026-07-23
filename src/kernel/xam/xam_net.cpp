@@ -436,6 +436,20 @@ void RexNetStartup() {
           "(shard, advertised_title_id, presence mappings) is INACTIVE");
     }
 
+    // System Link over RexNet rides the shard subnet -- it IS the virtual LAN
+    // that a title's broadcasts land on (§17.3.6). So turning on rexnet_syslink
+    // implies the ambient shard, even when no rexnet.toml opted into it;
+    // otherwise the redirect would have nowhere to deliver and silently do
+    // nothing. Runs after SetGameConfig so it wins over a toml that left the
+    // shard off. The reverse coupling is deliberately absent: a shard alone
+    // never redirects LAN play, keeping rexnet_syslink an explicit choice.
+    if (REXCVAR_GET(rexnet_syslink)) {
+      rexnet->EnableAmbientShard();
+      REXKRNL_INFO(
+          "rexnet_syslink on: ambient shard enabled to carry System Link over "
+          "RexNet");
+    }
+
     // Local profile from identity + display name (design spec §11): a
     // stable offline-format XUID derived from the keypair, so the same
     // install presents the same identity to every title.

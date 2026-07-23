@@ -144,6 +144,7 @@ static ui::RexNetOverlayStatus BuildOverlayStatus() {
   status.display_name = net->display_name();
   status.friend_code = RexNet::FriendCode(net->local_peer_id(), status.display_name);
   status.public_endpoints = net->PublicEndpoints();
+  status.syslink_over_wan = REXCVAR_GET(rexnet_syslink);
   if (auto sid = net->current_session_id()) {
     status.session_active = true;
   }
@@ -224,6 +225,19 @@ RexNet* RexNet::InitializeShared(const RexNetOptions& options) {
   // Wire the F6 diagnostics overlay (no-ops if the UI layer is absent).
   ui::SetRexNetStatusProvider(&BuildOverlayStatus);
   ui::RexNetOverlayActions actions;
+  actions.set_syslink = [](bool over_wan) {
+    REXCVAR_SET(rexnet_syslink, over_wan);
+    REXNET_INFO("System Link routing set to {}", over_wan ? "over RexNet (WAN)" : "LAN only");
+    // WAN needs the shard subnet to carry the redirected broadcasts. The
+    // XNetStartup coupling only runs once, so enable it here too for a live
+    // toggle. Turning it off leaves the shard as configured -- broadcasts
+    // simply route back to the real LAN (xsocket reads the cvar per send).
+    if (over_wan) {
+      if (auto* net = RexNet::shared()) {
+        net->EnableAmbientShard();
+      }
+    }
+  };
   actions.connect_manual = [](const std::string& multiaddr) {
     if (auto* net = RexNet::shared()) {
       net->ConnectManual(multiaddr);
@@ -661,6 +675,14 @@ void RexNet::SetGameConfig(GameConfig config) {
 GameConfig RexNet::game_config() {
   std::lock_guard lock(mutex_);
   return game_config_;
+}
+
+void RexNet::EnableAmbientShard() {
+  std::lock_guard lock(mutex_);
+  // Reflect it in game_config_ so game_config() and later SetGameConfig calls
+  // agree the shard is on, and pass the loaded cap through (0 => core's 255).
+  game_config_.shard_enabled = true;
+  rexnet_shard_enable(handle_, game_config_.shard_cap);
 }
 
 void RexNet::PushRichLocked() {
