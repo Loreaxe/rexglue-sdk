@@ -181,10 +181,14 @@ class FunctionGraph {
 
   // Classify a branch target for code generation.
   // target: address being branched to
-  // callerAddr: address of the branch instruction
+  // callerFn: the authoritative function being emitted (its entry point and
+  //   bounds are the context for classifying the target; passing it directly
+  //   avoids re-deriving the caller via getFunctionContaining, which can pick
+  //   a LATER overlapping function node for a backward branch)
   // isCallInstruction: true for bl (expects return), false for b (no return)
   // Returns how the target should be treated during code generation.
-  TargetKind classifyTarget(uint32_t target, uint32_t callerAddr, bool isCallInstruction) const;
+  TargetKind classifyTarget(uint32_t target, const FunctionNode& callerFn,
+                            bool isCallInstruction) const;
 
  private:
   std::vector<CodeBuffer> codeBuffers_;

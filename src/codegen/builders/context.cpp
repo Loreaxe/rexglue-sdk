@@ -244,9 +244,8 @@ void BuilderContext::emit_function_call(uint32_t address) {
   // The call edge is missing from this function node, but the target may still
   // be a known function: overlapping-function discovery can split one real
   // function across several nodes, leaving the call in a node whose edge list
-  // missed it. Fall back to the graph's own function table.
-  if (const FunctionNode* known = graph().getFunctionContaining(address);
-      known != nullptr && known->base() == address) {
+  // missed it. Fall back to the graph's exact entry-point lookup.
+  if (const FunctionNode* known = graph().getFunction(address)) {
     println("\t{}(ctx, base);", known->name());
     return;
   }
@@ -261,20 +260,12 @@ void BuilderContext::emit_function_call(uint32_t address) {
 void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
   uint32_t target = insn.operands[1];
 
-  // The function being emitted is the authoritative context. classifyTarget
-  // re-derives the caller via getFunctionContaining, which can pick a LATER
-  // overlapping function node for a backward branch, so a same-function loop
-  // target gets classified Unknown. A label of this function is a local loop
-  // back-edge.
-  if (fn.isWithinBounds(target) && fn.isLabel(target)) {
-    println("\tif ({}{}.{}) goto loc_{:08X};", not_ ? "!" : "", cr(insn.operands[0]), cond,
-            target);
-    return;
-  }
-
-  // Use classifyTarget for consistent branch classification
-  // false = branch instruction (not a call), so own-base means loop back
-  auto kind = graph().classifyTarget(target, base, false);
+  // Use classifyTarget for consistent branch classification.
+  // false = branch instruction (not a call), so own-base means loop back.
+  // Pass fn (the authoritative function being emitted) directly: classifyTarget
+  // no longer re-derives the caller via getFunctionContaining, which could pick
+  // a LATER overlapping node and misclassify a same-function backward loop edge.
+  auto kind = graph().classifyTarget(target, fn, false);
 
   switch (kind) {
     case TargetKind::InternalLabel:
