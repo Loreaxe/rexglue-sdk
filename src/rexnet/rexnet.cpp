@@ -1155,9 +1155,11 @@ std::optional<RexNetPeerId> RexNet::PeerFromVip(uint32_t virtual_ip) {
 void RexNet::StartPumpThread() {
   pump_running_.store(true, std::memory_order_relaxed);
   pump_thread_ = std::thread([this] {
+    // Woken by the core on every event; the timeout only bounds how long a
+    // stop request can go unnoticed.
     while (pump_running_.load(std::memory_order_relaxed)) {
+      rexnet_wait_event(handle_, 16);
       Pump();
-      std::this_thread::sleep_for(std::chrono::milliseconds(16));
     }
   });
 }

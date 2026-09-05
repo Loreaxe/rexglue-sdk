@@ -93,7 +93,6 @@ libp2p = { version = "0.56", features = [
     "ed25519",
     "rsa",
 ] }
-libp2p-stream = "0.4.0-alpha"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
@@ -111,3 +110,6 @@ sha2 = "0.10"
 
 [profile.release]
 lto = "thin"
+
+[build-dependencies]
+cbindgen = { version = "0.29", default-features = false }

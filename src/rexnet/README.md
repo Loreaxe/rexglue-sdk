@@ -8,7 +8,7 @@ Layout (spec §2):
 |---|---|---|
 | L3 XAM shim | `*.cpp` here + `include/rex/net/` | XNet/XSession/XUser/XPresence/XNotify/XInvite semantics, virtual-IP table, BE↔LE marshalling |
 | L2 FFI | `include/rex/net/rexnet_ffi.h` ↔ `core/src/ffi.rs` | C ABI, command queue in / event queue out, `catch_unwind` |
-| L1 core | `core/` (`rexnet-core`, Rust) | identity, libp2p (kad/identify/dcutr/relay/mdns), punch engine. No Xbox concepts. |
+| L1 core | `core/` (`rexnet-core`, Rust) | identity, libp2p (kad/identify/dcutr/relay/mdns), punch engine, game-plane fast path. `core/src/stream/` is a vendored copy of libp2p-stream. No Xbox concepts. |
 
 Build: `-DREXGLUE_ENABLE_REXNET=ON` (needs a Rust toolchain >= 1.88, built
 via corrosion). OFF by default; everything here is compiled out.
@@ -44,9 +44,9 @@ NATs still need testing from an open network.
    to app-relevant peers (explicit dials, friends, session hits, inbound
    rexnet protocol traffic); public-DHT crawl connections stay invisible
    and only app-requested dial failures surface as `Event::Error`. Verified two-instance punch +
-   datagram over loopback. TODO: game-plane encryption (blocked on a
-   rust-libp2p keying-material exporter; probes are nonce-auth only),
-   tunnel fallback for hostile NAT pairs, GNS framing decision (§16).
+   datagram over loopback. Game-plane encryption (§6.1) and the tunnel
+   fallback (§14) followed; the hot path now runs off the swarm loop
+   (`core/src/game_plane.rs`) and the pump is event-woken (§6).
 4. **XAM shim** — XNet layer done (`xam/xam_net.cpp`): XNADDR synthesis
    (vip + abOnline peer key), `XNetXnAddrToInAddr`/`InAddrToXnAddr`,
    `XNetConnect`/`XNetGetConnectStatus` (XRNM-load-bearing, auto-punch on
@@ -134,5 +134,8 @@ NATs still need testing from an open network.
    the advertised game name (reserved presence rich KV 0xFF00 fed from
    the title's XDBF) instead of a raw title id.
 
-The FFI header is currently hand-maintained; keep `rexnet_ffi.h` in sync with
-`core/src/ffi.rs` (cbindgen config is in `core/cbindgen.toml`).
+`include/rex/net/rexnet_ffi.h` is generated from `core/src/ffi.rs` by
+`core/build.rs` on every cargo build (config in `core/cbindgen.toml`); edit
+the Rust, commit the regenerated header. `.github/workflows/rexnet.yaml`
+builds the crate and the SDK with the module on, runs the C++ and cargo
+tests including the loopback network tests, and fails on header drift.

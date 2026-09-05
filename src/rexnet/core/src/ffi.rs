@@ -19,12 +19,14 @@ use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use libp2p::PeerId;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::engine::{self, Command, Event};
+use crate::game_plane::GamePlane;
 use crate::identity;
 
 // --- Logging bridge -----------------------------------------------------
@@ -108,7 +110,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SinkLayer {
 /// `sink` must be callable from any thread for the process lifetime, since
 /// the engine logs from its own tokio threads.
 #[no_mangle]
-pub unsafe extern "C" fn rexnet_set_log_sink(sink: Option<RexNetLogSink>) {
+pub unsafe extern "C" fn rexnet_set_log_sink(sink: Option<extern "C" fn(u32, *const c_char)>) {
     LOG_SINK.store(sink.map_or(0, |f| f as usize), Ordering::Release);
     SUBSCRIBER.get_or_init(|| {
         use tracing_subscriber::layer::SubscriberExt;
@@ -184,46 +186,73 @@ impl Default for RexNetPeerId {
     }
 }
 
+// Event kinds as the C side sees them: `RexNetEvent.kind` is a plain u32, so
+// the header carries these as defines. Append-only; never renumber.
+pub const REXNET_EVENT_NONE: u32 = 0;
+pub const REXNET_EVENT_PEER_CONNECTED: u32 = 1;
+pub const REXNET_EVENT_PEER_DISCONNECTED: u32 = 2;
+pub const REXNET_EVENT_PRESENCE_UPDATED: u32 = 3;
+pub const REXNET_EVENT_FRIEND_REQUEST: u32 = 4;
+pub const REXNET_EVENT_FRIEND_ACCEPTED: u32 = 5;
+pub const REXNET_EVENT_INVITE_RECEIVED: u32 = 6;
+pub const REXNET_EVENT_INVITE_REPLIED: u32 = 7;
+pub const REXNET_EVENT_PUNCH_RESULT: u32 = 8;
+pub const REXNET_EVENT_SESSION_FOUND: u32 = 9;
+pub const REXNET_EVENT_DATAGRAM: u32 = 10;
+/// Punch failed; traffic for `peer` rides the control tunnel (degraded).
+pub const REXNET_EVENT_DEGRADED: u32 = 11;
+pub const REXNET_EVENT_ERROR: u32 = 12;
+pub const REXNET_EVENT_FRIEND_REMOVED: u32 = 13;
+/// Ambient shard presence (§17.3.4). Append-only: the C header mirrors
+/// this ordering, so never insert above an existing variant.
+pub const REXNET_EVENT_SHARD_PRESENCE: u32 = 14;
+/// A peer started/stopped relaying our traffic (§17.2); flag = is_relay.
+pub const REXNET_EVENT_RELAY_STATUS: u32 = 15;
+/// Our own virtual address changed (§17.3.5); virtual_ip carries it.
+pub const REXNET_EVENT_LOCAL_ADDRESS: u32 = 16;
+/// Guest TCP connection opened (§18). virtual_ip = peer, port =
+/// local guest port, src_port = remote guest port, flag = 1 when we
+/// opened it. data = 8-byte big-endian stream id.
+pub const REXNET_EVENT_STREAM_OPENED: u32 = 17;
+/// Bytes on a guest TCP connection. data = [stream id 8][payload].
+pub const REXNET_EVENT_STREAM_DATA: u32 = 18;
+/// Guest TCP connection ended. data = 8-byte stream id.
+pub const REXNET_EVENT_STREAM_CLOSED: u32 = 19;
+/// Outbound guest TCP connect failed. virtual_ip = peer, port = dst.
+pub const REXNET_EVENT_STREAM_CONNECT_FAILED: u32 = 20;
+/// Measured round trip to a peer. virtual_ip = peer, port = milliseconds.
+pub const REXNET_EVENT_PEER_RTT: u32 = 21;
+/// A directly dialable public endpoint for us was confirmed (UPnP/AutoNAT).
+/// data = UTF-8 bare `host:port` to hand a peer for a direct connect.
+pub const REXNET_EVENT_EXTERNAL_ADDRESS: u32 = 22;
+
+/// Rust-side view of the same numbering.
 #[repr(u32)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RexNetEventKind {
-    None = 0,
-    PeerConnected,
-    PeerDisconnected,
-    PresenceUpdated,
-    FriendRequest,
-    FriendAccepted,
-    InviteReceived,
-    InviteReplied,
-    PunchResult,
-    SessionFound,
-    Datagram,
-    /// Punch failed; traffic for `peer` rides the control tunnel (degraded).
-    Degraded,
-    Error,
-    FriendRemoved,
-    /// Ambient shard presence (§17.3.4). Append-only: the C header mirrors
-    /// this ordering, so never insert above an existing variant.
-    ShardPresence,
-    /// A peer started/stopped relaying our traffic (§17.2); flag = is_relay.
-    RelayStatus,
-    /// Our own virtual address changed (§17.3.5); virtual_ip carries it.
-    LocalAddress,
-    /// Guest TCP connection opened (§18). virtual_ip = peer, port =
-    /// local guest port, src_port = remote guest port, flag = 1 when we
-    /// opened it. data = 8-byte big-endian stream id.
-    StreamOpened,
-    /// Bytes on a guest TCP connection. data = [stream id 8][payload].
-    StreamData,
-    /// Guest TCP connection ended. data = 8-byte stream id.
-    StreamClosed,
-    /// Outbound guest TCP connect failed. virtual_ip = peer, port = dst.
-    StreamConnectFailed,
-    /// Measured round trip to a peer. virtual_ip = peer, port = milliseconds.
-    PeerRtt,
-    /// A directly dialable public endpoint for us was confirmed (UPnP/AutoNAT).
-    /// data = UTF-8 bare `host:port` to hand a peer for a direct connect.
-    ExternalAddress,
+    None = REXNET_EVENT_NONE,
+    PeerConnected = REXNET_EVENT_PEER_CONNECTED,
+    PeerDisconnected = REXNET_EVENT_PEER_DISCONNECTED,
+    PresenceUpdated = REXNET_EVENT_PRESENCE_UPDATED,
+    FriendRequest = REXNET_EVENT_FRIEND_REQUEST,
+    FriendAccepted = REXNET_EVENT_FRIEND_ACCEPTED,
+    InviteReceived = REXNET_EVENT_INVITE_RECEIVED,
+    InviteReplied = REXNET_EVENT_INVITE_REPLIED,
+    PunchResult = REXNET_EVENT_PUNCH_RESULT,
+    SessionFound = REXNET_EVENT_SESSION_FOUND,
+    Datagram = REXNET_EVENT_DATAGRAM,
+    Degraded = REXNET_EVENT_DEGRADED,
+    Error = REXNET_EVENT_ERROR,
+    FriendRemoved = REXNET_EVENT_FRIEND_REMOVED,
+    ShardPresence = REXNET_EVENT_SHARD_PRESENCE,
+    RelayStatus = REXNET_EVENT_RELAY_STATUS,
+    LocalAddress = REXNET_EVENT_LOCAL_ADDRESS,
+    StreamOpened = REXNET_EVENT_STREAM_OPENED,
+    StreamData = REXNET_EVENT_STREAM_DATA,
+    StreamClosed = REXNET_EVENT_STREAM_CLOSED,
+    StreamConnectFailed = REXNET_EVENT_STREAM_CONNECT_FAILED,
+    PeerRtt = REXNET_EVENT_PEER_RTT,
+    ExternalAddress = REXNET_EVENT_EXTERNAL_ADDRESS,
 }
 
 /// Fixed-size POD event, drained once per frame via [`rexnet_poll_event`].
@@ -231,7 +260,8 @@ pub enum RexNetEventKind {
 /// error text) are carried in `data`/`data_len`, encoded per §8.
 #[repr(C)]
 pub struct RexNetEvent {
-    pub kind: RexNetEventKind,
+    /// One of the `REXNET_EVENT_*` values.
+    pub kind: u32,
     pub peer: RexNetPeerId,
     /// PeerConnected: the peer's allocated 10.77.0.0/16 address.
     /// Datagram: the sender's virtual IP.
@@ -247,11 +277,15 @@ pub struct RexNetEvent {
 }
 
 pub struct RexNetHandle {
-    _runtime: tokio::runtime::Runtime,
+    runtime: tokio::runtime::Runtime,
     cmd_tx: mpsc::UnboundedSender<Command>,
     /// Drained only by rexnet_poll_event; Mutex because the C side gives no
     /// single-thread guarantee.
     evt_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
+    /// Pinged on every event so rexnet_wait_event returns at once.
+    evt_notify: Arc<Notify>,
+    /// Sends to ready peers bypass the engine loop entirely.
+    plane: Arc<GamePlane>,
     pub peer_id: PeerId,
 }
 
@@ -264,7 +298,7 @@ fn cstr_owned(ptr: *const c_char) -> String {
 
 fn fill_event(out: &mut RexNetEvent, event: Event) {
     *out = RexNetEvent {
-        kind: RexNetEventKind::None,
+        kind: REXNET_EVENT_NONE,
         peer: RexNetPeerId::default(),
         virtual_ip: 0,
         port: 0,
@@ -281,12 +315,12 @@ fn fill_event(out: &mut RexNetEvent, event: Event) {
     };
     match event {
         Event::PeerConnected { peer, virtual_ip } => {
-            out.kind = RexNetEventKind::PeerConnected;
+            out.kind = RexNetEventKind::PeerConnected as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
             out.virtual_ip = virtual_ip;
         }
         Event::StreamOpened { stream_id, virtual_ip, local_port, remote_port, outbound } => {
-            out.kind = RexNetEventKind::StreamOpened;
+            out.kind = RexNetEventKind::StreamOpened as u32;
             out.virtual_ip = virtual_ip;
             out.port = local_port;
             out.src_port = remote_port;
@@ -294,7 +328,7 @@ fn fill_event(out: &mut RexNetEvent, event: Event) {
             set_data(out, &stream_id.to_be_bytes());
         }
         Event::StreamData { stream_id, data } => {
-            out.kind = RexNetEventKind::StreamData;
+            out.kind = RexNetEventKind::StreamData as u32;
             // Stream id prefixes the payload: the shim routes on it, and a
             // separate field would cap payloads at the fixed event struct.
             let mut packed = Vec::with_capacity(8 + data.len());
@@ -303,31 +337,31 @@ fn fill_event(out: &mut RexNetEvent, event: Event) {
             set_data(out, &packed);
         }
         Event::StreamClosed { stream_id } => {
-            out.kind = RexNetEventKind::StreamClosed;
+            out.kind = RexNetEventKind::StreamClosed as u32;
             set_data(out, &stream_id.to_be_bytes());
         }
         Event::StreamConnectFailed { virtual_ip, dst_port, message } => {
-            out.kind = RexNetEventKind::StreamConnectFailed;
+            out.kind = RexNetEventKind::StreamConnectFailed as u32;
             out.virtual_ip = virtual_ip;
             out.port = dst_port;
             set_data(out, message.as_bytes());
         }
         Event::PeerRtt { virtual_ip, rtt_ms } => {
-            out.kind = RexNetEventKind::PeerRtt;
+            out.kind = RexNetEventKind::PeerRtt as u32;
             out.virtual_ip = virtual_ip;
             out.port = rtt_ms.min(u16::MAX as u32) as u16;
         }
         Event::LocalAddress { virtual_ip } => {
-            out.kind = RexNetEventKind::LocalAddress;
+            out.kind = RexNetEventKind::LocalAddress as u32;
             out.virtual_ip = virtual_ip;
         }
         Event::RelayStatus { peer, is_relay } => {
-            out.kind = RexNetEventKind::RelayStatus;
+            out.kind = RexNetEventKind::RelayStatus as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
             out.flag = u8::from(is_relay);
         }
         Event::ShardPresence { peer, state, rich, session_id } => {
-            out.kind = RexNetEventKind::ShardPresence;
+            out.kind = RexNetEventKind::ShardPresence as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
             out.flag = state;
             // data = [has_session u8][session_id 16 if set][rich]
@@ -344,11 +378,11 @@ fn fill_event(out: &mut RexNetEvent, event: Event) {
             set_data(out, &packed);
         }
         Event::PeerDisconnected { peer } => {
-            out.kind = RexNetEventKind::PeerDisconnected;
+            out.kind = RexNetEventKind::PeerDisconnected as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
         }
         Event::PresenceUpdated { peer, title_id, state, display_name, rich } => {
-            out.kind = RexNetEventKind::PresenceUpdated;
+            out.kind = RexNetEventKind::PresenceUpdated as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
             out.virtual_ip = title_id; // repurposed: title id
             out.flag = state;
@@ -362,7 +396,7 @@ fn fill_event(out: &mut RexNetEvent, event: Event) {
             set_data(out, &packed);
         }
         Event::FriendRequest { peer, display_name, note } => {
-            out.kind = RexNetEventKind::FriendRequest;
+            out.kind = RexNetEventKind::FriendRequest as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
             // data = [name_len u8][name][note], mirroring PresenceUpdated.
             let name = display_name.as_bytes();
@@ -374,31 +408,31 @@ fn fill_event(out: &mut RexNetEvent, event: Event) {
             set_data(out, &data);
         }
         Event::FriendAccepted { peer } => {
-            out.kind = RexNetEventKind::FriendAccepted;
+            out.kind = RexNetEventKind::FriendAccepted as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
         }
         Event::FriendRemoved { peer } => {
-            out.kind = RexNetEventKind::FriendRemoved;
+            out.kind = RexNetEventKind::FriendRemoved as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
         }
         Event::InviteReceived { peer, title_id, session_id } => {
-            out.kind = RexNetEventKind::InviteReceived;
+            out.kind = RexNetEventKind::InviteReceived as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
             out.virtual_ip = title_id; // repurposed: title id
             set_data(out, &session_id);
         }
         Event::InviteReplied { peer, reply } => {
-            out.kind = RexNetEventKind::InviteReplied;
+            out.kind = RexNetEventKind::InviteReplied as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
             out.flag = reply;
         }
         Event::PunchResult { peer, ok } => {
-            out.kind = RexNetEventKind::PunchResult;
+            out.kind = RexNetEventKind::PunchResult as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
             out.flag = ok as u8;
         }
         Event::SessionFound { host, session_id, slots_total, slots_open, requires_invite } => {
-            out.kind = RexNetEventKind::SessionFound;
+            out.kind = RexNetEventKind::SessionFound as u32;
             out.peer = RexNetPeerId::from_peer(&host);
             out.port = u16::from(slots_total);
             out.src_port = u16::from(slots_open);
@@ -406,22 +440,22 @@ fn fill_event(out: &mut RexNetEvent, event: Event) {
             set_data(out, &session_id);
         }
         Event::Datagram { virtual_ip, src_port, dst_port, data } => {
-            out.kind = RexNetEventKind::Datagram;
+            out.kind = RexNetEventKind::Datagram as u32;
             out.virtual_ip = virtual_ip;
             out.port = dst_port;
             out.src_port = src_port;
             set_data(out, &data);
         }
         Event::Degraded { peer } => {
-            out.kind = RexNetEventKind::Degraded;
+            out.kind = RexNetEventKind::Degraded as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
         }
         Event::Error { message } => {
-            out.kind = RexNetEventKind::Error;
+            out.kind = RexNetEventKind::Error as u32;
             set_data(out, message.as_bytes());
         }
         Event::ExternalAddress { addr } => {
-            out.kind = RexNetEventKind::ExternalAddress;
+            out.kind = RexNetEventKind::ExternalAddress as u32;
             set_data(out, addr.as_bytes());
         }
     }
@@ -498,9 +532,11 @@ pub unsafe extern "C" fn rexnet_init(cfg: *const RexNetConfig) -> *mut RexNetHan
         };
 
         Box::into_raw(Box::new(RexNetHandle {
-            _runtime: runtime,
+            runtime,
             cmd_tx: handles.cmd_tx,
             evt_rx: Mutex::new(handles.evt_rx),
+            evt_notify: handles.evt_notify,
+            plane: handles.plane,
             peer_id: handles.peer_id,
         }))
     }))
@@ -527,6 +563,28 @@ unsafe fn with_handle(handle: *mut RexNetHandle, f: impl FnOnce(&RexNetHandle)) 
             f(handle);
         }
     }));
+}
+
+/// Block the calling thread until an event is queued or `timeout_ms`
+/// elapses. Returns true if woken by an event. A wake with an empty queue is
+/// possible (the event was drained by another poll) and harmless.
+///
+/// This is what lets the shim's pump thread deliver a datagram the moment
+/// it arrives rather than on its next fixed tick.
+///
+/// # Safety
+/// `handle` from [`rexnet_init`], not yet shut down.
+#[no_mangle]
+pub unsafe extern "C" fn rexnet_wait_event(handle: *mut RexNetHandle, timeout_ms: u32) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(handle) = handle.as_ref() else { return false };
+        let wait = handle.evt_notify.notified();
+        handle
+            .runtime
+            .block_on(tokio::time::timeout(Duration::from_millis(timeout_ms as u64), wait))
+            .is_ok()
+    }))
+    .unwrap_or(false)
 }
 
 /// # Safety
@@ -985,6 +1043,14 @@ pub unsafe extern "C" fn rexnet_send_datagram(
     reliable: bool,
 ) {
     with_handle(handle, |h| {
+        // Ready peer: sealed and sent on this thread. Everything else (punch
+        // in flight, tunnel, broadcast) is the engine's to route.
+        if !data.is_null() && len > 0 {
+            let bytes = std::slice::from_raw_parts(data, len as usize);
+            if h.plane.try_send(virtual_ip, src_port, dst_port, bytes) {
+                return;
+            }
+        }
         let data = slice_owned(data, len);
         let _ = h.cmd_tx.send(Command::SendDatagram {
             virtual_ip,

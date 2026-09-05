@@ -45,13 +45,14 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::friends::FriendStore;
 use crate::shard::{self, Candidate, Migration, Placement, ShardDesc, DEFAULT_SHARD_CAP};
 use crate::subnet;
 use crate::tcp::{StreamHeader, StreamId, StreamInfo, StreamTable, STREAM_HEADER_LEN, STREAM_SCHEMA};
-use crate::crypto::{self, LocalKeyAgreement, SessionKeys};
+use crate::crypto::{self, LocalKeyAgreement};
+use crate::game_plane::{Emitter, GamePlane};
 use crate::tunnel;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -130,7 +131,7 @@ fn now_micros() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
 
-const FRAME_DATA: u8 = 0x01;
+pub const FRAME_DATA: u8 = 0x01;
 const FRAME_PROBE: u8 = 0x02;
 const FRAME_PROBE_ACK: u8 = 0x03;
 
@@ -387,6 +388,10 @@ pub struct EngineConfig {
 pub struct EngineHandles {
     pub cmd_tx: mpsc::UnboundedSender<Command>,
     pub evt_rx: mpsc::UnboundedReceiver<Event>,
+    /// Pinged on every event; `rexnet_wait_event` blocks on it.
+    pub evt_notify: Arc<Notify>,
+    /// Game-plane fast path, shared with the FFI send call.
+    pub plane: Arc<GamePlane>,
     pub peer_id: PeerId,
 }
 
@@ -601,7 +606,7 @@ async fn pump_stream(
 /// header is read here before the connection is announced -- the shim cannot
 /// match it to a listening socket without knowing the port.
 fn spawn_stream_acceptor(
-    mut control: libp2p_stream::Control,
+    mut control: crate::stream::Control,
     events: mpsc::UnboundedSender<StreamEvent>,
     next_id: Arc<AtomicU64>,
 ) {
@@ -694,7 +699,7 @@ async fn pump_tunnel_writer(
 
 /// Open the outbound tunnel to `peer` and start writing to it.
 fn spawn_tunnel_writer(
-    mut control: libp2p_stream::Control,
+    mut control: crate::stream::Control,
     peer: PeerId,
     outgoing: mpsc::Receiver<Vec<u8>>,
     events: mpsc::UnboundedSender<TunnelEvent>,
@@ -746,7 +751,7 @@ async fn pump_tunnel_reader(
 
 /// Accept inbound tunnels for the lifetime of the engine.
 fn spawn_tunnel_acceptor(
-    mut control: libp2p_stream::Control,
+    mut control: crate::stream::Control,
     events: mpsc::UnboundedSender<TunnelEvent>,
 ) {
     let protocol = StreamProtocol::new(crate::protocol::TUNNEL);
@@ -800,7 +805,7 @@ struct Behaviour {
     /// streams rather than request-response protocols: a guest stream socket
     /// needs ordered bytes, and the tunnel needs a carrier whose cost does
     /// not scale with datagram rate.
-    stream: libp2p_stream::Behaviour,
+    stream: crate::stream::Behaviour,
     /// Ambient shard broadcast (§17.3.4). Deliberately gossip rather than a
     /// mesh of direct links: 255 peers fully connected is ~32k connections.
     gossipsub: gossipsub::Behaviour,
@@ -900,7 +905,7 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
                     )],
                     request_response::Config::default(),
                 ),
-                stream: libp2p_stream::Behaviour::new(),
+                stream: crate::stream::Behaviour::new(),
                 gossipsub: gossipsub::Behaviour::new(
                     gossipsub::MessageAuthenticity::Signed(key.clone()),
                     gossipsub::Config::default(),
@@ -984,21 +989,30 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
     let game_socket =
         Arc::new(UdpSocket::bind(("0.0.0.0", config.game_port)).await?);
     tracing::info!(game_port = game_socket.local_addr()?.port(), "game socket bound");
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
+    let (evt_tx, evt_rx) = mpsc::unbounded_channel::<Event>();
+    let evt_notify = Arc::new(Notify::new());
+    let emitter = Emitter::new(evt_tx, evt_notify.clone());
+    let plane = Arc::new(GamePlane::new(game_socket.clone(), emitter.clone()));
+
+    // Ready peers' data frames are decrypted and delivered right here; only
+    // probes and not-yet-mapped frames go through the engine.
     let (game_tx, game_rx) = mpsc::unbounded_channel::<(SocketAddr, Vec<u8>)>();
     {
         let socket = game_socket.clone();
+        let plane = plane.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             while let Ok((len, addr)) = socket.recv_from(&mut buf).await {
+                if plane.try_receive(addr, &buf[..len]) {
+                    continue;
+                }
                 if game_tx.send((addr, buf[..len].to_vec())).is_err() {
                     break;
                 }
             }
         });
     }
-
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
-    let (evt_tx, evt_rx) = mpsc::unbounded_channel::<Event>();
 
     let friend_store = FriendStore::load(&config.data_dir);
 
@@ -1019,7 +1033,8 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
     tokio::spawn(
         Engine {
             swarm,
-            evt_tx,
+            emitter,
+            plane: plane.clone(),
             game_socket,
             title_id: config.title_id,
             display_name: config.display_name.clone(),
@@ -1078,10 +1093,8 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             tunnel_writers: HashMap::new(),
             tunnel_tx,
             tunnel_drops: HashMap::new(),
-            game_endpoint_by_peer: HashMap::new(),
-            peer_by_game_endpoint: HashMap::new(),
+            peer_game_pubs: HashMap::new(),
             key_agreements: HashMap::new(),
-            game_keys: HashMap::new(),
             pending_punch_nonce: HashMap::new(),
             punch_replies: HashMap::new(),
             pending_punch_offers: HashMap::new(),
@@ -1092,12 +1105,15 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
     );
 
     tracing::info!(%peer_id, title_id = %format!("{:08X}", config.title_id), "rexnet engine up");
-    Ok(EngineHandles { cmd_tx, evt_rx, peer_id })
+    Ok(EngineHandles { cmd_tx, evt_rx, evt_notify, plane, peer_id })
 }
 
 struct Engine {
     swarm: Swarm<Behaviour>,
-    evt_tx: mpsc::UnboundedSender<Event>,
+    emitter: Emitter,
+    /// Punched endpoints, session keys and the vip table live here so the
+    /// fast paths can read them; this loop is their only writer.
+    plane: Arc<GamePlane>,
     game_socket: Arc<UdpSocket>,
     title_id: u32,
     display_name: String,
@@ -1199,7 +1215,7 @@ struct Engine {
     /// Write half of each live stream, keyed the same way.
     stream_writers: HashMap<StreamId, mpsc::UnboundedSender<Vec<u8>>>,
     /// Handle used to open outbound streams; cloned into spawned tasks.
-    stream_control: libp2p_stream::Control,
+    stream_control: crate::stream::Control,
     /// Shared id allocator so a pump task can name a stream without a round
     /// trip back to the engine.
     next_stream_id: Arc<AtomicU64>,
@@ -1214,7 +1230,7 @@ struct Engine {
     /// read by the shim for QoS, where titles show it as ping.
     peer_rtt_ms: HashMap<PeerId, u32>,
     /// Handle used to open outbound tunnel streams; cloned into the tasks.
-    tunnel_control: libp2p_stream::Control,
+    tunnel_control: crate::stream::Control,
     /// Write half of each peer's outbound tunnel. Bounded, because the guest
     /// thinks it is sending UDP and a backed-up link should drop, not grow.
     tunnel_writers: HashMap<PeerId, mpsc::Sender<Vec<u8>>>,
@@ -1224,14 +1240,15 @@ struct Engine {
     /// counted so loss can be seen in the log rather than guessed at from a
     /// title behaving oddly.
     tunnel_drops: HashMap<PeerId, u64>,
-    game_endpoint_by_peer: HashMap<PeerId, SocketAddr>,
-    peer_by_game_endpoint: HashMap<SocketAddr, PeerId>,
+    /// The public key each peer's current game-plane keys were derived
+    /// from. A different key in a later offer means the peer restarted and
+    /// lost its state, and ours must follow or nothing authenticates until
+    /// the stale connection times out.
+    peer_game_pubs: HashMap<PeerId, [u8; 32]>,
     /// Our half of the game-plane key agreement, one per peer session (§6).
     /// Created when we first punch toward a peer and reused for every attempt,
     /// so simultaneous punches cannot derive mismatched keys.
     key_agreements: HashMap<PeerId, LocalKeyAgreement>,
-    /// Derived game-plane keys, once the peer's public key has arrived.
-    game_keys: HashMap<PeerId, SessionKeys>,
     pending_punch_nonce: HashMap<[u8; 16], PeerId>,
     punch_replies: HashMap<PeerId, oneshot::Sender<Result<SocketAddr, String>>>,
     pending_punch_offers: HashMap<OutboundRequestId, PeerId>,
@@ -1342,7 +1359,7 @@ impl Engine {
     }
 
     fn emit(&self, event: Event) {
-        let _ = self.evt_tx.send(event);
+        self.emitter.emit(event);
     }
 
     // --- Ambient title shard (§17.3) ------------------------------------
@@ -1712,6 +1729,7 @@ impl Engine {
         let vip = self.derive_vip(peer);
         self.vip_by_peer.insert(peer, vip);
         self.peer_by_vip.insert(vip, peer);
+        self.plane.set_vip(peer, vip);
         vip
     }
 
@@ -1727,6 +1745,7 @@ impl Engine {
         }
         self.vip_by_peer.insert(peer, vip);
         self.peer_by_vip.insert(vip, peer);
+        self.plane.set_vip(peer, vip);
         tracing::info!(
             %peer,
             from = %previous.map(format_vip).unwrap_or_else(|| "-".to_string()),
@@ -1768,6 +1787,7 @@ impl Engine {
         for peer in stale {
             if let Some(vip) = self.vip_by_peer.remove(&peer) {
                 self.peer_by_vip.remove(&vip);
+                self.plane.clear_vip(&peer);
             }
         }
         let peers: Vec<PeerId> = self.vip_by_peer.keys().copied().collect();
@@ -1906,7 +1926,12 @@ impl Engine {
     /// A punched endpoint is only usable once it is also keyed; before that
     /// nothing can be sealed, so treating it as ready strands the peer.
     fn game_plane_ready(&self, peer: &PeerId) -> bool {
-        self.game_endpoint_by_peer.contains_key(peer) && self.game_keys.contains_key(peer)
+        self.plane.ready(peer)
+    }
+
+    /// The punched endpoint, only once it is also keyed.
+    fn ready_endpoint(&self, peer: &PeerId) -> Option<SocketAddr> {
+        self.plane.endpoint(peer).filter(|_| self.plane.has_keys(peer))
     }
 
     /// Reused across punch attempts so both sides agree (§6.1).
@@ -1914,22 +1939,31 @@ impl Engine {
         self.key_agreements.entry(peer).or_default().public_key()
     }
 
-    /// An established session is left alone: re-deriving would rewind the
-    /// nonce counter and replay window.
+    /// An established session is left alone when the same key arrives again
+    /// (simultaneous punches deliver it twice): re-deriving would rewind the
+    /// nonce counter and replay window. A *different* key can only come from
+    /// a peer that restarted, so the session is rebuilt around it -- endpoint
+    /// included, since the old one belongs to the old process.
     fn establish_game_keys(&mut self, peer: PeerId, peer_pub: [u8; 32]) {
-        if self.game_keys.contains_key(&peer) {
-            return;
+        if self.plane.has_keys(&peer) {
+            if self.peer_game_pubs.get(&peer) == Some(&peer_pub) {
+                return;
+            }
+            tracing::info!(%peer, "peer presented a new game-plane key; rebuilding its session");
+            self.plane.remove_keys(&peer);
+            self.plane.unmap_endpoint(&peer);
         }
         let keys = self.key_agreements.entry(peer).or_default().derive(&peer_pub);
-        self.game_keys.insert(peer, keys);
+        self.plane.install_keys(peer, keys);
+        self.peer_game_pubs.insert(peer, peer_pub);
         tracing::info!(%peer, "game-plane keys established");
-        if let Some(addr) = self.game_endpoint_by_peer.get(&peer).copied() {
+        if let Some(addr) = self.plane.endpoint(&peer) {
             self.complete_game_plane(peer, addr);
         }
     }
 
-    /// `None` when there are no keys — the caller drops it. No plaintext
-    /// fallback: that would be a downgrade an attacker could force.
+    /// Engine-side sealing for held and broadcast traffic; live traffic goes
+    /// through `GamePlane::try_send` without touching this loop.
     fn seal_datagram(
         &mut self,
         peer: PeerId,
@@ -1937,52 +1971,12 @@ impl Engine {
         dst_port: u16,
         data: &[u8],
     ) -> Option<Vec<u8>> {
-        let Some(keys) = self.game_keys.get_mut(&peer) else {
-            tracing::warn!(%peer, "no game-plane keys; datagram dropped rather than sent in clear");
-            return None;
-        };
-        let mut plaintext = Vec::with_capacity(4 + data.len());
-        plaintext.extend_from_slice(&src_port.to_be_bytes());
-        plaintext.extend_from_slice(&dst_port.to_be_bytes());
-        plaintext.extend_from_slice(data);
-
-        match keys.sealer.seal(&[FRAME_DATA], &plaintext) {
-            Ok(record) => {
-                let mut frame = Vec::with_capacity(1 + record.len());
-                frame.push(FRAME_DATA);
-                frame.extend_from_slice(&record);
-                Some(frame)
-            }
-            Err(err) => {
-                tracing::warn!(%peer, ?err, "sealing a game datagram failed; dropped");
-                None
-            }
-        }
+        self.plane.seal(peer, src_port, dst_port, data)
     }
 
-    /// Authenticate and decrypt an inbound game datagram.
+    /// Engine-side decryption for frames held before their endpoint mapped.
     fn open_datagram(&mut self, peer: PeerId, frame: &[u8]) -> Option<(u16, u16, Vec<u8>)> {
-        let keys = self.game_keys.get_mut(&peer)?;
-        match keys.opener.open(&[FRAME_DATA], &frame[1..]) {
-            Ok(plain) if plain.len() >= 4 => Some((
-                u16::from_be_bytes([plain[0], plain[1]]),
-                u16::from_be_bytes([plain[2], plain[3]]),
-                plain[4..].to_vec(),
-            )),
-            Ok(_) => {
-                tracing::debug!(%peer, "authentic game datagram was too short to carry ports");
-                None
-            }
-            Err(crypto::CryptoError::Replay) => {
-                // Expected with retransmitting titles; not an attack signal.
-                tracing::trace!(%peer, "replayed game datagram dropped");
-                None
-            }
-            Err(err) => {
-                tracing::debug!(%peer, ?err, "game datagram failed authentication");
-                None
-            }
-        }
+        self.plane.open(peer, frame)
     }
 
     /// Record a round trip measured from a probe ack.
@@ -1990,7 +1984,7 @@ impl Engine {
     /// Smoothed rather than replaced: a single sample on a busy link is noise,
     /// and a title showing ping wants a stable number.
     fn note_rtt(&mut self, addr: SocketAddr, sent_micros: u64) {
-        let Some(peer) = self.peer_by_game_endpoint.get(&addr).copied() else {
+        let Some(peer) = self.plane.peer_at(&addr) else {
             return;
         };
         let now = now_micros();
@@ -2252,8 +2246,8 @@ impl Engine {
         let mut sent = 0usize;
         let mut punching = 0usize;
         for peer in members {
-            match self.game_endpoint_by_peer.get(&peer).copied() {
-                Some(endpoint) if self.game_keys.contains_key(&peer) => {
+            match self.plane.endpoint(&peer) {
+                Some(endpoint) if self.plane.has_keys(&peer) => {
                     if let Some(frame) = self.seal_datagram(peer, src_port, dst_port, data) {
                         let _ = self.game_socket.try_send_to(&frame, endpoint);
                         sent += 1;
@@ -2443,7 +2437,7 @@ impl Engine {
             tracing::trace!(%addr, "probe with unknown nonce ignored");
             return;
         };
-        if self.game_endpoint_by_peer.contains_key(&peer) {
+        if self.plane.endpoint(&peer).is_some() {
             return; // first authenticated pair wins (§8.4)
         }
         tracing::info!(
@@ -2451,14 +2445,13 @@ impl Engine {
             peer_addr = %format_vip(self.vip_by_peer.get(&peer).copied().unwrap_or(0)),
             "game endpoint punched"
         );
-        self.game_endpoint_by_peer.insert(peer, addr);
-        self.peer_by_game_endpoint.insert(addr, peer);
+        self.plane.map_endpoint(peer, addr);
         self.vip_for(peer);
         // The probe travels direct while the punch answer comes back over the
         // control connection, so the endpoint can map before keys exist.
         // Whichever lands second finishes the job; until then the deadline
         // stays armed so the watchdog can still fall back to the tunnel.
-        if self.game_keys.contains_key(&peer) {
+        if self.plane.has_keys(&peer) {
             self.complete_game_plane(peer, addr);
         } else {
             tracing::warn!(%peer, %addr, "endpoint punched but no keys yet; holding traffic");
@@ -2490,8 +2483,8 @@ impl Engine {
                 // Unmapped, or mapped but not yet keyed because the probe beat
                 // the punch answer. Either way hold rather than drop: this
                 // window is exactly when a join's opening handshake arrives.
-                let mapped = self.peer_by_game_endpoint.get(&addr).copied();
-                let Some(peer) = mapped.filter(|p| self.game_keys.contains_key(p)) else {
+                let mapped = self.plane.peer_at(&addr);
+                let Some(peer) = mapped.filter(|p| self.plane.has_keys(p)) else {
                     // The two sides complete their punches independently, and
                     // the peer flushes whatever it queued the instant *its*
                     // side completes -- which can be milliseconds before ours.
@@ -2569,8 +2562,7 @@ impl Engine {
                 // request-response below dials if not yet connected.
                 self.wanted_peers.insert(peer);
                 self.announce_peer(peer);
-                if self.game_plane_ready(&peer) {
-                    let endpoint = self.game_endpoint_by_peer[&peer];
+                if let Some(endpoint) = self.ready_endpoint(&peer) {
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(endpoint));
                     } else {
@@ -2596,8 +2588,7 @@ impl Engine {
                     return true;
                 };
                 let peer = *peer;
-                if self.game_plane_ready(&peer) {
-                    let endpoint = self.game_endpoint_by_peer[&peer];
+                if let Some(endpoint) = self.ready_endpoint(&peer) {
                     if let Some(frame) = self.seal_datagram(peer, src_port, dst_port, &data) {
                         let _ = self.game_socket.try_send_to(&frame, endpoint);
                     }
@@ -2905,9 +2896,7 @@ impl Engine {
                     self.connected.remove(&peer_id);
                     // Virtual IP stays allocated (stable across reconnects);
                     // the punched endpoint is dropped as stale.
-                    if let Some(endpoint) = self.game_endpoint_by_peer.remove(&peer_id) {
-                        self.peer_by_game_endpoint.remove(&endpoint);
-                    }
+                    self.plane.unmap_endpoint(&peer_id);
                     // A relay that goes away stops being one; leaving it
                     // labelled would strand a stale "relay" row in the UI.
                     self.rexnet_peers.remove(&peer_id);
@@ -2921,13 +2910,16 @@ impl Engine {
                         self.emit(Event::StreamClosed { stream_id: id });
                     }
                     self.punch_deadline.remove(&peer_id);
+                    // Nonces are only ever added, so this is where they leave.
+                    self.pending_punch_nonce.retain(|_, p| *p != peer_id);
                     self.tunneled_peers.remove(&peer_id);
                     self.close_tunnel(&peer_id);
                     // A reconnect negotiates fresh keys, so counters and the
                     // replay window are never reused.
                     self.peer_rtt_ms.remove(&peer_id);
                     self.key_agreements.remove(&peer_id);
-                    self.game_keys.remove(&peer_id);
+                    self.peer_game_pubs.remove(&peer_id);
+                    self.plane.remove_keys(&peer_id);
                     // Allow a retry if they come back on the topic.
                     self.shard_reachable_attempted.remove(&peer_id);
                     if self.relays.remove(&peer_id) {
