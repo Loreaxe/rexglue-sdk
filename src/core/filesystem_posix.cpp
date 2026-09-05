@@ -6,7 +6,7 @@
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  *
- * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    Tom Clay & Rien Gupta, 2026 - Adapted for ReXGlue runtime (POSIX + macOS)
  */
 
 #include <assert.h>
@@ -20,6 +20,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
 #include <rex/assert.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
@@ -30,6 +34,20 @@
 #include <ftw.h>
 #include <libgen.h>
 #include <pwd.h>
+
+// macOS off_t is 64-bit with no *64 large-file variants; Linux keeps the
+// explicit *64 forms for legacy 32-bit off_t distributions.
+#if defined(__APPLE__)
+using rex_off64_t = off_t;
+#define rex_fseeko64 fseeko
+#define rex_ftello64 ftello
+#define rex_ftruncate64 ftruncate
+#else
+using rex_off64_t = off64_t;
+#define rex_fseeko64 fseeko64
+#define rex_ftello64 ftello64
+#define rex_ftruncate64 ftruncate64
+#endif
 
 namespace rex {
 
@@ -52,10 +70,33 @@ std::filesystem::path to_path(const std::u16string_view source) {
 namespace filesystem {
 
 std::filesystem::path GetExecutablePath() {
+#if defined(__APPLE__)
+  // Darwin has no /proc; query the executable path via the dyld API. The first
+  // call reports the required buffer size.
+  uint32_t executable_path_size = 0;
+  _NSGetExecutablePath(nullptr, &executable_path_size);
+  if (!executable_path_size) {
+    return {};
+  }
+
+  std::string executable_path(executable_path_size, '\0');
+  if (_NSGetExecutablePath(executable_path.data(), &executable_path_size) != 0) {
+    return {};
+  }
+
+  if (!executable_path.empty() && executable_path.back() == '\0') {
+    executable_path.pop_back();
+  }
+
+  std::error_code ec;
+  std::filesystem::path canonical_path = std::filesystem::weakly_canonical(executable_path, ec);
+  return ec ? std::filesystem::path(executable_path) : canonical_path;
+#else
   char buff[FILENAME_MAX] = "";
   readlink("/proc/self/exe", buff, FILENAME_MAX);
   std::string s(buff);
   return s;
+#endif
 }
 
 std::filesystem::path GetExecutableFolder() {
@@ -87,11 +128,11 @@ FILE* OpenFile(const std::filesystem::path& path, const std::string_view mode) {
 }
 
 bool Seek(FILE* file, int64_t offset, int origin) {
-  return fseeko64(file, off64_t(offset), origin) == 0;
+  return rex_fseeko64(file, rex_off64_t(offset), origin) == 0;
 }
 
 int64_t Tell(FILE* file) {
-  return int64_t(ftello64(file));
+  return int64_t(rex_ftello64(file));
 }
 
 bool TruncateStdioFile(FILE* file, uint64_t length) {
@@ -102,7 +143,7 @@ bool TruncateStdioFile(FILE* file, uint64_t length) {
   if (position < 0) {
     return false;
   }
-  if (ftruncate64(fileno(file), off64_t(length))) {
+  if (rex_ftruncate64(fileno(file), rex_off64_t(length))) {
     return false;
   }
   if (uint64_t(position) > length) {
@@ -149,14 +190,22 @@ class PosixFileHandle : public FileHandle {
   bool Read(size_t file_offset, void* buffer, size_t buffer_length,
             size_t* out_bytes_read) override {
     ssize_t out = pread(handle_, buffer, buffer_length, file_offset);
-    *out_bytes_read = out;
-    return out >= 0 ? true : false;
+    if (out < 0) {
+      *out_bytes_read = 0;
+      return false;
+    }
+    *out_bytes_read = static_cast<size_t>(out);
+    return true;
   }
   bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
              size_t* out_bytes_written) override {
     ssize_t out = pwrite(handle_, buffer, buffer_length, file_offset);
-    *out_bytes_written = out;
-    return out >= 0 ? true : false;
+    if (out < 0) {
+      *out_bytes_written = 0;
+      return false;
+    }
+    *out_bytes_written = static_cast<size_t>(out);
+    return true;
   }
   bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
   void Flush() override { fsync(handle_); }
@@ -170,28 +219,26 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path
                                                      bool /*allow_share_delete*/) {
   // POSIX allows unlinking/replacing an open file, so there is no share-delete
   // analog to thread through here.
-  int open_access = 0;
-  if (desired_access & FileAccess::kGenericRead) {
-    open_access |= O_RDONLY;
+  // O_RDONLY/O_WRONLY/O_RDWR are an enumeration in the O_ACCMODE bits, not
+  // independent flags. kGenericExecute grants neither right, matching
+  // GENERIC_EXECUTE on the Windows path.
+  constexpr uint32_t kReadRights =
+      FileAccess::kGenericRead | FileAccess::kGenericAll | FileAccess::kFileReadData;
+  constexpr uint32_t kWriteRights = FileAccess::kGenericWrite | FileAccess::kGenericAll |
+                                    FileAccess::kFileWriteData | FileAccess::kFileAppendData;
+
+  const bool want_read = (desired_access & kReadRights) != 0;
+  const bool want_write = (desired_access & kWriteRights) != 0;
+
+  int open_access = O_RDONLY;
+  if (want_read && want_write) {
+    open_access = O_RDWR;
+  } else if (want_write) {
+    open_access = O_WRONLY;
   }
-  if (desired_access & FileAccess::kGenericWrite) {
-    open_access |= O_WRONLY;
-  }
-  if (desired_access & FileAccess::kGenericExecute) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericAll) {
-    open_access |= O_RDWR;
-  }
-  if (desired_access & FileAccess::kFileReadData) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kFileWriteData) {
-    open_access |= O_WRONLY;
-  }
-  if (desired_access & FileAccess::kFileAppendData) {
-    open_access |= O_APPEND;
-  }
+
+  // No O_APPEND for kFileAppendData: writes go through pwrite with an explicit
+  // offset, which O_APPEND would override.
   int handle = open(path.c_str(), open_access);
   if (handle == -1) {
     // TODO(benvanik): pick correct response.

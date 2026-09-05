@@ -6,6 +6,37 @@
 #   rexglue_configure_target(<target>)             - host application
 #   rexglue_configure_module_target(<target> ...)  - guest DLL module
 #==========================================================
+include_guard(GLOBAL)
+
+function(_rexglue_stage_macos_vulkan_runtime target_name)
+    if(TARGET Vulkan::Loader AND TARGET MoltenVK::MoltenVK)
+        set(_rexglue_vulkan_loader Vulkan::Loader)
+        set(_rexglue_moltenvk MoltenVK::MoltenVK)
+        set(_rexglue_moltenvk_icd "${REXGLUE_ROOT}/cmake/MoltenVK_icd.json")
+    elseif(TARGET rex::vulkan-loader AND TARGET rex::moltenvk)
+        set(_rexglue_vulkan_loader rex::vulkan-loader)
+        set(_rexglue_moltenvk rex::moltenvk)
+        set(_rexglue_moltenvk_icd "${REXGLUE_MOLTENVK_ICD}")
+    else()
+        message(FATAL_ERROR "rexglue: pinned macOS Vulkan runtime targets are unavailable")
+    endif()
+
+    add_custom_command(TARGET ${target_name} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:${target_name}>/vulkan/lib"
+            "$<TARGET_FILE_DIR:${target_name}>/vulkan/share/vulkan/icd.d"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:${_rexglue_vulkan_loader}>"
+            "$<TARGET_FILE_DIR:${target_name}>/vulkan/lib/libvulkan.1.dylib"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:${_rexglue_moltenvk}>"
+            "$<TARGET_FILE_DIR:${target_name}>/vulkan/lib/libMoltenVK.dylib"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_rexglue_moltenvk_icd}"
+            "$<TARGET_FILE_DIR:${target_name}>/vulkan/share/vulkan/icd.d/MoltenVK_icd.json"
+        VERBATIM
+    )
+endfunction()
 
 #==========================================================
 # rexglue_apply_target_settings(<target>) - Common flags
@@ -58,6 +89,14 @@ function(rexglue_configure_target target_name)
             INSTALL_RPATH "$ORIGIN"
             BUILD_WITH_INSTALL_RPATH ON
         )
+    elseif(APPLE)
+        # macOS analogue of $ORIGIN: resolve @rpath dylibs (librexruntime,
+        # libTracyClient, ...) next to the executable. Pairs with the runtime
+        # dylib staging below so the app is self-contained.
+        set_target_properties(${target_name} PROPERTIES
+            INSTALL_RPATH "@executable_path"
+            BUILD_WITH_INSTALL_RPATH ON
+        )
     endif()
 
     rexglue_apply_target_settings(${target_name})
@@ -70,6 +109,25 @@ function(rexglue_configure_target target_name)
             COMMAND_EXPAND_LISTS
             VERBATIM
         )
+    elseif(APPLE)
+        # macOS: $<TARGET_RUNTIME_DLLS> does not resolve imported dylibs, so
+        # stage the shared runtime libraries explicitly next to the executable
+        # (paired with the @executable_path rpath above). Everything else the
+        # runtime links (fmt, spdlog, SDL3, ...) is static. Target names
+        # differ between an in-tree build and an installed SDK import.
+        foreach(_rexglue_runtime_lib rex::runtime rexruntime rex::TracyClient TracyClient)
+            if(TARGET ${_rexglue_runtime_lib})
+                add_custom_command(TARGET ${target_name} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        $<TARGET_FILE:${_rexglue_runtime_lib}>
+                        $<TARGET_FILE_DIR:${target_name}>
+                    VERBATIM
+                )
+            endif()
+        endforeach()
+    endif()
+
+    if(WIN32)
         # FidelityFX is linked PRIVATE by rexui (to avoid propagating DLL
         # requirements to tool-mode targets), so copy its DLLs explicitly.
         foreach(_fx amd_fidelityfx_vk amd_fidelityfx_dx12)
@@ -107,6 +165,10 @@ function(rexglue_configure_target target_name)
         )
         unset(_plugin_target)
     endforeach()
+
+    if(APPLE AND REXGLUE_USE_VULKAN)
+        _rexglue_stage_macos_vulkan_runtime(${target_name})
+    endif()
 endfunction()
 
 #==========================================================

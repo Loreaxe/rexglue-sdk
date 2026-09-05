@@ -18,6 +18,7 @@
 
 #include <fmt/format.h>
 #include <rex/assert.h>
+#include <rex/image_info.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ppc/function.h>
@@ -552,7 +553,7 @@ object_ref<XThread> KernelState::PrepareModuleLaunch(object_ref<UserModule> modu
   }
 
   SetExecutableModule(module);
-  REXSYS_INFO("KernelState: Preparing module launch...");
+  REXSYS_DEBUG("KernelState: Preparing module launch...");
 
   // Create a thread to run in.
   // We start suspended so the caller can inspect/attach before resume.
@@ -766,18 +767,32 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
     } else {
       auto register_func = reinterpret_cast<runtime::FunctionDispatcher::RegisterFn>(
           library_local.GetRawSymbol("ReXModule_Register"));
+      using GetImageInfoFn = const rex::PPCImageInfo* (*)();
+      auto get_image_info =
+          reinterpret_cast<GetImageInfoFn>(library_local.GetRawSymbol("ReXModule_GetImageInfo"));
       if (!register_func) {
         REXSYS_ERROR("ReXModule_Register not found in '{}'", recomp->shared_lib_name);
+      } else if (!get_image_info) {
+        REXSYS_ERROR("ReXModule_GetImageInfo not found in '{}'", recomp->shared_lib_name);
       } else {
         auto* xex = module->xex_module();
-        auto* text = xex->GetPESection(".text");
-        if (!text) {
-          REXSYS_ERROR("Module '{}' has no .text section", recomp->pe_name);
+        const auto* image_info = get_image_info();
+        if (!image_info) {
+          REXSYS_ERROR("ReXModule_GetImageInfo returned null for '{}'", recomp->shared_lib_name);
+        } else if (image_info->image_base != xex->base_address() ||
+                   image_info->image_size != xex->image_size()) {
+          REXSYS_ERROR(
+              "Recompiled module '{}' layout does not match loaded XEX "
+              "(DLL image={:08X}-{:08X}, XEX image={:08X}-{:08X})",
+              recomp->pe_name, image_info->image_base,
+              image_info->image_base + image_info->image_size, xex->base_address(),
+              xex->base_address() + xex->image_size());
         } else if (!function_dispatcher_->InitializeFunctionTable(
-                       text->address, text->size, xex->base_address(), xex->image_size())) {
+                       image_info->code_base, image_info->code_size, image_info->image_base,
+                       image_info->image_size)) {
           REXSYS_ERROR("InitializeFunctionTable failed for module '{}'", recomp->pe_name);
         } else {
-          function_dispatcher_->RegisterModule(lib_key, text->address, register_func);
+          function_dispatcher_->RegisterModule(lib_key, image_info->code_base, register_func);
           auto global_lock = global_critical_region_.Acquire();
           auto lib_it = module_libraries_.find(lib_key);
           assert_true(lib_it != module_libraries_.end());
@@ -893,8 +908,8 @@ void KernelState::RegisterRecompiledModule(const char* pe_name, const char* gues
     }
   }
 
-  REXSYS_INFO("Registered recompiled module: pe='{}' guest='{}' lib='{}'", info.pe_name,
-              info.guest_path, info.shared_lib_name);
+  REXSYS_DEBUG("Registered recompiled module: pe='{}' guest='{}' lib='{}'", info.pe_name,
+               info.guest_path, info.shared_lib_name);
   recompiled_modules_.push_back(std::move(info));
 }
 

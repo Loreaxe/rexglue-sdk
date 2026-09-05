@@ -51,10 +51,14 @@ class SDLWindowedAppContext final : public WindowedAppContext {
   }
 
   void ProcessEvent(SDL_Event& event);
+  void ProcessQuitRequest();
+  static bool SDLCALL WatchEvent(void* userdata, SDL_Event* event);
 
   std::unordered_map<SDL_WindowID, WindowSDL*> windows_;
   uint32_t wakeup_event_type_ = 0;
   uint32_t paint_event_type_ = 0;
+  uint32_t synchronously_handled_quit_events_ = 0;
+  bool event_watch_registered_ = false;
 };
 
 }  // namespace rex::ui

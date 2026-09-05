@@ -157,6 +157,8 @@ class Runtime {
   // rexglue - initializes per-module function dispatch table
   X_STATUS Setup(const PPCImageInfo& image_info, RuntimeConfig config = {});
 
+  const PPCCodegenFlags& codegen_flags() const { return codegen_flags_; }
+
   // Check if running in tool mode (no GPU)
   bool is_tool_mode() const { return tool_mode_; }
 
@@ -190,6 +192,7 @@ class Runtime {
   ui::Window* display_window_ = nullptr;
   ui::ImGuiDrawer* imgui_drawer_ = nullptr;
   bool tool_mode_ = false;
+  PPCCodegenFlags codegen_flags_{};
   bool setup_complete_ = false;
 
   std::unique_ptr<memory::Memory> memory_;

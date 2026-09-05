@@ -52,8 +52,11 @@ bool Entry::is_read_only() const {
 
 Entry* Entry::GetChild(const std::string_view name) {
   auto global_lock = global_critical_region_.Acquire();
+  // The size test is exact, not just a hint: the fold is ASCII-only, so any two
+  // names it calls equal hold the same bytes per codepoint. It skips the UTF-8
+  // decode for nearly every child, and a game directory can hold thousands.
   auto it = std::find_if(children_.cbegin(), children_.cend(), [&](const auto& child) {
-    return rex::string::utf8_equal_case(child->name(), name);
+    return child->name().size() == name.size() && rex::string::utf8_equal_case(child->name(), name);
   });
   if (it == children_.cend()) {
     return nullptr;

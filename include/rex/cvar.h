@@ -111,6 +111,8 @@
 #include <utility>
 #include <vector>
 
+#include <rex/string/numeric.h>
+
 namespace rex::cvar {
 
 //=============================================================================
@@ -137,6 +139,16 @@ enum class Lifecycle {
   kRequiresRestart  // Can be changed, but only takes effect after restart
 };
 
+// Where a flag's current value came from, in ascending priority. A source
+// never overwrites a value a higher-priority source already set.
+enum class Source {
+  kDefault,      // Compiled-in default
+  kConfig,       // TOML config file
+  kEnvironment,  // REX_* environment variable
+  kCommandLine,  // --flag on the command line
+  kRuntime       // SetFlagByName from the console, settings UI, or code
+};
+
 // Validation constraints
 struct Constraints {
   std::optional<double> min;
@@ -160,6 +172,7 @@ struct FlagEntry {
   Constraints constraints;
   std::string default_value;
   bool is_debug_only = false;
+  Source source = Source::kDefault;
 };
 
 std::vector<FlagEntry>& GetRegistry();
@@ -177,7 +190,16 @@ std::optional<size_t> RegisterFlag(FlagEntry entry);
 void UnregisterFlag(std::string_view name);
 
 bool SetFlagByName(std::string_view name, std::string_view value);
+
+// Applies a value parsed off the command line. Returns false only when the
+// value is rejected (unparseable, or outside the flag's constraints); a value
+// skipped because a higher-priority source already won returns true.
+bool SetFlagFromCommandLine(std::string_view name, std::string_view value);
+
 std::string GetFlagByName(std::string_view name);
+
+// Which source last wrote this flag. Returns Source::kDefault for unknown names.
+Source GetFlagSource(std::string_view name);
 
 // Invoke a registered command by name, passing the raw argument text.
 // Returns false if `name` is not registered or is not a FlagType::Command.
@@ -342,7 +364,7 @@ inline bool ParseDouble(std::string_view s, double& out) {
                                   category,                                                      \
                                   desc,                                                          \
                                   [](std::string_view v) {                                       \
-                                    bool val = (v == "true" || v == "1" || v == "yes");          \
+                                    bool val = ::rex::string::from_string<bool>(v, false);       \
                                     FLAGS_##name##_storage_() = val;                             \
                                     return true;                                                 \
                                   },                                                             \

@@ -35,18 +35,6 @@
 #include <WinSock2.h>
 
 #include <WS2tcpip.h>
-
-// WinSock2.h defines SOCK_STREAM / SOCK_DGRAM (and AF_INET / IPPROTO_*) as
-// object-like macros. They clobber the identically named XSocket::Type /
-// AddressFamily / Protocol enumerators used below, turning Type::SOCK_DGRAM
-// into Type::2. The guest enums deliberately mirror the WinSock numeric
-// values, and this translation unit only ever names the scoped enumerators,
-// so drop the macros now that the WinSock headers have been fully parsed.
-#undef SOCK_STREAM
-#undef SOCK_DGRAM
-#undef AF_INET
-#undef IPPROTO_TCP
-#undef IPPROTO_UDP
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -264,9 +252,9 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
   type_ = type;
   proto_ = proto;
 
-  if (proto == Protocol::IPPROTO_VDP) {
+  if (proto == Protocol::X_IPPROTO_VDP) {
     // VDP is a layer on top of UDP.
-    proto = Protocol::IPPROTO_UDP;
+    proto = Protocol::X_IPPROTO_UDP;
   }
 
   native_handle_ = socket(af, type, proto);
@@ -278,7 +266,7 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
 }
 
 X_STATUS XSocket::Close() {
-  if (bound_ && type_ == Type::SOCK_DGRAM) {
+  if (bound_ && type_ == Type::X_SOCK_DGRAM) {
     std::lock_guard<std::mutex> lock(bound_udp_mutex);
     if (auto it = bound_udp_sockets.find(bound_port_);
         it != bound_udp_sockets.end() && it->second == this) {
@@ -425,7 +413,7 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 #if REXGLUE_ENABLE_REXNET
   // A stream socket aimed at a virtual IP is carried by RexNet: the host
   // stack has no route to 10.77.0.0/16, so handing it over would just fail.
-  if (type_ == Type::SOCK_STREAM && name && name_len >= 8) {
+  if (type_ == Type::X_SOCK_STREAM && name && name_len >= 8) {
     const auto* addr = reinterpret_cast<const N_XSOCKADDR_IN*>(name);
     const uint32_t dst_ip = addr->sin_addr;
     if ((dst_ip & 0xFFFF0000u) == rex::net::VirtualIpTable::kNetworkBase) {
@@ -474,7 +462,7 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
   // non-root process (EACCES). Bind the native socket to an ephemeral
   // unprivileged port instead; keep the guest port for RexNet routing. This
   // also removes any same-host two-instance collision.
-  if (rex::net::RexNet::shared() && type_ == Type::SOCK_DGRAM) {
+  if (rex::net::RexNet::shared() && type_ == Type::X_SOCK_DGRAM) {
     N_XSOCKADDR_IN ephemeral = *name;
     ephemeral.sin_port = 0;  // OS picks an unprivileged ephemeral port
     ephemeral.sin_addr = 0;  // INADDR_ANY
@@ -502,7 +490,7 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
   bound_ = true;
   bound_port_ = name->sin_port;
 
-  if (type_ == Type::SOCK_DGRAM) {
+  if (type_ == Type::X_SOCK_DGRAM) {
     std::lock_guard<std::mutex> lock(bound_udp_mutex);
     bound_udp_sockets[bound_port_] = this;
   }
@@ -528,7 +516,7 @@ X_STATUS XSocket::Listen(int backlog) {
   // Listen on both planes: a title cannot know whether the peer that answers
   // will arrive over RexNet or the real network, and registering here costs
   // nothing when nobody does.
-  if (type_ == Type::SOCK_STREAM && rex::net::RexNet::shared()) {
+  if (type_ == Type::X_SOCK_STREAM && rex::net::RexNet::shared()) {
     BecomeStreamListener();
   }
 #endif
@@ -693,7 +681,7 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
 #if REXGLUE_ENABLE_REXNET
   // Datagrams to a virtual IP (10.77.0.0/16) route through the punched
   // RexNet game socket instead of the host network (design spec §11).
-  if (to && type_ == Type::SOCK_DGRAM) {
+  if (to && type_ == Type::X_SOCK_DGRAM) {
     const uint32_t dst_ip = to->sin_addr;  // logical host-order value
     const bool is_virtual = (dst_ip & 0xFFFF0000u) == rex::net::VirtualIpTable::kNetworkBase;
     // SO_BROADCAST is required of the caller, as real Winsock requires.

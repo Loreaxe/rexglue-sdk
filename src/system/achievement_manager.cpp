@@ -72,7 +72,7 @@ void AchievementManager::ReplaceAchievements(std::vector<AchievementInfo> achiev
       achievements_.push_back(std::move(achievement));
     }
   }
-  REXSYS_INFO("Achievement store: loaded {} entries", achievements_.size());
+  REXSYS_DEBUG("Achievement store: loaded {} entries", achievements_.size());
 }
 
 bool AchievementManager::LoadMetadataFile(const std::filesystem::path& path) {
@@ -104,7 +104,7 @@ bool AchievementManager::LoadMetadataFile(const std::filesystem::path& path) {
         ++loaded;
       }
     }
-    REXSYS_INFO("Loaded achievements.toml: {} entries from {}", loaded, path.string());
+    REXSYS_DEBUG("Loaded achievements.toml: {} entries from {}", loaded, path.string());
     return true;
   } catch (const toml::parse_error& error) {
     REXSYS_WARN("Failed to parse {}: {}", path.string(), error.what());
@@ -252,8 +252,8 @@ void AchievementManager::LoadUnlockState() {
       }
     }
     if (!unlocked_achievements_.empty()) {
-      REXSYS_INFO("Loaded {} persisted unlocks from {}", unlocked_achievements_.size(),
-                  save_path.string());
+      REXSYS_DEBUG("Loaded {} persisted unlocks from {}", unlocked_achievements_.size(),
+                   save_path.string());
     }
   } catch (const std::exception& error) {
     REXSYS_WARN("Failed to parse unlock save {}: {}", save_path.string(), error.what());
@@ -261,7 +261,7 @@ void AchievementManager::LoadUnlockState() {
   }
 
   if (migrated) {
-    REXSYS_INFO("Migrating legacy achievement save format: {}", save_path.string());
+    REXSYS_DEBUG("Migrating legacy achievement save format: {}", save_path.string());
     SaveUnlockState();
   }
 }

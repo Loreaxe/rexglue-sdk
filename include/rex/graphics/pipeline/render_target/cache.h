@@ -182,10 +182,9 @@ class RenderTargetCache {
 
  protected:
   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
-                    TraceWriter* trace_writer, uint32_t draw_resolution_scale_x,
-                    uint32_t draw_resolution_scale_y)
+                    uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y)
       : register_file_(register_file),
-        draw_extent_estimator_(register_file, memory, trace_writer),
+        draw_extent_estimator_(register_file, memory),
         draw_resolution_scale_x_(draw_resolution_scale_x),
         draw_resolution_scale_y_(draw_resolution_scale_y) {
     assert_not_zero(draw_resolution_scale_x);
@@ -540,16 +539,6 @@ class RenderTargetCache {
                                             std::vector<Transfer>& depth_transfers_out,
                                             RenderTarget*& color_render_target_out,
                                             std::vector<Transfer>& color_transfers_out);
-
-  // For restoring EDRAM contents from frame traces, obtains or creates a render
-  // target at base 0 with of 1280 (only 1 sample and color because copying
-  // between MSAA render targets and buffers is not possible in Direct3D 12, and
-  // depth may require additional format conversions, not needed really) and
-  // transfers ownership of the entire EDRAM to that render target. If a
-  // full-EDRAM render target can't be created (for instance, due to size
-  // limitations on the host), nullptr is returned.
-  RenderTarget* PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
-      xenos::ColorRenderTargetFormat color_format);
 
   // For pixel shader interlock.
 

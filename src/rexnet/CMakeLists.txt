@@ -47,10 +47,12 @@ target_include_directories(rexnet PUBLIC
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-# Corrosion names the imported target after the crate's [lib] name.
+# Corrosion names the imported target after the crate's [lib] name. imgui is
+# include-only here: the overlay registry header reaches imgui.h through
+# rex/ui/style.h, and the objects are linked once by rexruntime.
 target_link_libraries(rexnet
     PUBLIC rexcore
-    PRIVATE rexnet_core tomlplusplus
+    PRIVATE rexnet_core tomlplusplus imgui
 )
 
 # The Rust staticlib pulls in libc/pthread/dl on Linux; corrosion handles

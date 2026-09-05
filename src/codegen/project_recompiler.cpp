@@ -13,10 +13,11 @@
 
 #include <algorithm>
 #include <filesystem>
-#include <fstream>
+#include <span>
 #include <unordered_map>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <nlohmann/json.hpp>
 
 #include <rex/codegen/analyze.h>
@@ -25,6 +26,7 @@
 #include <rex/codegen/codegen_context.h>
 #include <rex/codegen/codegen_writer.h>
 #include <rex/codegen/config.h>
+#include <rex/codegen/output_stamp.h>
 #include <rex/codegen/progress_reporter.h>
 #include <rex/codegen/template_registry.h>
 #include <rex/kernel/init.h>
@@ -35,7 +37,9 @@
 
 #include <chrono>
 
+#include "codegen_flags.h"
 #include "codegen_logging.h"
+#include "file_io.h"
 #include "template_registry_internal.h"
 
 namespace rex::codegen {
@@ -48,6 +52,52 @@ std::string DeriveTargetNameFromFilePath(const std::string& file_path) {
   std::replace(name.begin(), name.end(), '.', '_');
   std::replace(name.begin(), name.end(), ' ', '_');
   return name;
+}
+
+std::vector<std::filesystem::path> CollectModuleInputs(const RecompilerConfig& cfg,
+                                                       const std::filesystem::path& configDir,
+                                                       const std::filesystem::path& manifestPath) {
+  namespace fs = std::filesystem;
+
+  std::vector<fs::path> inputs;
+  inputs.push_back(configDir / cfg.filePath);
+  inputs.push_back(manifestPath);
+  for (const auto& loaded : cfg.loadedFiles) {
+    inputs.emplace_back(loaded);
+  }
+  if (!cfg.templateDir.empty()) {
+    std::error_code ec;
+    for (const auto& entry : fs::recursive_directory_iterator(configDir / cfg.templateDir, ec)) {
+      if (entry.is_regular_file())
+        inputs.push_back(entry.path());
+    }
+  }
+  std::sort(inputs.begin(), inputs.end());
+  return inputs;
+}
+
+std::string FingerprintModule(const RecompilerConfig& cfg,
+                              std::span<const std::filesystem::path> inputs,
+                              std::string_view sdkVersion) {
+  std::vector<std::string> flags{
+      fmt::format("templates={}", EmbeddedTemplatesHash()),
+      fmt::format("generate_exception_handlers={}", cfg.generateExceptionHandlers),
+      fmt::format("max_jump_extension={}", cfg.maxJumpExtension),
+      fmt::format("data_region_threshold={}", cfg.dataRegionThreshold),
+      fmt::format("max_file_size_bytes={}", REXCVAR_GET(max_file_size_bytes)),
+      fmt::format("max_discovery_iterations={}", REXCVAR_GET(max_discovery_iterations)),
+      fmt::format("max_vtable_iterations={}", REXCVAR_GET(max_vtable_iterations)),
+      fmt::format("max_resolve_iterations={}", REXCVAR_GET(max_resolve_iterations)),
+      fmt::format("max_eh_states={}", REXCVAR_GET(max_eh_states)),
+      fmt::format("max_eh_try_blocks={}", REXCVAR_GET(max_eh_try_blocks)),
+      fmt::format("max_eh_ip_map_entries={}", REXCVAR_GET(max_eh_ip_map_entries)),
+      fmt::format("max_seh_scope_entries={}", REXCVAR_GET(max_seh_scope_entries)),
+      fmt::format("backward_scan_limit={}", REXCVAR_GET(backward_scan_limit)),
+      fmt::format("max_jump_table_entries={}", REXCVAR_GET(max_jump_table_entries)),
+      fmt::format("max_blocks_per_function={}", REXCVAR_GET(max_blocks_per_function)),
+  };
+
+  return ComputeInputFingerprint(inputs, sdkVersion, flags);
 }
 
 void ReportBinaryInfo(ProgressReporter* reporter, std::string_view display_name,
@@ -78,6 +128,7 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
 
   deletedFiles_.clear();
   writtenFiles_.clear();
+  unchangedFiles_.clear();
 
   if (manifest_.modules.empty()) {
     REXCODEGEN_TRACE("Recompiling '{}' (entrypoint)", manifest_.projectName);
@@ -299,8 +350,34 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     contexts.push_back({std::move(ctx), &targeted[i + 1], std::move(dll_display)});
   }
 
+  skippedModules_.clear();
+  std::vector<std::string> fingerprints(contexts.size());
+  std::vector<bool> skip(contexts.size(), false);
+  std::vector<fs::path> allInputs;
+
+  for (size_t i = 0; i < contexts.size(); ++i) {
+    auto& entry = contexts[i];
+    auto outDir = entry.ctx.configDir() / entry.ctx.Config().outDirectoryPath;
+    auto inputs =
+        CollectModuleInputs(entry.ctx.Config(), entry.ctx.configDir(), manifest_.manifestPath);
+    fingerprints[i] = FingerprintModule(entry.ctx.Config(), inputs, opts.sdkVersion);
+    allInputs.insert(allInputs.end(), inputs.begin(), inputs.end());
+
+    if (opts.ignoreStamp || opts.force)
+      continue;
+
+    auto stamp = OutputStamp::Load(outDir / kStampFileName);
+    if (stamp && OutputsAreUpToDate(*stamp, fingerprints[i], outDir)) {
+      REXCODEGEN_TRACE("'{}' is up to date, skipping", entry.module->targetName);
+      skip[i] = true;
+      skippedModules_.push_back(entry.module->targetName);
+    }
+  }
+
   std::vector<std::chrono::steady_clock::time_point> module_started_at(contexts.size());
   for (size_t i = 0; i < contexts.size(); ++i) {
+    if (skip[i])
+      continue;
     auto& entry = contexts[i];
     if (opts.reporter) {
       opts.reporter->moduleStarted(entry.display_name, i, contexts.size());
@@ -334,9 +411,9 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     }
   }
 
-  deletedFiles_.clear();
-  writtenFiles_.clear();
   for (size_t i = 0; i < contexts.size(); ++i) {
+    if (skip[i])
+      continue;
     auto& entry = contexts[i];
     if (opts.reporter) {
       opts.reporter->moduleStarted(entry.display_name, i, contexts.size());
@@ -352,10 +429,43 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
                          writer.deletedFiles().end());
     writtenFiles_.insert(writtenFiles_.end(), writer.writtenFiles().begin(),
                          writer.writtenFiles().end());
+    unchangedFiles_.insert(unchangedFiles_.end(), writer.unchangedFiles().begin(),
+                           writer.unchangedFiles().end());
+
+    OutputStamp stamp;
+    stamp.fingerprint = fingerprints[i];
+    stamp.outputs.insert(stamp.outputs.end(), writer.writtenFiles().begin(),
+                         writer.writtenFiles().end());
+    stamp.outputs.insert(stamp.outputs.end(), writer.unchangedFiles().begin(),
+                         writer.unchangedFiles().end());
+    std::sort(stamp.outputs.begin(), stamp.outputs.end());
+
+    auto outDir = entry.ctx.configDir() / entry.ctx.Config().outDirectoryPath;
+    if (WriteIfChanged(outDir / kStampFileName, stamp.Serialize()) == WriteOutcome::Failed) {
+      return Err<void>(ErrorCategory::IO,
+                       fmt::format("Failed to write stamp for '{}'", entry.module->targetName));
+    }
+
     if (opts.reporter) {
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - module_started_at[i]);
       opts.reporter->moduleFinished(elapsed);
+    }
+  }
+
+  if (!contexts.empty()) {
+    auto buildDir = contexts[0].ctx.configDir() / contexts[0].ctx.Config().outDirectoryPath;
+    std::sort(allInputs.begin(), allInputs.end());
+    allInputs.erase(std::unique(allInputs.begin(), allInputs.end()), allInputs.end());
+
+    auto buildStamp = fs::absolute(buildDir / kBuildStampFileName);
+    if (!WriteDepfile(buildDir / kDepfileName, buildStamp, allInputs)) {
+      return Err<void>(ErrorCategory::IO,
+                       fmt::format("Failed to write {}", (buildDir / kDepfileName).string()));
+    }
+    // Never WriteIfChanged: the build rule re-runs until this mtime passes its inputs.
+    if (!WriteFileBytes(buildStamp, fmt::format("{}\n", fmt::join(fingerprints, "\n")))) {
+      return Err<void>(ErrorCategory::IO, fmt::format("Failed to write {}", buildStamp.string()));
     }
   }
 
@@ -395,16 +505,17 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     auto registryContent = renderWithJson(registry, "codegen/module_registry_cpp", registryData);
 
     auto registryPath = outputPath / "module_registry.cpp";
-    std::ofstream f(registryPath);
-    if (!f) {
-      return Err<void>(ErrorCategory::IO, fmt::format("Failed to open {}", registryPath.string()));
+    switch (WriteIfChanged(registryPath, registryContent)) {
+      case WriteOutcome::Failed:
+        return Err<void>(ErrorCategory::IO,
+                         fmt::format("Failed while writing {}", registryPath.string()));
+      case WriteOutcome::Unchanged:
+        unchangedFiles_.push_back(registryPath.filename().string());
+        break;
+      case WriteOutcome::Written:
+        writtenFiles_.push_back(registryPath.filename().string());
+        break;
     }
-    f << registryContent;
-    if (!f.good()) {
-      return Err<void>(ErrorCategory::IO,
-                       fmt::format("Failed while writing {}", registryPath.string()));
-    }
-    writtenFiles_.push_back(registryPath.filename().string());
     REXCODEGEN_TRACE("Wrote {}", registryPath.string());
   }
   if (opts.reporter)
@@ -414,6 +525,7 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     opts.reporter->projectPhaseStarted("dll_targets.cmake");
   {
     nlohmann::json dllTargetsData;
+    dllTargetsData["project"] = manifest_.projectName;
     auto& dllTargetsArray = dllTargetsData["dll_modules"];
     dllTargetsArray = nlohmann::json::array();
     for (size_t i = 0; i < dllModules.size(); ++i) {
@@ -430,16 +542,17 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     auto dllCmakeContent = renderWithJson(registry, "codegen/dll_targets_cmake", dllTargetsData);
 
     auto dllCmakePath = outputPath / "dll_targets.cmake";
-    std::ofstream cf(dllCmakePath);
-    if (!cf) {
-      return Err<void>(ErrorCategory::IO, fmt::format("Failed to open {}", dllCmakePath.string()));
+    switch (WriteIfChanged(dllCmakePath, dllCmakeContent)) {
+      case WriteOutcome::Failed:
+        return Err<void>(ErrorCategory::IO,
+                         fmt::format("Failed while writing {}", dllCmakePath.string()));
+      case WriteOutcome::Unchanged:
+        unchangedFiles_.push_back(dllCmakePath.filename().string());
+        break;
+      case WriteOutcome::Written:
+        writtenFiles_.push_back(dllCmakePath.filename().string());
+        break;
     }
-    cf << dllCmakeContent;
-    if (!cf.good()) {
-      return Err<void>(ErrorCategory::IO,
-                       fmt::format("Failed while writing {}", dllCmakePath.string()));
-    }
-    writtenFiles_.push_back(dllCmakePath.filename().string());
     REXCODEGEN_TRACE("Wrote {}", dllCmakePath.string());
   }
   if (opts.reporter)

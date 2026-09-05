@@ -127,6 +127,18 @@ uint64_t FunctionDispatcher::Execute(ThreadState* thread_state, uint32_t address
   return ctx->r3.u64;
 }
 
+uint64_t FunctionDispatcher::ExecuteTrap(ThreadState* thread_state, uint32_t address,
+                                         uint64_t args[], size_t arg_count) {
+  auto* ctx = thread_state->context();
+  PPCContext saved = *ctx;
+
+  uint64_t result = Execute(thread_state, address, args, arg_count);
+
+  *ctx = saved;
+  ctx->fpscr.restoreGuestBits(saved.fpscr.csr);
+  return result;
+}
+
 uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_t address,
                                               uint64_t args[], size_t arg_count) {
   SCOPE_profile_cpu_f("cpu");

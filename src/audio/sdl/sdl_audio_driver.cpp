@@ -15,6 +15,7 @@
 
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
+#include <rex/audio/downmix.h>
 #include <rex/audio/flags.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/cvar.h>
@@ -36,9 +37,6 @@ SDLAudioDriver::~SDLAudioDriver() {
 }
 
 bool SDLAudioDriver::Initialize() {
-  // Prevent SDL from interfering with timer resolution (causes FPS drops)
-  SDL_SetHintWithPriority(SDL_HINT_TIMER_RESOLUTION, "0", SDL_HINT_OVERRIDE);
-
   // Set audio category for proper OS audio handling
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
 
@@ -75,7 +73,9 @@ bool SDLAudioDriver::Initialize() {
     obtained_spec = desired_spec;
   }
 
-  if (obtained_spec.channels == 2) {
+  // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
+  // Handing it a 6ch stream instead would use SDL's own downmix.
+  if (obtained_spec.channels <= 2) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
     desired_spec.channels = 2;
@@ -92,6 +92,14 @@ bool SDLAudioDriver::Initialize() {
       return false;
     }
   }
+
+  // The endpoint layout decides which mix the callback runs, and it is the
+  // first thing worth knowing when a report says the balance is wrong on one
+  // speaker setup and right on another.
+  const char* device_name = SDL_GetAudioDeviceName(sdl_device);
+  REXAPU_INFO("audio endpoint '{}': {} ch, {} Hz, format 0x{:04X}; submitting {} ch",
+              device_name ? device_name : "?", obtained_spec.channels, obtained_spec.freq,
+              static_cast<uint32_t>(obtained_spec.format), static_cast<int>(sdl_device_channels_));
 
   if (!SDL_ResumeAudioDevice(sdl_device)) {
     REXAPU_ERROR("SDL_ResumeAudioDevice() failed: {}", SDL_GetError());
@@ -166,6 +174,10 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     REXAPU_ERROR("SDLAudioDriver::SDLCallback failed to allocate {} samples", sample_count);
     return;
   }
+  // Snapshot once. A change mid-callback would split the frame across two mixes.
+  const StereoFold fold = GetStereoFold();
+  const SurroundMix mix = GetSurroundMix();
+  const float gain = GetOutputGain();
   while (additional_amount > 0) {
     static uint32_t sdl_callback_count = 0;
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
@@ -188,10 +200,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
       } else {
         switch (driver->sdl_device_channels_) {
           case 2:
-            conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_);
+            conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
+                                                            gain);
             break;
           case 6:
-            conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_);
+            conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_, mix,
+                                                            gain);
             break;
           default:
             assert_unhandled_case(driver->sdl_device_channels_);

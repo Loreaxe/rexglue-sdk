@@ -65,23 +65,26 @@ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - w - pad, io.DisplaySize.y - 80.0f - pad),
                           ImGuiCond_Always);
   ImGui::SetNextWindowSize(ImVec2(w, 70.0f), ImGuiCond_Always);
-  ImGui::SetNextWindowBgAlpha(0.88f * alpha);
+  const ToastStyle& s = imgui_drawer()->style().toast;
+  ImGui::SetNextWindowBgAlpha(s.background_alpha * alpha);
 
   ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
                            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                            ImGuiWindowFlags_NoInputs;
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
-  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, alpha));
+  // Colors carry the fade envelope; the style holds them at full opacity.
+  auto faded = [alpha](ImVec4 c) { return ImVec4(c.x, c.y, c.z, c.w * alpha); };
+
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, s.rounding);
+  ImGui::PushStyleColor(ImGuiCol_Text, faded(s.text));
   if (ImGui::Begin("##ach_toast", nullptr, flags)) {
-    constexpr float kIconSize = 44.0f;
     ImmediateTexture* icon = icon_cache_.GetIcon(toast.event.achievement);
     if (icon) {
-      ImGui::Image(reinterpret_cast<ImTextureID>(icon), ImVec2(kIconSize, kIconSize));
+      ImGui::Image(reinterpret_cast<ImTextureID>(icon), ImVec2(s.icon_size, s.icon_size));
       ImGui::SameLine();
     }
 
     ImGui::BeginGroup();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.2f, alpha));
+    ImGui::PushStyleColor(ImGuiCol_Text, faded(s.title));
     ImGui::TextUnformatted("Achievement Unlocked");
     ImGui::PopStyleColor();
     ImGui::TextUnformatted(toast.event.achievement.label.c_str());

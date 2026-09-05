@@ -18,49 +18,12 @@
 #include <cstring>
 
 #include <rex/platform/fpscr.h>
+#include <rex/ppc/func.h>
 #include <rex/types.h>
 
 #include <simde/x86/avx.h>
 #include <simde/x86/sse.h>
 #include <simde/x86/sse4.1.h>
-
-//=============================================================================
-// PPCFunc Type Definition
-//=============================================================================
-// Function signature for recompiled PPC functions.
-// All recompiled functions take a context reference and memory base pointer.
-
-// Forward declaration of the PPC execution context
-struct PPCContext;
-
-// Function signature for recompiled PPC functions
-using PPCFunc = void(PPCContext& ctx, uint8_t* base);
-
-namespace rex::runtime {
-PPCFunc* ResolveIndirectFunction(uint32_t guest_address);
-}  // namespace rex::runtime
-
-//=============================================================================
-// PPC Function Macros
-//=============================================================================
-
-#define REX_JOIN(x, y) x##y
-#define REX_XSTRINGIFY(x) #x
-#define REX_STRINGIFY(x) REX_XSTRINGIFY(x)
-#define REX_FUNC(x) void x([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base)
-#define REX_EXTERN(x) extern "C" REX_FUNC(x)
-#define REX_WEAK_FUNC(x) __attribute__((weak, noinline)) REX_FUNC(x)
-
-//=============================================================================
-// Function Mapping
-//=============================================================================
-
-struct PPCFuncMapping {
-  size_t guest;
-  PPCFunc* host;
-};
-
-extern PPCFuncMapping PPCFuncMappings[];
 
 //=============================================================================
 // Pack/Unpack Constants (NORMPACKED32 - 2:10:10:10 format)
@@ -191,8 +154,17 @@ struct FPSCRRegister {
   static constexpr size_t RoundMaskVal = Platform::RoundMaskVal;
   static constexpr size_t FlushMask = Platform::FlushMask;
 
+  // Bits the guest owns; the rest is host policy seeded by InitHost.
+  static constexpr uint32_t GuestMask = uint32_t(RoundMaskVal) | uint32_t(FlushMask);
+
   inline uint32_t getcsr() noexcept { return Platform::getcsr(); }
   inline void setcsr(uint32_t csr) noexcept { Platform::setcsr(csr); }
+
+  // Restoring the whole word would unmask every FP exception when csr is 0.
+  inline void restoreGuestBits(uint32_t saved) noexcept {
+    csr = (getcsr() & ~GuestMask) | (saved & GuestMask);
+    setcsr(csr);
+  }
 
   inline uint32_t loadFromHost() noexcept {
     csr = getcsr();
@@ -470,10 +442,10 @@ struct alignas(0x40) PPCContext {
 
   //--- Non-volatile register save/restore --------
   // Layout: r14-r31 (144) | f14-f31 (144) | v14-v31 (288) | v64-v127 (1024)
-  // Total: 1600 bytes.  Buffer must be at least this large.
+  //       | cr2-cr4 (12) | fpscr (4).  Total: 1616 bytes.
   static constexpr size_t kNonVolatileSaveSize =
       18 * sizeof(PPCRegister) + 18 * sizeof(PPCRegister) + 18 * sizeof(PPCVRegister) +
-      64 * sizeof(PPCVRegister);
+      64 * sizeof(PPCVRegister) + 3 * sizeof(PPCCRRegister) + sizeof(PPCFPSCRRegister);
 
   inline void SaveNonVolatiles(uint8_t* dst) const {
     std::memcpy(dst, &r14, 18 * sizeof(PPCRegister));
@@ -483,6 +455,10 @@ struct alignas(0x40) PPCContext {
     std::memcpy(dst, &v14, 18 * sizeof(PPCVRegister));
     dst += 18 * sizeof(PPCVRegister);
     std::memcpy(dst, &v64, 64 * sizeof(PPCVRegister));
+    dst += 64 * sizeof(PPCVRegister);
+    std::memcpy(dst, &cr2, 3 * sizeof(PPCCRRegister));
+    dst += 3 * sizeof(PPCCRRegister);
+    std::memcpy(dst, &fpscr, sizeof(PPCFPSCRRegister));
   }
 
   inline void RestoreNonVolatiles(const uint8_t* src) {
@@ -493,5 +469,11 @@ struct alignas(0x40) PPCContext {
     std::memcpy(&v14, src, 18 * sizeof(PPCVRegister));
     src += 18 * sizeof(PPCVRegister);
     std::memcpy(&v64, src, 64 * sizeof(PPCVRegister));
+    src += 64 * sizeof(PPCVRegister);
+    std::memcpy(&cr2, src, 3 * sizeof(PPCCRRegister));
+    src += 3 * sizeof(PPCCRRegister);
+    PPCFPSCRRegister saved_fpscr;
+    std::memcpy(&saved_fpscr, src, sizeof(PPCFPSCRRegister));
+    fpscr.restoreGuestBits(saved_fpscr.csr);
   }
 };

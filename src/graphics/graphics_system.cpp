@@ -31,10 +31,6 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
-REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU", "GPU trace file prefix");
-
-REXCVAR_DEFINE_BOOL(trace_gpu_stream, false, "GPU", "Enable GPU trace streaming");
-
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -179,16 +175,11 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   vsync_worker_thread_->set_name("GPU VSync");
   vsync_worker_thread_->Create();
 
-  if (REXCVAR_GET(trace_gpu_stream)) {
-    BeginTracing();
-  }
-
   return X_STATUS_SUCCESS;
 }
 
 void GraphicsSystem::Shutdown() {
   if (command_processor_) {
-    EndTracing();
     command_processor_->Shutdown();
     command_processor_.reset();
   }
@@ -371,18 +362,6 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
       command_processor_->InitializeShaderStorage(cache_root, title_id, false);
     });
   }
-}
-
-void GraphicsSystem::RequestFrameTrace() {
-  command_processor_->RequestFrameTrace(REXCVAR_GET(trace_gpu_prefix));
-}
-
-void GraphicsSystem::BeginTracing() {
-  command_processor_->BeginTracing(REXCVAR_GET(trace_gpu_prefix));
-}
-
-void GraphicsSystem::EndTracing() {
-  command_processor_->EndTracing();
 }
 
 void GraphicsSystem::Pause() {

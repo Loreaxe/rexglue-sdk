@@ -70,10 +70,8 @@ bool IsGpuDebugMarkersEnabled();
 // GPU Alpha Test
 REXCVAR_DECLARE(bool, use_fuzzy_alpha_epsilon);
 
-// GPU Shader Translation / Tracing
+// GPU Shader Translation
 REXCVAR_DECLARE(std::string, dump_shaders);
-REXCVAR_DECLARE(std::string, trace_gpu_prefix);
-REXCVAR_DECLARE(bool, trace_gpu_stream);
 REXCVAR_DECLARE(std::string, swap_post_effect);
 
 #if REX_HAS_VULKAN

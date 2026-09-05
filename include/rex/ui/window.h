@@ -302,6 +302,27 @@ class Window {
   void CaptureMouse();
   void ReleaseMouse();
 
+  // Locks the pointer and switches motion events to relative deltas
+  // (MouseEvent::dx/dy), for mouse look. Returns whether it took.
+  virtual bool SetRelativeMouseMode(bool enable) {
+    (void)enable;
+    return false;
+  }
+  // Fallback when relative mode isn't available. Returns false, leaving the
+  // outputs untouched, unless the pointer verifiably reached the center.
+  virtual bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) {
+    (void)x_out;
+    (void)y_out;
+    return false;
+  }
+
+  // Desired state stored by the common Window, externally modifiable, read-only
+  // in the implementation. Whether the window is an active text input field for
+  // the OS input method. Leaving it on for the session pulls in IME candidate
+  // windows and the on screen keyboard during button-only gameplay.
+  bool IsTextInputActive() const { return text_input_active_; }
+  void SetTextInputActive(bool active);
+
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
   CursorVisibility GetCursorVisibility() const { return cursor_visibility_; }
@@ -520,6 +541,7 @@ class Window {
   // captured, in case something has released it in the OS.
   virtual void ApplyNewMouseCapture() {}
   virtual void ApplyNewMouseRelease() {}
+  virtual void ApplyNewTextInputActive() {}
   virtual void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) {
     (void)old_cursor_visibility;
   }
@@ -696,6 +718,8 @@ class Window {
   std::unique_ptr<MenuItem> main_menu_;
 
   uint32_t mouse_capture_request_count_ = 0;
+
+  bool text_input_active_ = false;
 
   CursorVisibility cursor_visibility_ = CursorVisibility::kVisible;
 

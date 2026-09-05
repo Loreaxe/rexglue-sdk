@@ -27,31 +27,21 @@ AchievementsOverlayDialog::AchievementsOverlayDialog(ImGuiDrawer* imgui_drawer,
 
 AchievementsOverlayDialog::~AchievementsOverlayDialog() {}
 
-namespace {
-// Palette — kept ASCII-only; the bundled overlay font has no em dash / check glyphs.
-constexpr ImVec4 kUnlockedTitle{0.45f, 1.00f, 0.55f, 1.00f};  // bright green
-constexpr ImVec4 kUnlockedDesc{0.70f, 0.85f, 0.72f, 1.00f};   // soft green
-constexpr ImVec4 kLockedTitle{0.78f, 0.80f, 0.84f, 1.00f};    // light grey
-constexpr ImVec4 kLockedDesc{0.50f, 0.52f, 0.56f, 1.00f};     // dim grey
-constexpr ImVec4 kBadgeGS{1.00f, 0.82f, 0.30f, 1.00f};        // gamerscore gold
-constexpr ImVec4 kRowUnlockedBg{0.16f, 0.30f, 0.18f, 0.55f};  // green tint
-constexpr ImVec4 kHeaderText{0.60f, 0.85f, 1.00f, 1.00f};     // accent blue
-constexpr float kIconSize = 44.0f;
-}  // namespace
-
 ImmediateTexture* AchievementsOverlayDialog::GetIcon(
     const rex::system::AchievementInfo& achievement) {
   return icon_cache_.GetIcon(achievement);
 }
 
 void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
+  const AchievementsStyle& style = imgui_drawer()->style().achievements;
+
   ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 40.0f), ImGuiCond_FirstUseEver,
                           ImVec2(0.5f, 0.0f));
   ImGui::SetNextWindowSize(ImVec2(640.0f, 560.0f), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowBgAlpha(0.92f);
 
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
-  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, style.window_padding);
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, style.item_spacing);
 
   if (ImGui::Begin("Achievements##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
     const auto achievements = achievements_->ListAchievements();
@@ -69,14 +59,14 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
     const int total_count = static_cast<int>(achievements.size());
 
     // ---- Header: summary line + progress bar -------------------------------
-    ImGui::PushStyleColor(ImGuiCol_Text, kHeaderText);
+    ImGui::PushStyleColor(ImGuiCol_Text, style.header_text);
     ImGui::Text("%d / %d unlocked", unlocked_count, total_count);
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    ImGui::TextColored(kBadgeGS, "%dG / %dG", earned_gs, total_gs);
+    ImGui::TextColored(style.badge_gamerscore, "%dG / %dG", earned_gs, total_gs);
 
     float frac = total_count > 0 ? static_cast<float>(unlocked_count) / total_count : 0.0f;
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.30f, 0.80f, 0.40f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, style.progress_bar);
     ImGui::ProgressBar(frac, ImVec2(-1.0f, 6.0f), "");
     ImGui::PopStyleColor();
 
@@ -106,24 +96,26 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
       // Icon on the left. Locked icons are dimmed so the state reads clearly.
       ImmediateTexture* icon = GetIcon(a);
       if (icon) {
-        ImVec4 tint = is_unlocked ? ImVec4(1, 1, 1, 1) : ImVec4(0.45f, 0.45f, 0.45f, 0.8f);
-        ImGui::ImageWithBg(reinterpret_cast<ImTextureID>(icon), ImVec2(kIconSize, kIconSize),
-                           ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), tint);
+        ImVec4 tint = is_unlocked ? style.unlocked_icon_tint : style.locked_icon_tint;
+        ImGui::ImageWithBg(reinterpret_cast<ImTextureID>(icon),
+                           ImVec2(style.icon_size, style.icon_size), ImVec2(0, 0), ImVec2(1, 1),
+                           ImVec4(0, 0, 0, 0), tint);
       } else {
-        ImGui::Dummy(ImVec2(kIconSize, kIconSize));
+        ImGui::Dummy(ImVec2(style.icon_size, style.icon_size));
       }
       ImGui::SameLine();
 
       // Text block to the right of the icon.
       ImGui::BeginGroup();
       const char* marker = is_unlocked ? "[*]" : "[ ]";
-      ImGui::TextColored(is_unlocked ? kUnlockedTitle : kLockedTitle, "%s", marker);
+      const ImVec4& title_color = is_unlocked ? style.unlocked_title : style.locked_title;
+      ImGui::TextColored(title_color, "%s", marker);
       ImGui::SameLine();
-      ImGui::TextColored(kBadgeGS, "%dG", static_cast<int>(a.gamerscore));
+      ImGui::TextColored(style.badge_gamerscore, "%dG", static_cast<int>(a.gamerscore));
       ImGui::SameLine();
-      ImGui::TextColored(is_unlocked ? kUnlockedTitle : kLockedTitle, "%s", a.label.c_str());
+      ImGui::TextColored(title_color, "%s", a.label.c_str());
 
-      ImGui::PushStyleColor(ImGuiCol_Text, is_unlocked ? kUnlockedDesc : kLockedDesc);
+      ImGui::PushStyleColor(ImGuiCol_Text, is_unlocked ? style.unlocked_desc : style.locked_desc);
       ImGui::TextWrapped("%s", desc.c_str());
       ImGui::PopStyleColor();
       ImGui::EndGroup();
@@ -137,7 +129,7 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
         const float x0 = ImGui::GetWindowPos().x + 2.0f;
         const float x1 = x0 + ImGui::GetWindowSize().x - 4.0f;
         draw_list->AddRectFilled(ImVec2(x0, row_start_y), ImVec2(x1, row_end_y),
-                                 ImGui::GetColorU32(kRowUnlockedBg), 3.0f);
+                                 ImGui::GetColorU32(style.row_unlocked_bg), style.row_rounding);
       }
       draw_list->ChannelsMerge();
 

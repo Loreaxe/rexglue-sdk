@@ -32,8 +32,6 @@
 #include <rex/ui/window_listener.h>
 #include <rex/ui/windowed_app.h>
 
-struct ImFontAtlas;
-
 namespace rex {
 
 class LogCaptureSink;
@@ -139,6 +137,16 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// registered and before the atlas is built. Override to add additional
   /// fonts via AddFontFromMemoryTTF() or similar.
   virtual void OnConfigureFonts(ImFontAtlas* atlas) { (void)atlas; }
+
+  /// Called from the ImGui drawer's Initialize() after the SDK defaults have
+  /// been applied. `imgui_style` is the live global ImGuiStyle: patch fields,
+  /// or call ImGui::StyleColorsDark(&imgui_style) first to start from a clean
+  /// slate. `ui_style` carries the per-overlay colors that ImGuiStyle cannot
+  /// express (achievements, toast, console, debug, settings).
+  virtual void OnConfigureStyle(ImGuiStyle& imgui_style, ui::Style& ui_style) {
+    (void)imgui_style;
+    (void)ui_style;
+  }
 
   /// Called after logging is initialized. Add log sinks here.
   virtual void OnPostInitLogging() {}

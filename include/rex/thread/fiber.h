@@ -15,6 +15,11 @@
 #include <cstddef>
 
 #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC && !defined(_XOPEN_SOURCE)
+// Darwin hides the deprecated ucontext APIs unless _XOPEN_SOURCE is defined
+// before including <ucontext.h>.
+#define _XOPEN_SOURCE 700
+#endif
 #include <ucontext.h>
 #include <cstdint>
 #include <vector>
@@ -51,7 +56,7 @@ struct Fiber {
 #if REX_PLATFORM_WIN32
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
-#elif REX_PLATFORM_LINUX
+#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
   ucontext_t context_{};
   std::vector<uint8_t> stack_;
   void (*entry_)(void*) = nullptr;

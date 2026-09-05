@@ -13,28 +13,14 @@
 #include <rex/cvar.h>
 #include <imgui.h>
 #include <algorithm>
+#include <iterator>
 #include <string>
 
 namespace rex::ui {
 
-static ImVec4 LevelColor(spdlog::level::level_enum level) {
-  // todo(tomc): make these cvar driven
-  switch (level) {
-    case spdlog::level::trace:
-      return {0.5f, 0.5f, 0.5f, 1.0f};  // grey
-    case spdlog::level::debug:
-      return {0.4f, 0.9f, 0.9f, 1.0f};  // cyan
-    case spdlog::level::info:
-      return {1.0f, 1.0f, 1.0f, 1.0f};  // white
-    case spdlog::level::warn:
-      return {1.0f, 1.0f, 0.0f, 1.0f};  // yellow
-    case spdlog::level::err:
-      return {1.0f, 0.4f, 0.4f, 1.0f};  // red
-    case spdlog::level::critical:
-      return {1.0f, 0.0f, 0.0f, 1.0f};  // bright red
-    default:
-      return {1.0f, 1.0f, 1.0f, 1.0f};
-  }
+static ImVec4 LevelColor(spdlog::level::level_enum level, const ConsoleStyle& style) {
+  const auto index = static_cast<size_t>(level);
+  return index < std::size(style.level) ? style.level[index] : style.level[spdlog::level::info];
 }
 
 ConsoleDialog::ConsoleDialog(ImGuiDrawer* imgui_drawer, std::shared_ptr<rex::LogCaptureSink> sink)
@@ -241,6 +227,8 @@ void ConsoleDialog::ExecuteCommand(std::string_view cmd) {
 }
 
 void ConsoleDialog::OnDraw(ImGuiIO& io) {
+  const ConsoleStyle& style = imgui_drawer()->style().console;
+
   // Snapshot the sink only when it has new data (copying up to kCapacity
   // entries every frame would be wasteful). Console-local command feedback
   // lives in local_entries_ and is merged in at draw time below, so it appears
@@ -316,7 +304,7 @@ void ConsoleDialog::OnDraw(ImGuiIO& io) {
     if (!show_cat)
       return;
 
-    ImGui::PushStyleColor(ImGuiCol_Text, LevelColor(entry.level));
+    ImGui::PushStyleColor(ImGuiCol_Text, LevelColor(entry.level, style));
     ImGui::TextUnformatted(entry.text.c_str());
     ImGui::PopStyleColor();
   };
@@ -388,7 +376,7 @@ void ConsoleDialog::OnDraw(ImGuiIO& io) {
     const float width = input_max.x - input_min.x;
     // Anchor the bottom edge to the input's top edge and grow upward.
     ImGui::SetCursorScreenPos(ImVec2(input_min.x, input_min.y - height));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.10f, 0.10f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, style.completion_bg);
     if (ImGui::BeginChild("##rex_completions", ImVec2(width, height), true,
                           ImGuiWindowFlags_NoNavInputs)) {
       ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -396,7 +384,7 @@ void ConsoleDialog::OnDraw(ImGuiIO& io) {
         if (i == completion_index_) {
           const ImVec2 p = ImGui::GetCursorScreenPos();
           dl->AddRectFilled(p, ImVec2(p.x + ImGui::GetContentRegionAvail().x, p.y + line_h),
-                            IM_COL32(60, 90, 140, 200));
+                            ImGui::GetColorU32(style.completion_highlight));
         }
         ImGui::TextUnformatted(completion_candidates_[i].c_str());
         if (i == completion_index_)

@@ -55,12 +55,25 @@
 #endif
 
 #ifndef DEFINE_REX_FUNC
-#define DEFINE_REX_FUNC(name)                                  \
-  __attribute__((alias("__imp__" #name))) REX_WEAK_FUNC(name); \
+#if defined(__APPLE__)
+// Darwin has no overridable alias (see codegen/pch_h.inja): use a weak
+// musttail thunk so `name` stays overridable by hooks and lowers to a `jmp`.
+#define DEFINE_REX_FUNC(name)                                            \
+  extern "C" void __imp__##name(PPCContext& __restrict, uint8_t*);       \
+  __attribute__((weak, noinline)) extern "C" void name(                  \
+      PPCContext& __restrict ctx, uint8_t* base) {                       \
+    [[clang::musttail]] return __imp__##name(ctx, base);                 \
+  }                                                                      \
+  extern "C" void __imp__##name([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base)
+#else
+#define DEFINE_REX_FUNC(name)                                       \
+  __attribute__((alias("__imp__" #name)))                           \
+  __attribute__((weak, noinline)) extern "C" REX_FUNC(name);        \
   REX_EXTERN(__imp__##name)
 #endif
+#endif
 
-#if REX_PLATFORM_WIN32
+#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
 #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
 #else
 #define REX_PHYS_HOST_OFFSET(addr) 0u

@@ -13,8 +13,10 @@
 #include <memory>
 #include <vector>
 
+#include <rex/input/device_assignment.h>
 #include <rex/input/input.h>
 #include <rex/input/input_driver.h>
+#include <rex/input/state_merge.h>
 #include <rex/system/interfaces/input.h>
 
 namespace rex::ui {
@@ -37,15 +39,32 @@ class InputSystem : public system::IInputSystem {
   void AttachWindow(rex::ui::Window* window);
   void SetActiveCallback(std::function<bool()> callback);
 
+  /// Replaces any previous assignment. Call before the guest starts polling.
+  void SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment);
+
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
  private:
+  /// Re-enumerates every driver and notifies the assignment when the set
+  /// changed.
+  void RefreshDevices();
+  InputDriver* DriverForDevice(DeviceId id);
+  const DeviceInfo* DeviceInfoFor(DeviceId id) const;
+
   rex::ui::Window* window_ = nullptr;
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
+
+  std::unique_ptr<DeviceAssignment> assignment_;
+  ActiveDeviceTracker active_devices_;
+
+  // Ordered by ordinal. Ordinals are never recycled, so unplugging pad one
+  // does not renumber pad two.
+  std::vector<DeviceInfo> devices_;
+  std::vector<InputDriver*> device_owners_;
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

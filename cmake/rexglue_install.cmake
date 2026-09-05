@@ -9,19 +9,21 @@ set_target_properties(rexaudio PROPERTIES EXPORT_NAME audio)
 set_target_properties(rexruntime PROPERTIES EXPORT_NAME runtime)
 set_target_properties(rexcodegen PROPERTIES EXPORT_NAME codegen)
 
+include(${CMAKE_CURRENT_LIST_DIR}/rexglue_helpers.cmake)
+
+# Build install target list dynamically based on backend options
 set(REXGLUE_INSTALL_TARGETS
     rexruntime
     rexgpu-xenos
     disruptorplus renderdoc simde tomlplusplus
     aes128 mspack o1heap disasm xxhash
     libavcodec libavutil
-    rexglue
 )
 
 if(REXGLUE_USE_VULKAN)
     list(APPEND REXGLUE_INSTALL_TARGETS
         SPIRV glslang MachineIndependent GenericCodeGen OSDependent OGLCompiler  # glslang
-        SPIRV-Tools-static
+        spirv-tools-headers
     )
 endif()
 
@@ -47,6 +49,13 @@ install(TARGETS ${REXGLUE_INSTALL_TARGETS}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# A Debug codegen tool runs an order of magnitude slower, so only Release ships.
+install(TARGETS rexglue
+    EXPORT rexglueTargets
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    CONFIGURATIONS Release
 )
 
 if(REXGLUE_INSTALL_FIDELITYFX_TARGETS)
@@ -153,6 +162,23 @@ if(REXGLUE_USE_D3D12)
         thirdparty/dxc/include/DxbcConverter.h
         thirdparty/dxc/include/dxcapi.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dxc
+    )
+endif()
+
+if(APPLE AND REXGLUE_USE_VULKAN)
+    install(FILES "$<TARGET_FILE:Vulkan::Loader>"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        CONFIGURATIONS Release
+        RENAME libvulkan.1.dylib
+    )
+    install(FILES "$<TARGET_FILE:MoltenVK::MoltenVK>"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        CONFIGURATIONS Release
+        RENAME libMoltenVK.dylib
+    )
+    install(FILES cmake/MoltenVK_icd.json
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/vulkan/icd.d
+        CONFIGURATIONS Release
     )
 endif()
 

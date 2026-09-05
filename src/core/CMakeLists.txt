@@ -11,11 +11,11 @@ add_library(rexcore OBJECT
     exception_handler.cpp
     filesystem.cpp
     filesystem_wildcard.cpp
+    hash.cpp
     logging.cpp
     memory.cpp
     mutex.cpp
     ring_buffer.cpp
-    sha256.cpp
     string_buffer.cpp
     threading.cpp
     timer_queue.cpp
@@ -23,6 +23,14 @@ add_library(rexcore OBJECT
     vec128.cpp
 )
 add_library(rex::core ALIAS rexcore)
+
+if(APPLE)
+    # Apple's libc++ still gates std::jthread/std::stop_token behind the
+    # experimental-library feature flag. Only timer_queue.cpp uses them, and
+    # neither type crosses a header boundary.
+    set_source_files_properties(timer_queue.cpp PROPERTIES
+        COMPILE_OPTIONS "-fexperimental-library")
+endif()
 
 # Platform-specific sources
 if(WIN32)
@@ -46,6 +54,8 @@ if(WIN32)
     )
     target_compile_definitions(rexcore PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 elseif(UNIX)
+    # Linux and macOS/Darwin share the POSIX sources; Darwin-specific behavior
+    # is selected inside them with #if defined(__APPLE__).
     target_sources(rexcore PRIVATE
         atomic_posix.cpp
         clock_posix.cpp
@@ -88,7 +98,9 @@ target_include_directories(rexcore PRIVATE
     ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
 )
 
-if(UNIX)
+if(APPLE)
+    target_link_libraries(rexcore PRIVATE pthread)
+elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()
 
@@ -112,7 +124,8 @@ if(REXGLUE_USE_VULKAN)
 endif()
 
 if(REXGLUE_ENABLE_TRACY)
-    target_link_libraries(rexcore PUBLIC TracyClient)
+    target_link_libraries(rexcore PUBLIC
+        $<$<NOT:$<CONFIG:Release>>:$<TARGET_NAME:TracyClient>>)
     target_compile_definitions(rexcore PUBLIC
         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
 endif()
@@ -122,4 +135,3 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
     target_compile_definitions(rexcore PUBLIC
         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
 endif()
-

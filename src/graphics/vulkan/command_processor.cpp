@@ -646,18 +646,6 @@ void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
 }
 
-void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) {
-  shared_memory_->MemoryInvalidationCallback(base_ptr, length, true);
-  primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
-}
-
-void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
-  if (!BeginSubmission(true)) {
-    return;
-  }
-  render_target_cache_->RestoreEdramSnapshot(snapshot);
-}
-
 bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
                                                                 uint32_t packet, uint32_t count) {
   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
@@ -683,9 +671,9 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
       return true;
     }
     bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+        sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
     bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+        sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
     std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
     if (is_end_via_z_pass || is_end_via_z_fail) {
       sample_counts->ZPass_A = fake_sample_count;
@@ -695,9 +683,9 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
   };
 
   bool is_end_via_z_pass =
-      sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+      sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
   bool is_end_via_z_fail =
-      sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+      sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
   bool is_end = is_end_via_z_pass || is_end_via_z_fail;
 
   if (!is_end) {
@@ -902,15 +890,15 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
-  shared_memory_ = std::make_unique<VulkanSharedMemory>(*this, *memory_, trace_writer_,
-                                                        guest_shader_pipeline_stages_);
+  shared_memory_ =
+      std::make_unique<VulkanSharedMemory>(*this, *memory_, guest_shader_pipeline_stages_);
   if (!shared_memory_->Initialize()) {
     REXGPU_ERROR("Failed to initialize shared memory");
     return false;
   }
 
-  primitive_processor_ = std::make_unique<VulkanPrimitiveProcessor>(
-      *register_file_, *memory_, trace_writer_, *shared_memory_, *this);
+  primitive_processor_ =
+      std::make_unique<VulkanPrimitiveProcessor>(*register_file_, *memory_, *shared_memory_, *this);
   if (!primitive_processor_->Initialize()) {
     REXGPU_ERROR("Failed to initialize the geometric primitive processor");
     return false;
@@ -974,8 +962,7 @@ bool VulkanCommandProcessor::SetupContext() {
 
   // Requires the transient descriptor set layouts.
   render_target_cache_ = std::make_unique<VulkanRenderTargetCache>(
-      *register_file_, *memory_, trace_writer_, draw_resolution_scale_x, draw_resolution_scale_y,
-      *this);
+      *register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this);
   if (!render_target_cache_->Initialize(shared_memory_binding_count)) {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
@@ -4954,26 +4941,6 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
   sample_counts->ZFail_B = 0;
   sample_counts->StencilFail_A = 0;
   sample_counts->StencilFail_B = 0;
-}
-
-void VulkanCommandProcessor::InitializeTrace() {
-  CommandProcessor::InitializeTrace();
-
-  if (!BeginSubmission(true)) {
-    return;
-  }
-  bool render_target_submitted = render_target_cache_->InitializeTraceSubmitDownloads();
-  bool shared_memory_submitted = shared_memory_->InitializeTraceSubmitDownloads();
-  if (!render_target_submitted && !shared_memory_submitted) {
-    return;
-  }
-  AwaitAllQueueOperationsCompletion();
-  if (render_target_submitted) {
-    render_target_cache_->InitializeTraceCompleteDownloads();
-  }
-  if (shared_memory_submitted) {
-    shared_memory_->InitializeTraceCompleteDownloads();
-  }
 }
 
 void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {

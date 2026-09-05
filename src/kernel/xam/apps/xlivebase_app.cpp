@@ -259,6 +259,10 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       REXKRNL_DEBUG("XLiveBaseUnk58046({:08X}, {:08X}) unimplemented", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
+    case 0x00058037: {
+      REXKRNL_DEBUG("XPresenceInitialize({:08X}, {:08X})", buffer_ptr, buffer_length);
+      return X_E_SUCCESS;
+    }
   }
   if (message >= 0x00050000 && message < 0x00058000) {
     // Serialized XOnline service RPC (see comment above): decline cleanly

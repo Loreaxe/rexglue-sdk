@@ -33,10 +33,10 @@
 // HostToGuestFunction handles register translation automatically.
 #ifdef REXGLUE_ENABLE_PROFILING
 #include <tracy/Tracy.hpp>
-#define REX_HOOK(subroutine, function)                  \
-  extern "C" REX_FUNC(subroutine) {                     \
-    ZoneNamedN(___tracy_hook_zone, #subroutine, true);  \
-    rex::ppc::HostToGuestFunction<function>(ctx, base); \
+#define REX_HOOK(subroutine, function)                           \
+  extern "C" REX_FUNC(subroutine) {                              \
+    ZoneNamedN(___tracy_hook_zone, #subroutine, TracyIsStarted); \
+    rex::ppc::HostToGuestFunction<function>(ctx, base);          \
   }
 #else
 #define REX_HOOK(subroutine, function)                  \

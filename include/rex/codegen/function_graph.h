@@ -175,6 +175,10 @@ class FunctionGraph {
   // Check if target is a mergeable entry point (DISCOVERED with xrefs)
   bool isMergeableEntryPoint(uint32_t addr) const;
 
+  // Flag every SEH funclet as register-sharing. Run after discovery, once
+  // funclet extents are known. Returns the number flagged.
+  size_t markFuncletRegisterSharing();
+
   //=========================================================================
   // Target Classification (for code generation)
   //=========================================================================

@@ -123,6 +123,8 @@ struct X_FIBER_CONTEXT {
   uint8_t register_save_area[0xA50 - 0x38];  // non-volatile PPCContext register save area
 };
 static_assert_size(X_FIBER_CONTEXT, 0xA50);
+static_assert(sizeof(X_FIBER_CONTEXT::register_save_area) >= ::PPCContext::kNonVolatileSaveSize,
+              "fiber register save area too small for PPCContext non-volatiles");
 
 struct X_KTHREAD;
 struct X_KPROCESS;
@@ -373,7 +375,7 @@ class XThread : public XObject {
   uint32_t suspend_count();
   X_STATUS Resume(uint32_t* out_suspend_count = nullptr);
   X_STATUS Suspend(uint32_t* out_suspend_count = nullptr);
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
   // Increment suspend count and block until another thread resumes us.
   uint32_t SelfSuspend();
 #endif
@@ -425,7 +427,7 @@ class XThread : public XObject {
 
   int32_t priority_ = 0;
 
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
   std::mutex suspend_mutex_;
   std::condition_variable suspend_cv_;
 #endif

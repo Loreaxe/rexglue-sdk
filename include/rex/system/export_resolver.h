@@ -14,7 +14,7 @@
 #include <vector>
 
 #include <rex/math.h>
-#include <rex/ppc/context.h>
+#include <rex/ppc/func.h>
 #include <rex/string.h>
 
 namespace rex::runtime {

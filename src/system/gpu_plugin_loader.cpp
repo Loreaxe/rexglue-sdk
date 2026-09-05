@@ -38,6 +38,8 @@ std::string PluginFileName(std::string_view name) {
   }
 #if REX_PLATFORM_WIN32
   return fmt::format("rexgpu-{}{}.dll", name, postfix);
+#elif REX_PLATFORM_MAC
+  return fmt::format("librexgpu-{}{}.dylib", name, postfix);
 #else
   return fmt::format("librexgpu-{}{}.so", name, postfix);
 #endif
@@ -96,7 +98,7 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
   }
 
   LoadedPlugins().push_back(std::move(library));
-  REXSYS_INFO("GPU plugin '{}' loaded ({})", name, path.filename().string());
+  REXSYS_DEBUG("GPU plugin '{}' loaded ({})", name, path.filename().string());
   return std::unique_ptr<IGraphicsSystem>(graphics_system);
 }
 

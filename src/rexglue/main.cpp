@@ -20,6 +20,7 @@
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
+#include <rex/cvar_cli.h>
 #include <rex/logging.h>
 #include <rex/platform/console.h>
 #include <rex/platform/env.h>
@@ -59,6 +60,8 @@ int main(int argc, char** argv) {
   CLI::App app{TitleString(), "rexglue"};
   app.set_version_flag("--version", REXGLUE_VERSION_STRING);
   app.require_subcommand(1);
+  // Lets cvar overrides be spelled after the subcommand name.
+  app.fallthrough();
 
   rexglue::cli::CliContext ctx;
   std::string log_level = "info";
@@ -80,13 +83,22 @@ int main(int argc, char** argv) {
   rexglue::cli::RegisterInit(app, ctx, pending);
   rexglue::cli::RegisterRecompileTests(app, ctx, pending);
 
+  rex::cvar::RegisterCliOptions(app);
+
   CLI11_PARSE(app, argc, argv);
+
+  // The registry also exposes log_level/log_file, so honor those spellings.
+  if (rex::cvar::GetFlagSource("log_level") == rex::cvar::Source::kCommandLine) {
+    log_level = rex::cvar::GetFlagByName("log_level");
+  }
+  if (rex::cvar::GetFlagSource("log_file") == rex::cvar::Source::kCommandLine) {
+    log_file = rex::cvar::GetFlagByName("log_file");
+  }
 
   ConfigureLogging(log_level, log_file, verbose);
   ctx.verbose = verbose;
   ctx.overwrite_existing = force;
   ctx.generate_despite_errors = force;
-  ctx.skip_upgrade_consent = force;
 
   bool tty = IsStderrTty();
   rexglue::ui::Init({.tty = tty, .color = ColorEnabled(tty)});

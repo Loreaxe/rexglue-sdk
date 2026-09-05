@@ -190,13 +190,22 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
 }
 
 void XmaContext::ResetDecoderState() {
-  // A freed or re-initialized context is a new logical stream. Drop the previous
-  // wave's MDCT overlap-add tail (persistent av_context_) and any buffered
-  // subframes so frame 0 of the next same-format wave is not contaminated.
-  if (av_context_ && avcodec_is_open(av_context_)) {
-    avcodec_flush_buffers(av_context_);
+  // A freed or re-initialized context is a new logical stream, so the previous
+  // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
+  // avcodec_flush_buffers() cannot drop it: ff_xmaframes_decoder declares no
+  // flush callback, so the call never reaches the code clearing channel[].out.
+  // Invalidating the cached format makes PrepareDecoder reopen the codec on the
+  // next decode, which does discard the history.
+  if (av_context_) {
+    av_context_->sample_rate = 0;
+    av_context_->channels = 0;
   }
   raw_frame_.fill(0);
+  decoded_frame_.fill(0);
+  carry_frame_.fill(0);
+  carry_valid_ = false;
+  pending_output_limit_ = 0;
+  pending_start_skip_ = 0;
   current_frame_remaining_subframes_ = 0;
   loop_frame_output_limit_ = 0;
   loop_start_skip_pending_ = false;
@@ -649,30 +658,55 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   const uint32_t padding_start =
       static_cast<uint8_t>(stream.Copy(xma_frame_.data() + 1, packet_info.current_frame_size_));
 
-  raw_frame_.fill(0);
+  decoded_frame_.fill(0);
 
-  PrepareDecoder(data->sample_rate, bool(data->is_stereo));
+  if (PrepareDecoder(data->sample_rate, bool(data->is_stereo)) == 1) {
+    // Reopening the codec restarts its output; the carried tail belongs to the
+    // old stream.
+    carry_valid_ = false;
+  }
   PreparePacket(packet_info.current_frame_size_, padding_start);
-  if (DecodePacket(av_context_, av_packet_, av_frame_)) {
+  const bool decoded = DecodePacket(av_context_, av_packet_, av_frame_);
+  if (decoded) {
     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
-                 raw_frame_.data());
-    current_frame_remaining_subframes_ = 4 << data->is_stereo;
+                 decoded_frame_.data());
+
+    // Realign the decoder's output onto the bitstream's sample numbering: the
+    // samples of the frame just decoded run from kDecoderStartPadding into this
+    // block and finish in the head of the next one.
+    const size_t pad_bytes = kDecoderStartPadding * kBytesPerSample << data->is_stereo;
+    const size_t carry_bytes = (kBytesPerFrameChannel << data->is_stereo) - pad_bytes;
 
     // Loop end: limit output to subframes 0..loop_subframe_end.
-    if (is_loop_end_frame) {
-      loop_frame_output_limit_ = (data->loop_subframe_end + 1) << data->is_stereo;
-    } else {
-      loop_frame_output_limit_ = 0;
-    }
-
+    const uint8_t decoded_output_limit =
+        is_loop_end_frame ? static_cast<uint8_t>((data->loop_subframe_end + 1) << data->is_stereo)
+                          : 0;
     // Loop start: skip leading subframes per loop_subframe_skip. skip == 4
     // means the whole frame is a warm-up frame (frame-aligned loop start):
     // decode seeds the codec state, output is fully discarded.
-    if (loop_start_skip_pending_) {
-      const uint8_t skip = data->loop_subframe_skip << data->is_stereo;
-      current_frame_remaining_subframes_ -= std::min(skip, current_frame_remaining_subframes_);
-      loop_start_skip_pending_ = false;
+    const uint8_t decoded_start_skip =
+        loop_start_skip_pending_ ? static_cast<uint8_t>(data->loop_subframe_skip << data->is_stereo)
+                                 : 0;
+    loop_start_skip_pending_ = false;
+
+    if (carry_valid_) {
+      std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
+      std::memcpy(raw_frame_.data() + carry_bytes, decoded_frame_.data(), pad_bytes);
+
+      current_frame_remaining_subframes_ = 4 << data->is_stereo;
+      loop_frame_output_limit_ = pending_output_limit_;
+      current_frame_remaining_subframes_ -=
+          std::min(pending_start_skip_, current_frame_remaining_subframes_);
     }
+
+    std::memcpy(carry_frame_.data(), decoded_frame_.data() + pad_bytes, carry_bytes);
+    carry_valid_ = true;
+    pending_output_limit_ = decoded_output_limit;
+    pending_start_skip_ = decoded_start_skip;
+  } else {
+    // A dropped frame breaks the carry's adjacency; re-prime rather than splice
+    // two blocks that are not neighbors.
+    carry_valid_ = false;
   }
 
   // Compute where to go next.
