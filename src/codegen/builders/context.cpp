@@ -269,6 +269,15 @@ void BuilderContext::emit_function_call(uint32_t address) {
     return;
   }
 
+  // The call edge is missing from this function node, but the target may still
+  // be a known function: overlapping-function discovery can split one real
+  // function across several nodes, leaving the call in a node whose edge list
+  // missed it. Fall back to the graph's exact entry-point lookup.
+  if (const FunctionNode* known = graph().getFunction(address)) {
+    println("\t{}(ctx, base);", known->name());
+    return;
+  }
+
   // No pre-resolved target found - this is an error
   REXCODEGEN_ERROR("Unresolved function 0x{:08X} from 0x{:08X} (no CallTarget in FunctionNode)",
                    address, base);
@@ -279,9 +288,12 @@ void BuilderContext::emit_function_call(uint32_t address) {
 void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
   uint32_t target = insn.operands[1];
 
-  // Use classifyTarget for consistent branch classification
-  // false = branch instruction (not a call), so own-base means loop back
-  auto kind = graph().classifyTarget(target, base, false);
+  // Use classifyTarget for consistent branch classification.
+  // false = branch instruction (not a call), so own-base means loop back.
+  // Pass fn (the authoritative function being emitted) directly: classifyTarget
+  // no longer re-derives the caller via getFunctionContaining, which could pick
+  // a LATER overlapping node and misclassify a same-function backward loop edge.
+  auto kind = graph().classifyTarget(target, fn, false);
 
   switch (kind) {
     case TargetKind::InternalLabel:
