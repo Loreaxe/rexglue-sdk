@@ -1249,18 +1249,15 @@ bool FunctionGraph::isMergeableEntryPoint(uint32_t addr) const {
   return node->authority() == FunctionAuthority::GAP_FILL;
 }
 
-TargetKind FunctionGraph::classifyTarget(uint32_t target, uint32_t callerAddr,
+TargetKind FunctionGraph::classifyTarget(uint32_t target, const FunctionNode& callerFn,
                                          bool isCallInstruction) const {
-  // Find the caller's function
-  const FunctionNode* callerFn = getFunctionContaining(callerAddr);
-
   // Case 1: Target is an import - always a call/tail-call
   if (isImport(target)) {
     return TargetKind::Import;
   }
 
   // Case 2: Target is the caller's own entry point
-  if (callerFn && target == callerFn->base()) {
+  if (target == callerFn.base()) {
     // bl to own base = recursive call (Function)
     // b to own base = loop back to start (InternalLabel)
     return isCallInstruction ? TargetKind::Function : TargetKind::InternalLabel;
@@ -1268,14 +1265,19 @@ TargetKind FunctionGraph::classifyTarget(uint32_t target, uint32_t callerAddr,
 
   // Case 3: Target is a DIFFERENT function's entry point - this is a call/tail-call
   // This handles cases where a small thunk function branches to another function
-  // whose entry point happens to fall within the thunk's address range
+  // whose entry point happens to fall within the thunk's address range.
+  // Checked BEFORE internal-label classification so overlapping nodes don't turn
+  // a real tail call into a local goto.
   if (isEntryPoint(target)) {
     return TargetKind::Function;
   }
 
   // Case 4: Target is inside caller's function -> InternalLabel
-  // For bl, this would be a rare PIC code pattern
-  if (callerFn && callerFn->containsAddress(target)) {
+  // For bl, this would be a rare PIC code pattern.
+  // A label within the caller's bounds is a local branch target even when it
+  // falls in a gap between blocks (backward loop back-edges).
+  if (callerFn.containsAddress(target) ||
+      (callerFn.isWithinBounds(target) && callerFn.isLabel(target))) {
     return TargetKind::InternalLabel;
   }
 
