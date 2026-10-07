@@ -37,8 +37,15 @@ endif()
 
 add_library(rexnet OBJECT
     rexnet.cpp
+    discord_presence.cpp
     pseudonym.cpp
     virtual_ip.cpp
+)
+
+# The Discord IPC frames are JSON; nlohmann's single header rides with inja,
+# which the SDK already vendors for codegen's templates.
+target_include_directories(rexnet PRIVATE
+    ${PROJECT_SOURCE_DIR}/thirdparty/inja/third_party/include
 )
 add_library(rex::rexnet ALIAS rexnet)
 

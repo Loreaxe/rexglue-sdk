@@ -33,6 +33,7 @@
 
 #include "rex/cvar.h"
 #include "rex/logging.h"
+#include "rex/net/discord_presence.h"
 #include "rex/net/rexnet_ffi.h"
 #include "rex/net/virtual_ip.h"
 
@@ -145,6 +146,16 @@ struct GameConfig {
   /// "friends", which not every title will want.
   bool shard_surface_as_friends = false;
 
+  /// [discord] — Rich Presence for this title, spoken to the Discord client on
+  /// this machine. Empty application id = no presence. The id is the title's
+  /// own Discord application; the two lines are what Discord shows under the
+  /// game's name until the host states better ones (SetDiscordActivity).
+  std::string discord_application_id;
+  std::string discord_details;
+  std::string discord_state;
+  std::string discord_large_image;
+  std::string discord_large_text;
+
   /// XUserSetContext/SetProperty id -> presence rich KV mapping.
   struct RichMapping {
     uint32_t context_id = 0;
@@ -245,6 +256,8 @@ class RexNet {
   void SessionDelete();
   /// Kick a DHT session search; results accumulate (poll TakeSessionResults).
   void SessionSearch();
+  /// Ask one host for its descriptor directly; the answer lands like a search result.
+  void SessionQuery(const RexNetPeerId& peer);
   std::optional<std::array<uint8_t, 16>> current_session_id();
 
   struct SessionResult {
@@ -295,6 +308,10 @@ class RexNet {
   /// Pending inbound requests/invites (snapshots; resolved explicitly by
   /// the calls below, typically from the F6 overlay).
   std::vector<FriendRequestInfo> PendingFriendRequests();
+  /// Peers that dismissed a request we sent, since the last call; drained on read.
+  std::vector<RexNetPeerId> TakeDeclinedFriendRequests();
+  /// Peers a request we sent REACHED (acknowledged), since the last call; drained on read.
+  std::vector<RexNetPeerId> TakeDeliveredFriendRequests();
   std::vector<InviteInfo> PendingInvites();
   /// Accept a pending friend request (mutual consent completes when the
   /// FriendAccepted event lands) / dismiss it locally without replying.
@@ -421,6 +438,32 @@ class RexNet {
   /// Dial a manual connect string (multiaddr, §4 preservation floor).
   void ConnectManual(const std::string& multiaddr);
 
+  // --- Shard and invites by material (Discord and other out-of-band joins) ---
+
+  /// Enter the named title shard outright (an invite carried its id).
+  void ShardJoin(const std::array<uint8_t, 16>& shard_id);
+  /// The title shard we are in, if any.
+  std::optional<std::array<uint8_t, 16>> current_shard_id();
+
+  /// Everything a joiner needs, as one string to hand out of band — a Discord
+  /// join secret, a pasted code: version, title id, our peer id, the session
+  /// id, our shard id and a public endpoint when one is confirmed. Empty when
+  /// there is no local session to join.
+  std::string JoinSecret();
+  /// Join from that material: dial the endpoint if it carried one, arm the
+  /// accept so the title's own invite path runs, search for the host's
+  /// descriptor, befriend the host with a note naming the session, and enter
+  /// the host's shard. False when the material does not parse, names another
+  /// title, or the node is down.
+  bool JoinFromSecret(const std::string& secret);
+
+  /// What Discord shows: the two lines, and whether the local session admits a
+  /// joiner (nullopt = whenever a local session exists). Any thread.
+  void SetDiscordActivity(const std::string& details, const std::string& state,
+                          std::optional<bool> joinable);
+  /// Rich Presence on or off (a player setting). Off clears it at Discord.
+  void SetDiscordEnabled(bool enabled);
+
   // --- Overlay / diagnostics snapshot ---------------------------------
 
   struct Connection {
@@ -482,6 +525,8 @@ class RexNet {
   std::optional<std::array<uint8_t, 16>> session_id_;
   std::vector<SessionResult> session_results_;
   std::vector<FriendRequestInfo> friend_requests_;
+  std::vector<RexNetPeerId> declined_requests_;
+  std::vector<RexNetPeerId> delivered_requests_;
   std::vector<InviteInfo> invites_;
   // Keyed by 20-byte abOnline identity string.
   std::unordered_map<std::string, PresenceInfo> presence_;
@@ -495,6 +540,23 @@ class RexNet {
   /// `host:port` strings a player hands a peer for a direct connect. A set so
   /// re-confirmations dedup and the overlay shows a stable list.
   std::set<std::string> public_endpoints_;
+  /// Mirrored from ShardJoined / ShardLeft.
+  std::optional<std::array<uint8_t, 16>> current_shard_;
+
+  /// Rich Presence, when the title's config names a Discord application. Pumped
+  /// from the pump thread; the activity it shows is computed in DiscordPump.
+  /// Shared, not unique: the pump thread holds its own reference for the length
+  /// of one pump, so a config reload replacing it cannot pull it out from under.
+  std::shared_ptr<DiscordPresence> discord_;
+  bool discord_enabled_ = true;
+  std::string discord_details_;
+  std::string discord_state_;
+  std::optional<bool> discord_joinable_;
+  /// The XEX's own title id, kept beside the advertised one so a join secret
+  /// written under either is accepted.
+  uint32_t xex_title_id_ = 0;
+  void DiscordPump();
+  void ConfigureDiscordLocked();
 
   StreamAcceptSink stream_accept_sink_;
   StreamDataSink stream_data_sink_;

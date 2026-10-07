@@ -139,3 +139,62 @@ NATs still need testing from an open network.
 the Rust, commit the regenerated header. `.github/workflows/rexnet.yaml`
 builds the crate and the SDK with the module on, runs the C++ and cargo
 tests including the loopback network tests, and fails on header drift.
+
+## Discord Rich Presence and invites
+
+RexNet speaks to the Discord client on the machine itself, over Discord's local IPC
+endpoint (`discord-ipc-N` under the runtime directory, a named pipe on Windows) — no
+Discord SDK, no service of ours. A title opts in with a `[discord]` section in its
+`rexnet.toml` naming its own Discord application:
+
+```toml
+[discord]
+application_id = "123456789012345678"   # the title's app in the developer portal
+details = "Playing"                      # defaults for the two lines Discord shows
+state = ""
+large_image = "logo"                     # an art asset key on that application
+large_text = "Title name"
+```
+
+While a local session admits a joiner the activity carries a party and a **join secret**,
+`RexNet::JoinSecret()`: `REXJ2|title|peer|session|shard|endpoint`. A friend who accepts the
+invite gets that secret on their side and `RexNet::JoinFromSecret()` does the whole join:
+dials the carried public endpoint if there is one, arms the accept so the title's own
+accepted-invite path runs, searches for the host's descriptor, befriends the host with a
+note naming the session (which the host's node accepts without asking), and enters the
+host's title shard by id (`rexnet_shard_join`), so the two are in the same ambient tier
+as well as the same session. "Ask to Join" is approved while the session is joinable.
+
+The host may state the two lines live (`RexNet::SetDiscordActivity`, the player's whereabouts
+for instance) and turn presence off as a player setting (`SetDiscordEnabled`); otherwise the
+config defaults stand and joinable means "a local session exists".
+
+## Reachability, recovery and hygiene (from the original-Xbox fork review, 2026-10-07)
+
+Taken from Creesic's `codex/rexnet-original-xbox` branch where it was generic:
+
+- **Each node publishes its own reachability record** (`rexnet/v1/peer/<id>`) as a DHT
+  provider record, at every heartbeat until a DHT node stores it and then every ten
+  minutes. Friends and peers owed a message are found through that key with a 30 s to
+  10 min backoff. A client-mode node is never in a routing table, so this is the only
+  lookup that works between two players on the public DHT.
+- **Friend requests report delivery** (`REXNET_EVENT_FRIEND_DELIVERED`, the other side's
+  ack) as well as a decline; "sent" is only the node taking the message.
+- **UPnP maps the game socket**, not just the swarm's listeners, so a NAT'd peer's probes
+  reach the public game port instead of falling back to a relayed tunnel.
+- **Relay hygiene**: a relay that refuses or drops a reservation is backed off ten minutes,
+  bootstrap nodes are never relays, and the reservation address is a global non-circuit
+  one chosen deterministically. **Inbound hygiene**: a public DHT peer that dialled us
+  and speaks nothing of ours is closed after identify so the crawl cannot fill the
+  inbound budget.
+- **Bounded game-peer recovery**: when a game peer's last control connection drops, its
+  validated routes (TCP first, then a relay circuit, QUIC last for a minute after a QUIC
+  failure) are redialled every second for five seconds, with one own-key lookup if no
+  route is known; the title hears the peer leave only when that fails.
+- **A direct session query** (`rexnet_session_query`) for a join that already knows the
+  host, used by `JoinFromSecret`; and **old-build detection**: an unsupported-protocol
+  failure is reported as the peer running an older build.
+
+Left behind as title-specific: clubs, signed notices, population heartbeats, the
+diagnostics recorder, and the quinn-udp Wine/Proton backport (only needed to run a
+Windows build under Wine).

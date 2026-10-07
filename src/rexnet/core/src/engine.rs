@@ -38,6 +38,7 @@ use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{
     autonat, connection_limits, dcutr, gossipsub, identify, kad, mdns, relay, upnp, Multiaddr,
@@ -190,6 +191,136 @@ const SHARD_WARM_CONNECT_LIMIT: usize = 24;
 /// have moved on, and the session it names may be gone. Matches the 5 minute
 /// expiry carried in the invite itself.
 const INVITE_DEFER_MAX: Duration = Duration::from_secs(300);
+/// Friends and peers we owe a message are looked up in the DHT and dialled on
+/// this backoff while they stay away: first after 30 s, doubling to 10 min.
+const PEER_LOOKUP_FIRST: Duration = Duration::from_secs(30);
+const PEER_LOOKUP_MAX: Duration = Duration::from_secs(600);
+/// Our own reachability record (`protocol::peer_key`) is published at each
+/// heartbeat until a DHT node stores it, then refreshed every ten minutes so
+/// new addresses and lost stores recover (kad's own republish is 12 h).
+const OWN_KEY_REPUBLISH: Duration = Duration::from_secs(600);
+/// A relay that refused or failed our reservation is not picked again for this long.
+const AUTO_RELAY_BACKOFF: Duration = Duration::from_secs(600);
+/// UPnP lease on the game socket, renewed at half-life as libp2p-upnp does.
+const GAME_PORT_LEASE: Duration = Duration::from_secs(3600);
+/// A game peer whose last control connection dropped is given this long to
+/// come back before the title is told it left: the title's own timeouts are
+/// longer, and a QUIC path that died often has a TCP or relay path alive.
+const PEER_RECOVERY_GRACE: Duration = Duration::from_secs(5);
+const PEER_RECOVERY_TICK: Duration = Duration::from_millis(250);
+const PEER_RECOVERY_RETRY: Duration = Duration::from_secs(1);
+/// After a direct QUIC path failed, other routes to that peer are tried first
+/// for this long.
+const QUIC_AVOID: Duration = Duration::from_secs(60);
+/// Validated routes to peers we have spoken to, for a recovery dial that
+/// needs no lookup: bounded, and forgotten after a while unused.
+const ROUTE_CACHE_TTL: Duration = Duration::from_secs(600);
+const ROUTE_CACHE_PEERS: usize = MAX_ESTABLISHED_CONNECTIONS as usize;
+const ROUTE_CACHE_ADDRS: usize = 8;
+
+struct PeerRoutes {
+    updated: Instant,
+    addresses: Vec<Multiaddr>,
+    avoid_quic_until: Option<Instant>,
+}
+
+struct PeerRecovery {
+    started: Instant,
+    next_dial: Instant,
+    looked_up: bool,
+}
+
+fn direct_quic(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, Protocol::QuicV1))
+        && !addr.iter().any(|p| matches!(p, Protocol::P2pCircuit))
+}
+
+/// TCP to the peer first, then a route through a relay, then QUIC: after a
+/// QUIC path died, the others are the ones most likely to be alive.
+fn route_priority(addr: &Multiaddr) -> u8 {
+    if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+        1
+    } else if direct_quic(addr) {
+        2
+    } else {
+        0
+    }
+}
+
+/// The address a connection can be redialled on: what we dialled, or a direct
+/// QUIC remote (an inbound TCP remote carries an ephemeral source port).
+fn reconnect_address(endpoint: &libp2p::core::ConnectedPoint) -> Option<Multiaddr> {
+    (endpoint.is_dialer() || direct_quic(endpoint.get_remote_address()))
+        .then(|| endpoint.get_remote_address().clone())
+}
+
+fn remember_routes(
+    cache: &mut HashMap<PeerId, PeerRoutes>,
+    peer: PeerId,
+    addresses: impl IntoIterator<Item = Multiaddr>,
+    now: Instant,
+) {
+    cache.retain(|_, routes| now.saturating_duration_since(routes.updated) < ROUTE_CACHE_TTL);
+    for addr in addresses {
+        let usable = addr.len() <= 512
+            && addr.iter().any(|p| matches!(p, Protocol::Tcp(n) if n != 0) || matches!(p, Protocol::QuicV1))
+            && !addr.iter().any(|p| {
+                matches!(p, Protocol::Ws(_) | Protocol::Wss(_) | Protocol::WebTransport)
+                    || matches!(p, Protocol::Ip4(ip) if ip.is_unspecified())
+                    || matches!(p, Protocol::Ip6(ip) if ip.is_unspecified())
+                    || matches!(p, Protocol::Tcp(0) | Protocol::Udp(0))
+            })
+            && !matches!(addr.iter().last(), Some(Protocol::P2p(id)) if id != peer);
+        if !usable {
+            continue;
+        }
+        if !cache.contains_key(&peer) && cache.len() >= ROUTE_CACHE_PEERS {
+            if let Some(oldest) = cache.iter().min_by_key(|(_, r)| r.updated).map(|(p, _)| *p) {
+                cache.remove(&oldest);
+            }
+        }
+        let routes = cache.entry(peer).or_insert_with(|| PeerRoutes {
+            updated: now,
+            addresses: Vec::new(),
+            avoid_quic_until: None,
+        });
+        routes.updated = now;
+        routes.addresses.retain(|old| old != &addr);
+        routes.addresses.insert(0, addr);
+        routes.addresses.sort_by_key(route_priority);
+        // Many local NIC addresses must not crowd out the relay or the
+        // working QUIC endpoint: one entry of each path kind is kept first.
+        let mut distinct: Vec<Multiaddr> = (0..3)
+            .filter_map(|priority| routes.addresses.iter().find(|a| route_priority(a) == priority).cloned())
+            .collect();
+        for addr in routes.addresses.drain(..) {
+            if distinct.len() < ROUTE_CACHE_ADDRS && !distinct.contains(&addr) {
+                distinct.push(addr);
+            }
+        }
+        routes.addresses = distinct;
+    }
+}
+
+fn reconnect_routes(routes: Option<&PeerRoutes>, now: Instant) -> Vec<Multiaddr> {
+    let Some(routes) = routes.filter(|r| now.saturating_duration_since(r.updated) < ROUTE_CACHE_TTL)
+    else {
+        return Vec::new();
+    };
+    let alternatives = routes.addresses.iter().any(|a| !direct_quic(a));
+    let avoid_quic = alternatives && routes.avoid_quic_until.is_some_and(|at| now < at);
+    let mut addresses: Vec<Multiaddr> =
+        routes.addresses.iter().filter(|a| !avoid_quic || !direct_quic(a)).cloned().collect();
+    addresses.sort_by_key(route_priority);
+    addresses
+}
+/// How often a peer still owed a friend message is dialled and looked up again.
+/// Short enough that a friend who comes online is reached within a few of the
+/// shard sweeps that find them; the retries are quiet, so the cost is a dial.
+const FRIEND_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+/// A friend message may ride a relayed connection that has to be set up first
+/// (reservation, circuit, noise); the library's 10 s covered a warm LAN dial.
+const FRIEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Datagrams held per peer while its game-plane punch completes, and how long
 /// they stay worth sending.
 ///
@@ -255,7 +386,10 @@ pub enum Command {
     InviteReply { peer: PeerId, accept: bool },
     FriendRequest { peer: PeerId, note: String },
     FriendAccept { peer: PeerId },
+    FriendDismiss { peer: PeerId },
     FriendRemove { peer: PeerId },
+    /// Enter a named shard outright (an invite carried its id).
+    ShardJoin { shard_id: [u8; 16] },
     /// Register the local session (id allocated by the shim). Public
     /// sessions additionally publish a DHT provider record (§10).
     SessionCreate { id: [u8; 16], slots_total: u8, slots_open: u8, is_public: bool },
@@ -263,6 +397,8 @@ pub enum Command {
     /// Find public sessions for our title via DHT provider records, then
     /// query each advertiser; results arrive as [`Event::SessionFound`].
     SessionSearch,
+    /// Ask one peer for its session descriptor.
+    SessionQuery { peer: PeerId },
     /// Opt in to the ambient title shard (§17.3, §17.5). Idempotent; a cap of
     /// 0 means the spec default.
     ShardEnable { cap: u16 },
@@ -300,7 +436,15 @@ pub enum Event {
     /// Also emitted once per stored friend at engine start, so the shim's
     /// mirror converges without a separate list query.
     FriendAccepted { peer: PeerId },
+    /// A request we sent was dismissed by the other side.
+    FriendDeclined { peer: PeerId },
+    /// A request we sent reached the other side (they acknowledged it).
+    FriendDelivered { peer: PeerId },
     FriendRemoved { peer: PeerId },
+    /// We entered a title shard (data = shard id).
+    ShardJoined { shard_id: [u8; 16] },
+    /// We left a title shard (data = shard id).
+    ShardLeft { shard_id: [u8; 16] },
     InviteReceived { peer: PeerId, title_id: u32, session_id: [u8; 16] },
     /// reply: 1 = accepted, 0 = declined.
     InviteReplied { peer: PeerId, reply: u8 },
@@ -441,6 +585,9 @@ struct PresenceMsg {
 enum FriendMsg {
     Request { schema: u8, display_name: String, note: String },
     Accept { schema: u8 },
+    /// The request was dismissed. The requester stops waiting for an Accept
+    /// and stops re-sending; nothing stops them asking again.
+    Decline { schema: u8 },
     Remove { schema: u8 },
 }
 
@@ -889,7 +1036,8 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
                         StreamProtocol::new(crate::protocol::FRIEND),
                         ProtocolSupport::Full,
                     )],
-                    request_response::Config::default(),
+                    request_response::Config::default()
+                        .with_request_timeout(FRIEND_REQUEST_TIMEOUT),
                 ),
                 invite: request_response::cbor::Behaviour::new(
                     [(
@@ -938,10 +1086,12 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
         }
     }
 
+    let mut bootstrap_peers: HashSet<PeerId> = HashSet::new();
     for entry in &config.bootstrap {
         match entry.parse::<Multiaddr>() {
             Ok(addr) => match addr.iter().last() {
                 Some(Protocol::P2p(peer)) => {
+                    bootstrap_peers.insert(peer);
                     swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
                 }
                 _ => tracing::warn!(%addr, "bootstrap addr lacks /p2p/ suffix, skipped"),
@@ -989,6 +1139,9 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
     let game_socket =
         Arc::new(UdpSocket::bind(("0.0.0.0", config.game_port)).await?);
     tracing::info!(game_port = game_socket.local_addr()?.port(), "game socket bound");
+    if !config.force_tunnel {
+        tokio::spawn(map_game_port(game_socket.local_addr()?.port()));
+    }
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<Event>();
     let evt_notify = Arc::new(Notify::new());
@@ -1054,6 +1207,17 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             announced_vip: None,
             invited: HashSet::new(),
             pending_invites: HashMap::new(),
+            pending_friend_msgs: HashMap::new(),
+            inflight_friend: HashMap::new(),
+            peer_lookups: HashMap::new(),
+            own_key_query: None,
+            own_key_at: None,
+            lookup_retry_at: HashMap::new(),
+            bootstrap_peers,
+            auto_relay_backoff: HashMap::new(),
+            auto_relay_listeners: HashMap::new(),
+            peer_routes: HashMap::new(),
+            recovering: HashMap::new(),
             local_session: None,
             pending_session_search: None,
             relays: HashSet::new(),
@@ -1064,6 +1228,7 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             shard_cap: DEFAULT_SHARD_CAP,
             current_shard: None,
             shard_candidates: HashMap::new(),
+            shard_preferred: None,
             pending_shard_search: None,
             pending_shard_queries: HashMap::new(),
             shard_member_peers: HashSet::new(),
@@ -1139,6 +1304,33 @@ struct Engine {
     /// connection and often no known address either -- sending blind meant
     /// the first invite reliably failed and the user had to try twice.
     pending_invites: HashMap<PeerId, (InviteMsg, Instant)>,
+    /// Friend messages waiting for a connection, exactly as invites
+    /// wait above. A friend request is the FIRST thing we ever send a peer -- a
+    /// friend code carries a key and a name, no address -- so sending it blind
+    /// failed at trace level and the player saw "request sent" for a message that
+    /// never left. Held until the peer connects (shard scan, DHT lookup, mdns or
+    /// a relay), retried on every heartbeat, never silently dropped.
+    pending_friend_msgs: HashMap<PeerId, (FriendMsg, Instant)>,
+    /// Friend messages in flight, so an outbound failure can put the
+    /// message back in the queue instead of losing it.
+    inflight_friend: HashMap<OutboundRequestId, (PeerId, FriendMsg)>,
+    /// DHT lookups for one peer's own reachability record, by query.
+    peer_lookups: HashMap<kad::QueryId, PeerId>,
+    /// The publish of our own record in flight, and when one last stuck.
+    own_key_query: Option<kad::QueryId>,
+    own_key_at: Option<Instant>,
+    /// Per-peer backoff for lookups and dials of peers that stay away.
+    lookup_retry_at: HashMap<PeerId, (Instant, Duration)>,
+    /// Configured bootstrap nodes: never relays, never friends, never announced.
+    bootstrap_peers: HashSet<PeerId>,
+    /// Relays that refused or dropped a reservation, with the time to try again.
+    auto_relay_backoff: HashMap<PeerId, Instant>,
+    /// Circuit listeners we hold, by listener, so a closed one frees its relay.
+    auto_relay_listeners: HashMap<libp2p::core::transport::ListenerId, PeerId>,
+    /// Validated routes to peers, for recovery dials.
+    peer_routes: HashMap<PeerId, PeerRoutes>,
+    /// Game peers whose transport dropped and are being brought back.
+    recovering: HashMap<PeerId, PeerRecovery>,
     local_session: Option<LocalSession>,
     /// Active session-search provider query, with peers already asked.
     pending_session_search: Option<(kad::QueryId, Vec<PeerId>)>,
@@ -1164,6 +1356,9 @@ struct Engine {
     current_shard: Option<ShardDesc>,
     /// Descriptors learned from the last sweep, keyed by shard id.
     shard_candidates: HashMap<[u8; 16], ShardDesc>,
+    /// A shard the player asked for by id (`Command::ShardJoin`); entered as
+    /// soon as its descriptor is known, cleared once we are in it.
+    shard_preferred: Option<[u8; 16]>,
     pending_shard_search: Option<(kad::QueryId, Vec<PeerId>)>,
     pending_shard_queries: HashMap<OutboundRequestId, PeerId>,
     /// Peer ids heard on our shard topic. Larger than the gossipsub mesh:
@@ -1270,6 +1465,23 @@ impl Engine {
         for peer in stored {
             self.emit(Event::FriendAccepted { peer });
         }
+        // Requests sent in an earlier run are still owed. The
+        // receiver answers a repeat with the same Accept it would have sent, and
+        // an Accept only counts here while the peer is in pending_out, which is
+        // why that set is persisted now (friends.rs).
+        let shown: Vec<(PeerId, String, String)> = self.friend_store.inbound().collect();
+        for (peer, display_name, note) in shown {
+            self.emit(Event::FriendRequest { peer, display_name, note });
+        }
+        let owed: Vec<PeerId> = self.friend_store.pending_out.iter().copied().collect();
+        for peer in owed {
+            let msg = FriendMsg::Request {
+                schema: 1,
+                display_name: self.display_name.clone(),
+                note: String::new(),
+            };
+            self.pending_friend_msgs.insert(peer, (msg, Instant::now()));
+        }
         self.announce_local_address();
 
         let mut heartbeat = tokio::time::interval(PRESENCE_HEARTBEAT);
@@ -1277,6 +1489,8 @@ impl Engine {
         let mut punch_watchdog = tokio::time::interval(PUNCH_WATCHDOG_INTERVAL);
         let mut shard_status = tokio::time::interval(SHARD_STATUS_INTERVAL);
         let mut relay_check = tokio::time::interval(RELAY_RETRY_INTERVAL);
+        let mut friend_retry = tokio::time::interval(FRIEND_RETRY_INTERVAL);
+        let mut recovery_tick = tokio::time::interval(PEER_RECOVERY_TICK);
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
@@ -1292,7 +1506,10 @@ impl Engine {
                 _ = heartbeat.tick() => {
                     self.push_presence(None);
                     self.shard_beat();
+                    self.publish_own_key();
                 }
+                _ = friend_retry.tick() => self.friend_retry(),
+                _ = recovery_tick.tick() => self.maintain_recoveries(),
                 _ = punch_watchdog.tick() => self.check_punch_deadlines(),
                 _ = shard_status.tick() => self.log_shard_status(),
                 _ = relay_check.tick() => {
@@ -1385,6 +1602,89 @@ impl Engine {
 
     /// Subscribe to a shard's topic and advertise ourselves as a provider so
     /// later arrivals can find it.
+    /// Send a friend message now if the peer is connected, else hold
+    /// it and go looking for the peer. See `pending_friend_msgs`.
+    fn friend_send(&mut self, peer: PeerId, msg: FriendMsg) {
+        if self.connected.contains(&peer) {
+            let id = self.swarm.behaviour_mut().friend.send_request(&peer, msg.clone());
+            self.inflight_friend.insert(id, (peer, msg));
+            return;
+        }
+        tracing::info!(%peer, "friend message deferred until connected");
+        self.pending_friend_msgs.insert(peer, (msg, Instant::now()));
+        self.friend_seek(peer);
+    }
+
+    /// Every way we have of reaching a peer we hold no address for --
+    /// a dial over whatever kad, mdns or identify already know, a DHT peer lookup,
+    /// and a shard sweep, since another Fable II player publishes a shard provider
+    /// record that carries their addresses.
+    fn friend_seek(&mut self, peer: PeerId) {
+        self.wanted_peers.insert(peer);
+        if let Err(err) = self.swarm.dial(peer) {
+            tracing::debug!(%peer, %err, "friend dial failed; trying DHT");
+        }
+        self.lookup_peer(peer);
+        if self.shard_enabled && self.pending_shard_search.is_none() {
+            self.shard_discover();
+        }
+    }
+
+    /// Find one peer's addresses through its own reachability record. One
+    /// lookup per peer at a time; the result dials once and finishes.
+    fn lookup_peer(&mut self, peer: PeerId) {
+        if self.peer_lookups.values().any(|target| *target == peer) {
+            return;
+        }
+        let key = kad::RecordKey::new(&crate::protocol::peer_key(&peer));
+        let id = self.swarm.behaviour_mut().kad.get_providers(key);
+        self.peer_lookups.insert(id, peer);
+    }
+
+    /// Our own reachability record, so friends holding only our peer id can
+    /// find us: at every heartbeat until one DHT node has stored it, then at
+    /// OWN_KEY_REPUBLISH.
+    fn publish_own_key(&mut self) {
+        if self.own_key_query.is_some() || !own_key_due(self.own_key_at, Instant::now()) {
+            return;
+        }
+        let local = *self.swarm.local_peer_id();
+        let key = kad::RecordKey::new(&crate::protocol::peer_key(&local));
+        match self.swarm.behaviour_mut().kad.start_providing(key) {
+            Ok(id) => self.own_key_query = Some(id),
+            Err(err) => tracing::warn!(%err, "own reachability record publish failed"),
+        }
+    }
+
+    /// Every FRIEND_RETRY_INTERVAL, try again for every peer still owed a friend
+    /// message. Quiet retries: not marked wanted, so a peer that is simply
+    /// offline does not raise an error each time.
+    fn friend_retry(&mut self) {
+        // Friends we are not connected to as well as peers owed a message: a
+        // friend who comes back online is found the same way a stranger is.
+        let now = Instant::now();
+        let mut waiting: HashSet<PeerId> = self.pending_friend_msgs.keys().copied().collect();
+        waiting.extend(self.friend_store.friends().copied());
+        waiting.retain(|peer| !self.connected.contains(peer));
+        for peer in waiting {
+            if !retry_due(&mut self.lookup_retry_at, peer, now, PEER_LOOKUP_FIRST, PEER_LOOKUP_MAX) {
+                continue;
+            }
+            tracing::info!(%peer, "looking up peer");
+            if let Err(err) = self.swarm.dial(peer) {
+                tracing::debug!(%peer, %err, "retry dial failed");
+            }
+            self.lookup_peer(peer);
+        }
+        let keep: HashSet<PeerId> = self
+            .pending_friend_msgs
+            .keys()
+            .chain(self.friend_store.friends())
+            .copied()
+            .collect();
+        self.lookup_retry_at.retain(|peer, _| keep.contains(peer));
+    }
+
     fn shard_enter(&mut self, desc: ShardDesc) {
         let topic = gossipsub::IdentTopic::new(crate::protocol::shard_topic(&desc.shard_id));
         if let Err(err) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
@@ -1400,8 +1700,28 @@ impl Engine {
             shard = %hex16(&desc.shard_id), created_at = desc.created_at,
             "joined shard"
         );
+        if self.shard_preferred == Some(desc.shard_id) {
+            self.shard_preferred = None;
+        }
+        self.emit(Event::ShardJoined { shard_id: desc.shard_id });
         self.current_shard = Some(desc);
         self.readdress_all();
+        // Say so at once rather than at the next heartbeat, so the members we are
+        // already connected to place us on the /24 before anyone dials.
+        self.shard_beat();
+        let peers: Vec<PeerId> = self.rexnet_peers.iter().copied().collect();
+        for peer in peers {
+            self.shard_query_peer(peer);
+        }
+    }
+
+    /// A game path to some peer is up: punched, tunnelled, or being punched.
+    /// Addresses must not move while it is.
+    fn game_in_progress(&self) -> bool {
+        self.local_session.is_some()
+            || !self.tunneled_peers.is_empty()
+            || !self.punch_deadline.is_empty()
+            || self.announced.iter().any(|p| self.game_plane_ready(p))
     }
 
     /// Leave the current shard, unsubscribing and withdrawing our record.
@@ -1416,6 +1736,7 @@ impl Engine {
         self.shard_member_peers.clear();
         self.shard_reachable_attempted.clear();
         tracing::info!(shard = %hex16(&current.shard_id), "left shard");
+        self.emit(Event::ShardLeft { shard_id: current.shard_id });
         self.readdress_all();
     }
 
@@ -1491,6 +1812,26 @@ impl Engine {
             })
             .collect();
 
+        // A GAME IN PROGRESS PINS EVERY ADDRESS. Entering a shard re-derives the
+        // virtual IPs of every peer (readdress_all), and the titles on both ends
+        // hold those addresses in live sockets. The migration path below already
+        // refuses to move a player mid-co-op; the FIRST placement did not, and with
+        // the shard newly enabled it fired while two players sat on the co-op
+        // screen: the host moved to 10.77.34.x, the joiner's packets went to an
+        // address nobody held, and the session dropped. Placement waits until no
+        // game path is up; the rescan picks it up then.
+        if self.game_in_progress() {
+            tracing::debug!("shard placement deferred: a game path is up");
+            return;
+        }
+        // A named shard that is still being looked for holds placement off:
+        // creating or joining another shard now would just be left again.
+        if let Some(preferred) = self.shard_preferred {
+            if !self.shard_candidates.contains_key(&preferred) {
+                tracing::debug!(shard = %hex16(&preferred), "shard settle waiting on the named shard");
+                return;
+            }
+        }
         match self.current_shard.clone() {
             None => {
                 match shard::choose(self.title_id, &candidates) {
@@ -2086,6 +2427,7 @@ impl Engine {
         );
         self.emit(Event::Degraded { peer });
         self.flush_pending_datagrams(peer, None);
+        self.game_path_recovered(peer, "tunnel");
     }
 
     /// Give up on punches that have exceeded PUNCH_TIMEOUT.
@@ -2331,6 +2673,16 @@ impl Engine {
         if self.auto_relays.len() >= MAX_AUTO_RELAYS || self.auto_relays.contains(&peer_id) {
             return;
         }
+        // Never a bootstrap node (they are DHT entry points, not our relays),
+        // and not one that refused us lately.
+        if self.bootstrap_peers.contains(&peer_id) {
+            return;
+        }
+        if let Some(until) = self.auto_relay_backoff.get(&peer_id) {
+            if Instant::now() < *until {
+                return;
+            }
+        }
         // Peer must speak the circuit-v2 hop, or it cannot relay for us.
         let offers_hop = protocols
             .iter()
@@ -2338,9 +2690,10 @@ impl Engine {
         if !offers_hop {
             return;
         }
-        // Reserve only through a globally routable address: a LAN-only relay is
-        // useless to a NAT'd peer elsewhere that must reach us through it.
-        let Some(base) = listen_addrs.iter().find(|a| multiaddr_is_global(a)) else {
+        // Reserve only through a globally routable address that is not itself a
+        // circuit: a LAN-only relay is useless to a NAT'd peer elsewhere, and a
+        // circuit inside a circuit cannot be listened on.
+        let Some(base) = reservable_addr(listen_addrs) else {
             return;
         };
         // Circuit = <relay transport>/p2p/<relay>/p2p-circuit. Drop any trailing
@@ -2351,14 +2704,146 @@ impl Engine {
         }
         let circuit = circuit.with(Protocol::P2p(peer_id)).with(Protocol::P2pCircuit);
         match self.swarm.listen_on(circuit.clone()) {
-            Ok(_) => {
+            Ok(listener) => {
                 self.auto_relays.insert(peer_id);
+                self.auto_relay_listeners.insert(listener, peer_id);
                 tracing::info!(%peer_id, %circuit,
                     "mesh relay: auto-reserving a circuit through a reachable peer");
             }
             Err(err) => {
                 tracing::debug!(%peer_id, %err, "auto relay reservation failed to start");
             }
+        }
+    }
+
+    /// A request-response failure worth saying. UnsupportedProtocols is the
+    /// one that is not a network fault: the peer is a RexNet build without
+    /// this protocol, and the player should hear that, not "no answer".
+    fn note_outbound_failure(
+        &mut self,
+        peer: PeerId,
+        what: &str,
+        error: &request_response::OutboundFailure,
+    ) {
+        if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
+            tracing::warn!(%peer, what, "peer runs a build without this protocol");
+            self.emit(Event::Error {
+                message: format!("{peer} runs an older build that cannot take a {what} message"),
+            });
+        } else {
+            tracing::debug!(%peer, what, %error, "request failed");
+        }
+    }
+
+    fn remember_peer_routes(&mut self, peer: PeerId, addresses: impl IntoIterator<Item = Multiaddr>) {
+        remember_routes(&mut self.peer_routes, peer, addresses, Instant::now());
+    }
+
+    fn maintain_recoveries(&mut self) {
+        let now = Instant::now();
+        let peers: Vec<PeerId> = self.recovering.keys().copied().collect();
+        for peer in peers {
+            if now.saturating_duration_since(self.recovering[&peer].started) >= PEER_RECOVERY_GRACE {
+                self.expire_peer_recovery(peer);
+            } else {
+                self.recover_peer(peer);
+            }
+        }
+    }
+
+    fn recover_peer(&mut self, peer: PeerId) {
+        let now = Instant::now();
+        let Some(recovery) = self.recovering.get_mut(&peer) else { return };
+        if self.connected.contains(&peer) || now < recovery.next_dial {
+            return;
+        }
+        recovery.next_dial = now + PEER_RECOVERY_RETRY;
+        let addresses = reconnect_routes(self.peer_routes.get(&peer), now);
+        // Explicit alternatives must not be extended with the failed QUIC path.
+        let dial = if addresses.is_empty() {
+            DialOpts::peer_id(peer).condition(PeerCondition::NotDialing).build()
+        } else {
+            DialOpts::peer_id(peer).condition(PeerCondition::NotDialing).addresses(addresses).build()
+        };
+        if let Err(error) = self.swarm.dial(dial) {
+            tracing::debug!(%peer, ?error, "recovery dial not started");
+            if let Some(recovery) = self.recovering.get_mut(&peer) {
+                if !recovery.looked_up {
+                    recovery.looked_up = true;
+                    self.lookup_peer(peer);
+                }
+            }
+        }
+    }
+
+    fn expire_peer_recovery(&mut self, peer: PeerId) {
+        if let Some(recovery) = self.recovering.remove(&peer) {
+            tracing::info!(%peer, elapsed_ms = recovery.started.elapsed().as_millis(),
+                control_connected = self.connected.contains(&peer), "game peer recovery timed out");
+            self.pending_datagrams.remove(&peer);
+            if let Some(reply) = self.punch_replies.remove(&peer) {
+                let _ = reply.send(Err("peer recovery timed out".into()));
+            }
+            self.report_peer_departure(peer);
+        }
+    }
+
+    /// A game path to a recovering peer is up again: the title never heard it
+    /// leave. Too late, and it is told now rather than kept in limbo.
+    fn game_path_recovered(&mut self, peer: PeerId, path: &str) {
+        if !self.connected.contains(&peer) {
+            return;
+        }
+        if self.recovering.get(&peer).is_some_and(|r| r.started.elapsed() >= PEER_RECOVERY_GRACE) {
+            self.expire_peer_recovery(peer);
+            return;
+        }
+        if let Some(recovery) = self.recovering.remove(&peer) {
+            tracing::info!(%peer, path, elapsed_ms = recovery.started.elapsed().as_millis(), "game path recovered");
+        }
+    }
+
+    fn report_peer_departure(&mut self, peer: PeerId) {
+        if self.announced.remove(&peer) {
+            self.emit(Event::PeerDisconnected { peer });
+        }
+    }
+
+    /// A circuit listener ended: free its relay slot; if it failed, back the
+    /// relay off so the next identify does not pick it again at once.
+    fn auto_relay_listener_closed(
+        &mut self,
+        listener: libp2p::core::transport::ListenerId,
+        failed: bool,
+    ) {
+        let Some(peer) = self.auto_relay_listeners.remove(&listener) else { return };
+        if !self.auto_relay_listeners.values().any(|other| *other == peer) {
+            self.auto_relays.remove(&peer);
+        }
+        if failed {
+            let now = Instant::now();
+            self.auto_relay_backoff.retain(|_, until| now < *until);
+            self.auto_relay_backoff.insert(peer, now + AUTO_RELAY_BACKOFF);
+            tracing::info!(%peer, "mesh relay: reservation refused or failed; slot freed, relay backed off");
+        }
+    }
+
+    /// Close an inbound connection from a peer that is nothing to us: not
+    /// wanted, not a relay of ours, not a friend, not a bootstrap node.
+    fn close_public_inbound(&mut self, peer: PeerId, connection: libp2p::swarm::ConnectionId) {
+        if self.wanted_peers.contains(&peer)
+            || self.auto_relays.contains(&peer)
+            || self.relay_addrs.iter().any(|(relay, _)| *relay == peer)
+            || self.relays.contains(&peer)
+            || self.friend_store.is_friend(&peer)
+            || self.bootstrap_peers.contains(&peer)
+            || self.pending_friend_msgs.contains_key(&peer)
+            || self.rexnet_peers.contains(&peer)
+        {
+            return;
+        }
+        if self.swarm.close_connection(connection) {
+            tracing::debug!(%peer, "closed a public inbound connection");
         }
     }
 
@@ -2467,6 +2952,7 @@ impl Engine {
         }
         self.flush_pending_datagrams(peer, Some(addr));
         self.deliver_orphan_frames(peer, addr);
+        self.game_path_recovered(peer, "udp");
         self.emit(Event::PunchResult { peer, ok: true });
         if let Some(reply) = self.punch_replies.remove(&peer) {
             let _ = reply.send(Ok(addr));
@@ -2626,17 +3112,28 @@ impl Engine {
                 self.push_presence(None);
             }
             Command::FriendRequest { peer, note } => {
+                if peer == *self.swarm.local_peer_id() {
+                    // Two installs made by copying one carry the same identity.key, so
+                    // the other machine's friend code IS ours: nothing can ever connect.
+                    tracing::warn!("friend request to our own peer id: a copied install shares identity.key");
+                    self.emit(Event::Error {
+                        message: "that friend code is this node's own id: a copied install shares \
+                                  identity.key; delete the copy's rexnet/identity.key and restart it"
+                            .into(),
+                    });
+                    return true;
+                }
                 if self.friend_store.is_friend(&peer) {
                     self.emit(Event::FriendAccepted { peer });
                     return true;
                 }
-                self.friend_store.pending_out.insert(peer);
+                self.friend_store.request_sent(peer);
                 let msg = FriendMsg::Request {
                     schema: 1,
                     display_name: self.display_name.clone(),
                     note,
                 };
-                self.swarm.behaviour_mut().friend.send_request(&peer, msg);
+                self.friend_send(peer, msg);
             }
             Command::FriendAccept { peer } => {
                 if !self.friend_store.pending_in.contains(&peer) {
@@ -2644,13 +3141,21 @@ impl Engine {
                     return true;
                 }
                 self.friend_store.add(peer);
-                self.swarm.behaviour_mut().friend.send_request(&peer, FriendMsg::Accept { schema: 1 });
+                self.friend_send(peer, FriendMsg::Accept { schema: 1 });
                 self.emit(Event::FriendAccepted { peer });
                 self.push_presence(Some(peer));
             }
+            Command::FriendDismiss { peer } => {
+                if self.friend_store.dismiss(&peer) {
+                    self.friend_send(peer, FriendMsg::Decline { schema: 1 });
+                }
+            }
             Command::FriendRemove { peer } => {
                 self.friend_store.remove(&peer);
-                self.swarm.behaviour_mut().friend.send_request(&peer, FriendMsg::Remove { schema: 1 });
+                self.pending_friend_msgs.remove(&peer);
+                if self.connected.contains(&peer) {
+                    self.swarm.behaviour_mut().friend.send_request(&peer, FriendMsg::Remove { schema: 1 });
+                }
                 self.emit(Event::FriendRemoved { peer });
             }
             Command::SendInvite { peer } => {
@@ -2725,6 +3230,34 @@ impl Engine {
                     tracing::info!(cap = self.shard_cap, "ambient shard enabled");
                     // Look before creating: joining an existing shard is the
                     // whole point, so never create one on the enable path.
+                    self.shard_discover();
+                }
+            }
+            Command::ShardJoin { shard_id } => {
+                // An explicit join -- a Discord invite names the host's shard -- outranks
+                // placement and the migration cooldown: the player asked to be with
+                // this person. Known already: go now. Not yet: remembered, and taken the
+                // moment that shard's descriptor arrives (the host is dialled for the
+                // session join, and a rexnet peer is queried for its shard on identify).
+                if !self.shard_enabled {
+                    self.shard_enabled = true;
+                    self.shard_cap = DEFAULT_SHARD_CAP;
+                }
+                if self.current_shard.as_ref().is_some_and(|c| c.shard_id == shard_id) {
+                    return true;
+                }
+                self.shard_preferred = Some(shard_id);
+                if self.game_in_progress() {
+                    tracing::info!(shard = %hex16(&shard_id), "named shard remembered; a game path is up, joining after it");
+                    return true;
+                }
+                if let Some(desc) = self.shard_candidates.get(&shard_id).cloned() {
+                    tracing::info!(shard = %hex16(&shard_id), "joining the named shard");
+                    self.shard_leave();
+                    self.shard_enter(desc);
+                    self.last_shard_move = Some(Instant::now());
+                } else {
+                    tracing::info!(shard = %hex16(&shard_id), "named shard not seen yet; waiting for its descriptor");
                     self.shard_discover();
                 }
             }
@@ -2812,6 +3345,13 @@ impl Engine {
             Command::ShardStatus { reply } => {
                 let _ = reply.send(self.current_shard.as_ref().map(|d| d.shard_id));
             }
+            Command::SessionQuery { peer } => {
+                // Ask one host for its descriptor directly: a join that already
+                // knows the host (an invite, a pasted code) need not wait on a
+                // DHT search. The answer takes the same path a search result does.
+                self.wanted_peers.insert(peer);
+                self.swarm.behaviour_mut().session.send_request(&peer, SessionQuery { schema: 1 });
+            }
             Command::SessionSearch => {
                 let key = kad::RecordKey::new(&crate::protocol::session_key(self.title_id));
                 let id = self.swarm.behaviour_mut().kad.get_providers(key);
@@ -2839,6 +3379,13 @@ impl Engine {
 
     fn handle_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
         match event {
+            SwarmEvent::ListenerClosed { listener_id, reason, .. } => {
+                self.auto_relay_listener_closed(listener_id, reason.is_err());
+            }
+            SwarmEvent::ListenerError { listener_id, error } => {
+                tracing::debug!(?listener_id, %error, "listener error");
+                self.auto_relay_listener_closed(listener_id, true);
+            }
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::info!(%address, "listening");
                 self.listen_addrs.push(address);
@@ -2854,7 +3401,14 @@ impl Engine {
                 // when identify shows it speaks our protocols -- that is logged
                 // at info instead.
                 tracing::debug!(%peer_id, endpoint = %endpoint.get_remote_address(), "connected");
+                self.remember_peer_routes(peer_id, reconnect_address(&endpoint));
                 if num_established.get() == 1 {
+                    // A game peer coming back: rebuild its game path now rather
+                    // than at the title's next datagram, which may be a while.
+                    if self.recovering.contains_key(&peer_id) {
+                        tracing::info!(%peer_id, "control connection back; re-punching the game path");
+                        self.begin_punch(peer_id);
+                    }
                     let wanted = self.wanted_peers.remove(&peer_id);
                     self.connected.insert(peer_id);
                     // Peers we didn't ask for (kad crawl, autonat dial-backs)
@@ -2883,15 +3437,52 @@ impl Engine {
                             );
                         }
                     }
+                    // A friend message that waited for this peer goes now.
+                    if let Some((msg, queued)) = self.pending_friend_msgs.remove(&peer_id) {
+                        tracing::info!(
+                            %peer_id, waited_s = queued.elapsed().as_secs(),
+                            "sending deferred friend message"
+                        );
+                        self.announce_peer(peer_id);
+                        let id = self.swarm.behaviour_mut().friend.send_request(&peer_id, msg.clone());
+                        self.inflight_friend.insert(id, (peer_id, msg));
+                    }
                 }
             }
-            SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, endpoint, num_established, cause, .. } => {
                 if num_established == 0 {
                     // Only worth a line if we ever cared about this peer.
                     if self.rexnet_peers.contains(&peer_id) || self.announced.contains(&peer_id) {
                         tracing::info!(%peer_id, ?cause, "rexnet peer disconnected");
                     } else {
                         tracing::debug!(%peer_id, ?cause, "disconnected");
+                    }
+                    // A GAME PEER GETS A GRACE PERIOD. Its transport is torn down
+                    // below as before -- a reconnect negotiates fresh keys -- but
+                    // the title is not told it left until recovery has had its
+                    // chance: cached routes are dialled, a QUIC path that died is
+                    // tried last, and one lookup runs if no route is known.
+                    let game_peer = self.announced.contains(&peer_id)
+                        && (self.recovering.contains_key(&peer_id) || self.recovering.len() < ROUTE_CACHE_PEERS)
+                        && (self.tunneled_peers.contains(&peer_id)
+                            || self.game_plane_ready(&peer_id)
+                            || self.punch_deadline.contains_key(&peer_id)
+                            || self.recovering.contains_key(&peer_id));
+                    if game_peer {
+                        self.remember_peer_routes(peer_id, reconnect_address(&endpoint));
+                        let now = Instant::now();
+                        if direct_quic(endpoint.get_remote_address()) {
+                            if let Some(routes) = self.peer_routes.get_mut(&peer_id) {
+                                routes.avoid_quic_until = Some(now + QUIC_AVOID);
+                            }
+                        }
+                        if !self.recovering.contains_key(&peer_id) {
+                            self.recovering.insert(
+                                peer_id,
+                                PeerRecovery { started: now, next_dial: now, looked_up: false },
+                            );
+                            tracing::info!(%peer_id, "game peer transport lost; attempting bounded recovery");
+                        }
                     }
                     self.connected.remove(&peer_id);
                     // Virtual IP stays allocated (stable across reconnects);
@@ -2928,8 +3519,8 @@ impl Engine {
                     // Free the auto-relay slot so another reachable peer can take
                     // its place next time one identifies.
                     self.auto_relays.remove(&peer_id);
-                    if self.announced.remove(&peer_id) {
-                        self.emit(Event::PeerDisconnected { peer: peer_id });
+                    if !self.recovering.contains_key(&peer_id) {
+                        self.report_peer_departure(peer_id);
                     }
                 }
             }
@@ -2950,7 +3541,7 @@ impl Engine {
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
                 info,
-                ..
+                connection_id,
             })) => {
                 // A peer that speaks our shard protocol is another RexNet
                 // node. Worth knowing separately from `connected`, which is
@@ -2960,6 +3551,7 @@ impl Engine {
                     .iter()
                     .any(|p| p.as_ref() == crate::protocol::SHARD)
                 {
+                    self.remember_peer_routes(peer_id, info.listen_addrs.iter().cloned());
                     if self.rexnet_peers.insert(peer_id) {
                         tracing::info!(%peer_id, "rexnet peer identified");
                         // Late arrivals matter: if we already hold a shard and
@@ -2974,6 +3566,13 @@ impl Engine {
                 // hop on a routable address, hold a reservation on it so a NAT'd
                 // node gets a relay from the mesh itself, no configured server.
                 self.maybe_auto_reserve_relay(peer_id, &info.protocols, &info.listen_addrs);
+                // After the relay pick, so a relay it just chose is kept. A public
+                // DHT peer that dialled us and speaks nothing of ours is let go:
+                // the crawl otherwise fills the inbound budget and a friend
+                // cannot get in.
+                if !info.protocols.iter().any(|p| p.as_ref() == crate::protocol::SHARD) {
+                    self.close_public_inbound(peer_id, connection_id);
+                }
                 // Feed identify-learned addresses into the routing table so
                 // kad queries and dials can use them.
                 for addr in info.listen_addrs {
@@ -2990,8 +3589,8 @@ impl Engine {
                 id,
                 result,
                 step,
-                ..
-            })) => self.handle_kad_result(id, result, step.last),
+                stats,
+            })) => self.handle_kad_result(id, result, step.last, stats.num_successes()),
             SwarmEvent::Behaviour(BehaviourEvent::Echo(request_response::Event::Message {
                 peer,
                 message,
@@ -3015,6 +3614,12 @@ impl Engine {
                     let _ = reply.send(Err(error.to_string()));
                 }
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Session(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => self.note_outbound_failure(peer, "session", &error),
+            SwarmEvent::Behaviour(BehaviourEvent::Invite(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => self.note_outbound_failure(peer, "invite", &error),
             SwarmEvent::Behaviour(BehaviourEvent::Session(request_response::Event::Message {
                 peer,
                 message,
@@ -3079,11 +3684,35 @@ impl Engine {
                     }
                 }
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Friend(
+                request_response::Event::OutboundFailure { peer, request_id, error, .. },
+            )) => {
+                // The message is not lost. It goes back in the queue
+                // and leaves on the next connection; the failure is stated, where
+                // before it fell through to a trace line nobody saw.
+                if let Some((_, msg)) = self.inflight_friend.remove(&request_id) {
+                    self.note_outbound_failure(peer, "friend", &error);
+                    tracing::warn!(%peer, %error, "friend message failed; queued for retry");
+                    self.emit(Event::Error {
+                        message: format!("friend message to {peer} not delivered yet: {error}"),
+                    });
+                    self.pending_friend_msgs.entry(peer).or_insert((msg, Instant::now()));
+                    self.friend_seek(peer);
+                }
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Friend(request_response::Event::Message {
                 peer,
                 message,
                 ..
             })) => {
+                if let request_response::Message::Response { request_id, .. } = &message {
+                    if let Some((_, msg)) = self.inflight_friend.remove(request_id) {
+                        tracing::info!(%peer, ?msg, "friend message delivered");
+                        if matches!(msg, FriendMsg::Request { .. }) {
+                            self.emit(Event::FriendDelivered { peer });
+                        }
+                    }
+                }
                 if let request_response::Message::Request { request, channel, .. } = message {
                     let _ =
                         self.swarm.behaviour_mut().friend.send_response(channel, Ack { schema: 1 });
@@ -3105,8 +3734,16 @@ impl Engine {
                                     .friend
                                     .send_request(&peer, FriendMsg::Accept { schema: 1 });
                                 self.emit(Event::FriendAccepted { peer });
-                            } else {
-                                self.friend_store.pending_in.insert(peer);
+                            } else if self.friend_store.request_received(peer, &display_name, &note) {
+                                // A joiner naming our session came with our own invite
+                                // material; a private descriptor is served to them.
+                                if let Some(session) = self.local_session.as_ref() {
+                                    if note == format!("discord:{}", hex16(&session.id)) {
+                                        self.invited.insert(peer);
+                                    }
+                                }
+                                // A repeat of a request already shown stays shown once;
+                                // the sender re-sends after every restart (see run()).
                                 self.emit(Event::FriendRequest { peer, display_name, note });
                             }
                         }
@@ -3116,6 +3753,13 @@ impl Engine {
                                 self.announce_peer(peer);
                                 self.emit(Event::FriendAccepted { peer });
                                 self.push_presence(Some(peer));
+                            }
+                        }
+                        FriendMsg::Decline { .. } => {
+                            if self.friend_store.request_declined(&peer) {
+                                self.pending_friend_msgs.remove(&peer);
+                                tracing::info!(%peer, "friend request declined");
+                                self.emit(Event::FriendDeclined { peer });
                             }
                         }
                         FriendMsg::Remove { .. } => {
@@ -3228,7 +3872,27 @@ impl Engine {
                                 %peer, shard = %hex16(&desc.shard_id),
                                 members = desc.members_hint, "shard descriptor received"
                             );
-                            self.shard_candidates.insert(desc.shard_id, desc);
+                            let arrived = desc.shard_id;
+                            self.shard_candidates.insert(desc.shard_id, desc.clone());
+                            // A peer that answers with OUR shard is a member of it now,
+                            // beat or no beat: its address on our /24 must agree with
+                            // the one it derives for itself, and waiting up to a
+                            // heartbeat for the gossip left the two sides disagreeing.
+                            if self.current_shard.as_ref().is_some_and(|c| c.shard_id == arrived)
+                                && self.shard_member_peers.insert(peer)
+                            {
+                                self.readdress_all();
+                            }
+                            if self.shard_preferred == Some(arrived)
+                                && !self.current_shard.as_ref().is_some_and(|c| c.shard_id == arrived)
+                                && !self.game_in_progress()
+                            {
+                                tracing::info!(shard = %hex16(&arrived), "named shard found; joining it");
+                                self.shard_leave();
+                                self.shard_enter(desc);
+                                self.last_shard_move = Some(Instant::now());
+                                return;
+                            }
                         }
                     }
                     // Act the moment the picture is complete. Waiting for the
@@ -3321,7 +3985,13 @@ impl Engine {
         }
     }
 
-    fn handle_kad_result(&mut self, id: kad::QueryId, result: kad::QueryResult, last: bool) {
+    fn handle_kad_result(
+        &mut self,
+        id: kad::QueryId,
+        result: kad::QueryResult,
+        last: bool,
+        successes: u32,
+    ) {
         match result {
             kad::QueryResult::GetClosestPeers(res) => {
                 let Some((target, _)) = self.pending_find.get(&id) else { return };
@@ -3343,6 +4013,27 @@ impl Engine {
                 }
             }
             kad::QueryResult::GetProviders(res) => {
+                if let Some(&peer) = self.peer_lookups.get(&id) {
+                    if let Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) = &res {
+                        if providers.contains(&peer) {
+                            // Many DHT servers return the same provider. Once our
+                            // target is found, further walking and repeated dials
+                            // waste bandwidth while it is offline or behind a NAT.
+                            self.peer_lookups.remove(&id);
+                            if let Some(mut query) = self.swarm.behaviour_mut().kad.query_mut(&id) {
+                                query.finish();
+                            }
+                            if !self.connected.contains(&peer) {
+                                tracing::info!(%peer, "peer found in DHT; dialling once");
+                                let _ = self.swarm.dial(peer);
+                            }
+                        }
+                    }
+                    if last {
+                        self.peer_lookups.remove(&id);
+                    }
+                    return;
+                }
                 // One result type serves two registries -- the §10 session
                 // directory and the §17.3 shard registry. Dispatch on which
                 // query this belongs to; matching only one would silently
@@ -3431,7 +4122,14 @@ impl Engine {
                 }
             }
             kad::QueryResult::StartProviding(res) => {
-                tracing::info!(ok = res.is_ok(), "provider record published");
+                tracing::info!(ok = res.is_ok(), stored = successes, "provider record published");
+                if self.own_key_query == Some(id) {
+                    self.own_key_query = None;
+                    // kad reports Ok even when no DHT node took the record.
+                    if res.is_ok() && successes > 0 {
+                        self.own_key_at = Some(Instant::now());
+                    }
+                }
             }
             kad::QueryResult::Bootstrap(res) => {
                 if last {
@@ -3440,6 +4138,73 @@ impl Engine {
             }
             _ => {}
         }
+    }
+}
+
+fn own_key_due(last_stored: Option<Instant>, now: Instant) -> bool {
+    last_stored.map_or(true, |at| now.saturating_duration_since(at) >= OWN_KEY_REPUBLISH)
+}
+
+/// Exponential retry per peer: true when `peer` is due, scheduling the next.
+fn retry_due(
+    retries: &mut HashMap<PeerId, (Instant, Duration)>,
+    peer: PeerId,
+    now: Instant,
+    first: Duration,
+    max: Duration,
+) -> bool {
+    let delay = match retries.get(&peer) {
+        Some(&(next, _)) if now < next => return false,
+        Some(&(_, delay)) => (delay * 2).min(max),
+        None => first,
+    };
+    retries.insert(peer, (now + delay, delay));
+    true
+}
+
+/// The address to reserve an auto relay through: a global one that is not a
+/// circuit. A relay that holds a reservation itself advertises that circuit,
+/// a circuit inside a circuit cannot be listened on, and identify lists
+/// addresses in no set order, so taking the first global one failed at random.
+fn reservable_addr(listen_addrs: &[Multiaddr]) -> Option<&Multiaddr> {
+    listen_addrs
+        .iter()
+        .find(|a| multiaddr_is_global(a) && !a.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
+}
+
+/// Map the game socket on a UPnP router. libp2p-upnp maps only the swarm's
+/// listeners, so a NAT'd peer's probes to our public game port were dropped
+/// and the pair fell back to a relayed tunnel even though we were reachable.
+async fn map_game_port(port: u16) {
+    use igd_next::{aio::tokio::search_gateway, PortMappingProtocol, SearchOptions};
+    let gateway = match search_gateway(SearchOptions::default()).await {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            tracing::info!(?error, "upnp: game port not mapped (no gateway)");
+            return;
+        }
+    };
+    // The address our route to the gateway leaves from is the one it can forward to.
+    let local = std::net::UdpSocket::bind(("0.0.0.0", 0))
+        .and_then(|socket| socket.connect(gateway.addr).and_then(|()| socket.local_addr()));
+    let local_ip = match local {
+        Ok(addr) => addr.ip(),
+        Err(error) => {
+            tracing::warn!(?error, "upnp: no route to the gateway; game port not mapped");
+            return;
+        }
+    };
+    loop {
+        let internal = SocketAddr::new(local_ip, port);
+        let lease = GAME_PORT_LEASE.as_secs() as u32;
+        match gateway.add_port(PortMappingProtocol::UDP, port, internal, lease, "rexnet game").await {
+            Ok(()) => tracing::info!(port, %internal, "upnp: game port mapped"),
+            Err(error) => {
+                tracing::warn!(port, ?error, "upnp: game port mapping failed");
+                return;
+            }
+        }
+        tokio::time::sleep(GAME_PORT_LEASE / 2).await;
     }
 }
 

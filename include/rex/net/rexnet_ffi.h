@@ -118,6 +118,26 @@
  */
 #define REXNET_EVENT_EXTERNAL_ADDRESS 22
 
+/**
+ * A friend request we sent was dismissed by `peer`.
+ */
+#define REXNET_EVENT_FRIEND_DECLINED 23
+
+/**
+ * We entered a title shard. data = the 16-byte shard id.
+ */
+#define REXNET_EVENT_SHARD_JOINED 24
+
+/**
+ * We left a title shard. data = the 16-byte shard id.
+ */
+#define REXNET_EVENT_SHARD_LEFT 25
+
+/**
+ * A friend request we sent reached `peer` (they acknowledged it).
+ */
+#define REXNET_EVENT_FRIEND_DELIVERED 26
+
 typedef struct RexNetHandle RexNetHandle;
 
 typedef struct RexNetConfig {
@@ -387,6 +407,14 @@ void rexnet_friend_request(struct RexNetHandle *handle,
 void rexnet_friend_accept(struct RexNetHandle *handle, const struct RexNetPeerId *peer);
 
 /**
+ * Drop an inbound friend request without answering it.
+ *
+ * # Safety
+ * `handle` from [`rexnet_init`]; `peer` valid.
+ */
+void rexnet_friend_dismiss(struct RexNetHandle *handle, const struct RexNetPeerId *peer);
+
+/**
  * # Safety
  * `handle` from [`rexnet_init`]; `peer` valid.
  */
@@ -450,6 +478,26 @@ void rexnet_stream_close(struct RexNetHandle *handle, uint64_t stream_id);
  * `handle` from [`rexnet_init`].
  */
 void rexnet_shard_enable(struct RexNetHandle *handle, uint16_t cap);
+
+/**
+ * Enter the shard with this 16-byte id outright: an invite carried it, so
+ * the player wants to be where the host is. Enables the ambient shard if it
+ * was off. Taken as soon as the shard's descriptor is known.
+ *
+ * # Safety
+ * `handle` from [`rexnet_init`]; `shard_id` points at 16 readable bytes.
+ */
+void rexnet_shard_join(struct RexNetHandle *handle, const uint8_t *shard_id);
+
+/**
+ * Ask one peer for its session descriptor; the answer arrives as a
+ * SESSION_FOUND event like a search result. For a join that already knows
+ * the host (an invite, a pasted code).
+ *
+ * # Safety
+ * `handle` from [`rexnet_init`]; `peer` valid.
+ */
+void rexnet_session_query(struct RexNetHandle *handle, const struct RexNetPeerId *peer);
 
 /**
  * Leave any shard and stop publishing/scanning.

@@ -75,6 +75,14 @@ pub mod protocol {
     /// Deliberately a *different* key from [`session_key`]. An ambient shard
     /// is not an XSession: if the two shared a namespace, a title's session
     /// search would find a 255-member shard and try to join it as a game.
+    /// One node's reachability record (§4): published by the node itself as a
+    /// provider record every few minutes, so a friend holding only its peer id
+    /// can find it on the public DHT. A client-mode node is never in a routing
+    /// table, so FindPeer cannot do this; provider records can.
+    pub fn peer_key(peer: &libp2p::PeerId) -> String {
+        format!("rexnet/v1/peer/{peer}")
+    }
+
     pub fn shard_key(title_id: u32) -> String {
         format!("rexnet/v1/title/{title_id:08x}/shards")
     }

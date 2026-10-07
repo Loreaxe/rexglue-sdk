@@ -225,6 +225,14 @@ pub const REXNET_EVENT_PEER_RTT: u32 = 21;
 /// A directly dialable public endpoint for us was confirmed (UPnP/AutoNAT).
 /// data = UTF-8 bare `host:port` to hand a peer for a direct connect.
 pub const REXNET_EVENT_EXTERNAL_ADDRESS: u32 = 22;
+/// A friend request we sent was dismissed by `peer`.
+pub const REXNET_EVENT_FRIEND_DECLINED: u32 = 23;
+/// We entered a title shard. data = the 16-byte shard id.
+pub const REXNET_EVENT_SHARD_JOINED: u32 = 24;
+/// We left a title shard. data = the 16-byte shard id.
+pub const REXNET_EVENT_SHARD_LEFT: u32 = 25;
+/// A friend request we sent reached `peer` (they acknowledged it).
+pub const REXNET_EVENT_FRIEND_DELIVERED: u32 = 26;
 
 /// Rust-side view of the same numbering.
 #[repr(u32)]
@@ -253,6 +261,10 @@ pub enum RexNetEventKind {
     StreamConnectFailed = REXNET_EVENT_STREAM_CONNECT_FAILED,
     PeerRtt = REXNET_EVENT_PEER_RTT,
     ExternalAddress = REXNET_EVENT_EXTERNAL_ADDRESS,
+    FriendDeclined = REXNET_EVENT_FRIEND_DECLINED,
+    ShardJoined = REXNET_EVENT_SHARD_JOINED,
+    ShardLeft = REXNET_EVENT_SHARD_LEFT,
+    FriendDelivered = REXNET_EVENT_FRIEND_DELIVERED,
 }
 
 /// Fixed-size POD event, drained once per frame via [`rexnet_poll_event`].
@@ -414,6 +426,22 @@ fn fill_event(out: &mut RexNetEvent, event: Event) {
         Event::FriendRemoved { peer } => {
             out.kind = RexNetEventKind::FriendRemoved as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
+        }
+        Event::FriendDeclined { peer } => {
+            out.kind = RexNetEventKind::FriendDeclined as u32;
+            out.peer = RexNetPeerId::from_peer(&peer);
+        }
+        Event::ShardJoined { shard_id } => {
+            out.kind = RexNetEventKind::ShardJoined as u32;
+            set_data(out, &shard_id);
+        }
+        Event::FriendDelivered { peer } => {
+            out.kind = RexNetEventKind::FriendDelivered as u32;
+            out.peer = RexNetPeerId::from_peer(&peer);
+        }
+        Event::ShardLeft { shard_id } => {
+            out.kind = RexNetEventKind::ShardLeft as u32;
+            set_data(out, &shard_id);
         }
         Event::InviteReceived { peer, title_id, session_id } => {
             out.kind = RexNetEventKind::InviteReceived as u32;
@@ -578,10 +606,15 @@ unsafe fn with_handle(handle: *mut RexNetHandle, f: impl FnOnce(&RexNetHandle)) 
 pub unsafe extern "C" fn rexnet_wait_event(handle: *mut RexNetHandle, timeout_ms: u32) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(handle) = handle.as_ref() else { return false };
+        // The timeout's timer must be created INSIDE the runtime. Built as
+        // block_on's argument it is constructed on the caller's thread with no runtime
+        // entered, and tokio panics ("there is no reactor running") on every call; the
+        // pump then retried immediately and wrote 43 million panics to stdout (b172).
         let wait = handle.evt_notify.notified();
+        let timeout = Duration::from_millis(timeout_ms as u64);
         handle
             .runtime
-            .block_on(tokio::time::timeout(Duration::from_millis(timeout_ms as u64), wait))
+            .block_on(async move { tokio::time::timeout(timeout, wait).await })
             .is_ok()
     }))
     .unwrap_or(false)
@@ -896,6 +929,22 @@ pub unsafe extern "C" fn rexnet_friend_accept(
     });
 }
 
+/// Drop an inbound friend request without answering it.
+///
+/// # Safety
+/// `handle` from [`rexnet_init`]; `peer` valid.
+#[no_mangle]
+pub unsafe extern "C" fn rexnet_friend_dismiss(
+    handle: *mut RexNetHandle,
+    peer: *const RexNetPeerId,
+) {
+    with_handle(handle, |h| {
+        if let Some(peer) = peer.as_ref().and_then(RexNetPeerId::to_peer) {
+            let _ = h.cmd_tx.send(Command::FriendDismiss { peer });
+        }
+    });
+}
+
 /// # Safety
 /// `handle` from [`rexnet_init`]; `peer` valid.
 #[no_mangle]
@@ -999,6 +1048,39 @@ pub unsafe extern "C" fn rexnet_stream_close(handle: *mut RexNetHandle, stream_i
 pub unsafe extern "C" fn rexnet_shard_enable(handle: *mut RexNetHandle, cap: u16) {
     with_handle(handle, |h| {
         let _ = h.cmd_tx.send(Command::ShardEnable { cap });
+    });
+}
+
+/// Enter the shard with this 16-byte id outright: an invite carried it, so
+/// the player wants to be where the host is. Enables the ambient shard if it
+/// was off. Taken as soon as the shard's descriptor is known.
+///
+/// # Safety
+/// `handle` from [`rexnet_init`]; `shard_id` points at 16 readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rexnet_shard_join(handle: *mut RexNetHandle, shard_id: *const u8) {
+    if shard_id.is_null() {
+        return;
+    }
+    let mut id = [0u8; 16];
+    std::ptr::copy_nonoverlapping(shard_id, id.as_mut_ptr(), 16);
+    with_handle(handle, |h| {
+        let _ = h.cmd_tx.send(Command::ShardJoin { shard_id: id });
+    });
+}
+
+/// Ask one peer for its session descriptor; the answer arrives as a
+/// SESSION_FOUND event like a search result. For a join that already knows
+/// the host (an invite, a pasted code).
+///
+/// # Safety
+/// `handle` from [`rexnet_init`]; `peer` valid.
+#[no_mangle]
+pub unsafe extern "C" fn rexnet_session_query(handle: *mut RexNetHandle, peer: *const RexNetPeerId) {
+    with_handle(handle, |h| {
+        if let Some(peer) = peer.as_ref().and_then(RexNetPeerId::to_peer) {
+            let _ = h.cmd_tx.send(Command::SessionQuery { peer });
+        }
     });
 }
 

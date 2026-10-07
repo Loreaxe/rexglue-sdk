@@ -2672,6 +2672,7 @@ dependencies = [
  "cbindgen",
  "chacha20poly1305",
  "hkdf",
+ "igd-next",
  "libp2p",
  "postcard",
  "rand 0.8.7",

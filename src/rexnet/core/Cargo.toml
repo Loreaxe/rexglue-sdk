@@ -71,6 +71,10 @@ path = "tests/tunnel_fallback.rs"
 required-features = ["net-tests"]
 
 [dependencies]
+# UPnP for the GAME socket: libp2p-upnp maps only the swarm's listeners, so a
+# NAT'd peer's probes to our public game port were dropped and the pair fell
+# back to a relayed tunnel even though we were reachable.
+igd-next = { version = "0.16", features = ["aio_tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 libp2p = { version = "0.56", features = [
     "tokio",
