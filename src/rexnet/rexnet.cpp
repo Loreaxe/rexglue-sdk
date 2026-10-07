@@ -156,7 +156,7 @@ static ui::RexNetOverlayStatus BuildOverlayStatus() {
         fmt::format("10.77.{}.{}", (conn.virtual_ip >> 8) & 0xFF, conn.virtual_ip & 0xFF);
     switch (conn.status) {
       case ConnectStatus::kConnected:
-        peer.status = "connected";
+        peer.status = conn.degraded ? "connected (tunnel)" : "connected";
         break;
       case ConnectStatus::kPending:
         peer.status = "punching";
@@ -394,7 +394,29 @@ void RexNet::SetNotifySink(NotifySink sink) {
 
 void RexNet::SetStatus(uint32_t virtual_ip, ConnectStatus status) {
   std::lock_guard lock(mutex_);
-  statuses_[virtual_ip] = status;
+  statuses_[virtual_ip].status = status;
+}
+
+void RexNet::SetNoticeSink(NoticeSink sink) {
+  std::lock_guard lock(mutex_);
+  notice_sink_ = std::move(sink);
+}
+
+std::vector<RexNet::Notice> RexNet::TakeNotices() {
+  std::lock_guard lock(mutex_);
+  return std::exchange(notices_, {});
+}
+
+void RexNet::RaiseNotice(Notice notice) {
+  NoticeSink sink;
+  {
+    std::lock_guard lock(mutex_);
+    sink = notice_sink_;
+    notices_.push_back(notice);
+  }
+  if (sink) {
+    sink(notice);
+  }
 }
 
 bool RexNet::Connect(uint32_t virtual_ip) {
@@ -407,10 +429,10 @@ bool RexNet::Connect(uint32_t virtual_ip) {
     }
     peer = *found;
     auto it = statuses_.find(virtual_ip);
-    if (it != statuses_.end() && it->second == ConnectStatus::kConnected) {
-      return true;  // already up
+    if (it != statuses_.end() && it->second.status == ConnectStatus::kConnected) {
+      return true;  // already up (punched or over the tunnel)
     }
-    statuses_[virtual_ip] = ConnectStatus::kPending;
+    statuses_[virtual_ip] = PeerLink{ConnectStatus::kPending, false};
   }
   rexnet_connect_peer(handle_, &peer);
   // If the control connection already exists no PeerConnected event will
@@ -422,7 +444,7 @@ bool RexNet::Connect(uint32_t virtual_ip) {
 ConnectStatus RexNet::GetConnectStatus(uint32_t virtual_ip) {
   std::lock_guard lock(mutex_);
   if (auto it = statuses_.find(virtual_ip); it != statuses_.end()) {
-    return it->second;
+    return it->second.status;
   }
   return ConnectStatus::kIdle;
 }
@@ -437,16 +459,27 @@ void RexNet::SendDatagram(uint32_t virtual_ip, uint16_t src_port, uint16_t dst_p
 std::array<uint8_t, 16> RexNet::SessionCreate(bool is_public, uint8_t slots_total,
                                               uint8_t slots_open) {
   std::array<uint8_t, 16> id;
+  uint64_t token = 0;
   {
     std::random_device rd;
     for (size_t i = 0; i < id.size(); i += 4) {
       uint32_t word = rd();
       std::memcpy(id.data() + i, &word, 4);
     }
+    // The join token: what proves a joiner holds material the host handed
+    // out. Seeded from the device, never 0 (0 = no token).
+    std::mt19937_64 rng(rd());
+    do {
+      token = rng();
+    } while (token == 0);
   }
   {
     std::lock_guard lock(mutex_);
     session_id_ = id;
+    join_token_ = token;
+    slots_total_ = slots_total;
+    slots_open_ = slots_open;
+    join_secret_dirty_ = true;
     // Advertise the session to friends so join-in-progress UIs (orbs)
     // light up: JOINABLE + XNKID flow from this KV into their
     // XFriendsCreateEnumerator records.
@@ -457,6 +490,9 @@ std::array<uint8_t, 16> RexNet::SessionCreate(bool is_public, uint8_t slots_tota
     PushRichLocked();
   }
   rexnet_session_create(handle_, id.data(), slots_total, slots_open, is_public);
+  if (rexnet_session_set_join_token(handle_, token) != 0) {
+    REXNET_WARN("session: the core refused the join token; joins by material will not resolve");
+  }
   REXNET_INFO(
       "session created ({}, {}/{} slots) xnkid {:02X} {:02X} {:02X} {:02X} "
       "{:02X} {:02X} {:02X} {:02X}",
@@ -469,10 +505,29 @@ void RexNet::SessionDelete() {
   {
     std::lock_guard lock(mutex_);
     session_id_.reset();
+    join_token_ = 0;
+    slots_total_ = 0;
+    slots_open_ = 0;
+    join_secret_dirty_ = true;
     rich_kvs_.erase(kRichKeySessionId);
     PushRichLocked();
   }
+  rexnet_session_set_join_token(handle_, 0);
   rexnet_session_delete(handle_);
+}
+
+uint64_t RexNet::join_token() {
+  std::lock_guard lock(mutex_);
+  return join_token_;
+}
+
+void RexNet::SetSessionSlots(uint32_t open, uint32_t total) {
+  {
+    std::lock_guard lock(mutex_);
+    slots_open_ = std::min(open, total);
+    slots_total_ = total;
+  }
+  rexnet_session_set_slots(handle_, std::min(open, total), total);
 }
 
 void RexNet::SessionSearch() {
@@ -493,8 +548,9 @@ void RexNet::SetPresence(uint32_t title_id, uint8_t state, const void* rich, uin
     // Track the last-set state so rich-KV pushes don't revert it.
     std::lock_guard lock(mutex_);
     presence_state_ = state;
-    if (title_id) {
+    if (title_id && title_id != title_id_) {
       title_id_ = title_id;
+      join_secret_dirty_ = true;
     }
   }
   rexnet_set_presence(handle_, title_id, state, static_cast<const uint8_t*>(rich), rich_len);
@@ -590,12 +646,15 @@ std::string EndpointToMultiaddr(const std::string& endpoint, const std::string& 
   return std::string(v6 ? "/ip6/" : "/ip4/") + host + "/udp/" + port + "/quic-v1/p2p/" + peer;
 }
 
-constexpr const char* kJoinSecretVersion = "REXJ2";
+/// Join material versions. REXJ3 adds the join token; REXJ2 is read, never
+/// written, so material from the previous build still joins a public session.
+constexpr const char* kJoinSecretVersion = "REXJ3";
+constexpr const char* kJoinSecretVersionNoToken = "REXJ2";
 
 }  // namespace
 
-void RexNet::SessionQuery(const RexNetPeerId& peer) {
-  rexnet_session_query(handle_, &peer);
+void RexNet::SessionQuery(const RexNetPeerId& peer, uint64_t token) {
+  rexnet_session_query(handle_, &peer, token);
 }
 
 void RexNet::ShardJoin(const std::array<uint8_t, 16>& shard_id) {
@@ -609,8 +668,17 @@ std::optional<std::array<uint8_t, 16>> RexNet::current_shard_id() {
 
 std::string RexNet::JoinSecret() {
   std::lock_guard lock(mutex_);
+  return JoinSecretLocked();
+}
+
+std::string RexNet::JoinSecretLocked() {
+  if (!join_secret_dirty_) {
+    return join_secret_cache_;
+  }
+  join_secret_dirty_ = false;
+  join_secret_cache_.clear();
   if (!session_id_.has_value()) {
-    return {};
+    return join_secret_cache_;
   }
   std::string secret = kJoinSecretVersion;
   secret += '|';
@@ -623,7 +691,10 @@ std::string RexNet::JoinSecret() {
   secret += current_shard_ ? Hex16(*current_shard_) : std::string("-");
   secret += '|';
   secret += public_endpoints_.empty() ? std::string("-") : *public_endpoints_.begin();
-  return secret;
+  secret += '|';
+  secret += fmt::format("{:016x}", join_token_);
+  join_secret_cache_ = std::move(secret);
+  return join_secret_cache_;
 }
 
 bool RexNet::JoinFromSecret(const std::string& secret) {
@@ -636,9 +707,17 @@ bool RexNet::JoinFromSecret(const std::string& secret) {
     }
   }
 
-  // REXJ2|title|peer|session|shard|endpoint, or the first cut's peer|title|session.
-  std::string peer_text, title_text, session_text, shard_text, endpoint_text;
-  if (parts.size() == 6 && parts[0] == kJoinSecretVersion) {
+  // REXJ3|title|peer|session|shard|endpoint|token, REXJ2 without the token,
+  // or the first cut's peer|title|session.
+  std::string peer_text, title_text, session_text, shard_text, endpoint_text, token_text;
+  if (parts.size() == 7 && parts[0] == kJoinSecretVersion) {
+    title_text = parts[1];
+    peer_text = parts[2];
+    session_text = parts[3];
+    shard_text = parts[4];
+    endpoint_text = parts[5];
+    token_text = parts[6];
+  } else if (parts.size() == 6 && parts[0] == kJoinSecretVersionNoToken) {
     title_text = parts[1];
     peer_text = parts[2];
     session_text = parts[3];
@@ -657,8 +736,24 @@ bool RexNet::JoinFromSecret(const std::string& secret) {
   if (std::sscanf(title_text.c_str(), "%x", &title) != 1) {
     return false;
   }
-  if (title != title_id_ && title != xex_title_id_) {
-    REXNET_WARN("join refused: title {:08X} is not ours ({:08X})", title, title_id_);
+  uint64_t token = 0;
+  if (!token_text.empty()) {
+    unsigned long long parsed = 0;
+    if (std::sscanf(token_text.c_str(), "%llx", &parsed) != 1) {
+      REXNET_WARN("join material: bad token");
+      return false;
+    }
+    token = parsed;
+  }
+  uint32_t our_title = 0;
+  uint32_t our_xex_title = 0;
+  {
+    std::lock_guard lock(mutex_);
+    our_title = title_id_;
+    our_xex_title = xex_title_id_;
+  }
+  if (title != our_title && title != our_xex_title) {
+    REXNET_WARN("join refused: title {:08X} is not ours ({:08X})", title, our_title);
     return false;
   }
   const std::optional<RexNetPeerId> peer = PeerIdFromString(peer_text);
@@ -679,19 +774,24 @@ bool RexNet::JoinFromSecret(const std::string& secret) {
       ConnectManual(multiaddr);
     }
   }
-  AcceptInvite(invite);
-  // The host is known: ask it outright, and keep the DHT search as the
-  // fallback for a dial that has not landed yet.
-  SessionQuery(*peer);
-  SessionSearch();
-  if (!IsFriend(*peer)) {
-    FriendRequest(*peer, "discord:" + session_text);
+  if (!AcceptInvite(invite)) {
+    // Already on its way: the descriptor or the timeout resolves it, and a
+    // second arm would run the title's join twice.
+    REXNET_INFO("join to {}'s session already pending; not re-armed", PeerIdString(*peer));
+    return true;
   }
+  // The host is known: ask it outright, with the token that proves the
+  // material came from it, and keep the DHT search as the fallback for a dial
+  // that has not landed yet. Friendship is the players' business, not the
+  // join's: nothing here sends a request.
+  SessionQuery(*peer, token);
+  SessionSearch();
   std::array<uint8_t, 16> shard{};
   if (!shard_text.empty() && shard_text != "-" && ParseHex16(shard_text, shard)) {
     ShardJoin(shard);
   }
-  REXNET_INFO("joining {}'s session from invite material", PeerIdString(*peer));
+  REXNET_INFO("joining {}'s session from invite material{}", PeerIdString(*peer),
+              token ? "" : " (no token: a private session will not answer)");
   return true;
 }
 
@@ -708,9 +808,31 @@ void RexNet::ConfigureDiscordLocked() {
       REXNET_WARN("discord join: the invite could not be used");
     }
   };
-  callbacks.on_join_request = [this](const std::string&, const std::string&) {
+  callbacks.on_join_request = [this](const std::string& user_id,
+                                     const std::string& user_name) -> std::optional<bool> {
     std::lock_guard lock(mutex_);
-    return discord_joinable_.value_or(session_id_.has_value()) && session_id_.has_value();
+    const bool joinable = discord_joinable_.value_or(true) && session_id_.has_value();
+    if (!joinable) {
+      return false;
+    }
+    switch (join_request_policy_) {
+      case JoinRequestPolicy::All:
+        return true;
+      case JoinRequestPolicy::Friends:
+        if (auto it = discord_user_peers_.find(user_id); it != discord_user_peers_.end()) {
+          uint8_t key[20];
+          OnlineKey(it->second, key);
+          if (friends_.contains(std::string(reinterpret_cast<const char*>(key), 20))) {
+            return true;
+          }
+        }
+        [[fallthrough]];  // unknown to us: the host decides
+      case JoinRequestPolicy::Ask:
+        break;
+    }
+    join_requests_.push_back(
+        JoinRequestEntry{JoinRequest{user_id, user_name}, std::chrono::steady_clock::now()});
+    return std::nullopt;
   };
   DiscordPresence::Assets assets;
   assets.large_image = game_config_.discord_large_image;
@@ -731,6 +853,45 @@ void RexNet::SetDiscordActivity(const std::string& details, const std::string& s
 void RexNet::SetDiscordEnabled(bool enabled) {
   std::lock_guard lock(mutex_);
   discord_enabled_ = enabled;
+}
+
+void RexNet::SetJoinRequestPolicy(JoinRequestPolicy policy) {
+  std::lock_guard lock(mutex_);
+  join_request_policy_ = policy;
+}
+
+RexNet::JoinRequestPolicy RexNet::join_request_policy() {
+  std::lock_guard lock(mutex_);
+  return join_request_policy_;
+}
+
+std::vector<RexNet::JoinRequest> RexNet::TakeJoinRequests() {
+  std::lock_guard lock(mutex_);
+  std::vector<JoinRequest> out;
+  out.reserve(join_requests_.size());
+  for (auto& entry : join_requests_) {
+    out.push_back(std::move(entry.request));
+  }
+  join_requests_.clear();
+  return out;
+}
+
+void RexNet::ReplyJoinRequest(const std::string& user_id, bool accept) {
+  std::shared_ptr<DiscordPresence> discord;
+  {
+    std::lock_guard lock(mutex_);
+    std::erase_if(join_requests_,
+                  [&](const JoinRequestEntry& e) { return e.request.user_id == user_id; });
+    discord = discord_;
+  }
+  if (discord) {
+    discord->ReplyJoinRequest(user_id, accept);
+  }
+}
+
+void RexNet::LinkDiscordUser(const std::string& user_id, const RexNetPeerId& peer) {
+  std::lock_guard lock(mutex_);
+  discord_user_peers_[user_id] = peer;
 }
 
 void RexNet::DiscordPump() {
@@ -754,15 +915,16 @@ void RexNet::DiscordPump() {
     if (joinable) {
       wanted.joinable = true;
       wanted.party_id = Hex16(*session_id_);
+      wanted.join_secret = JoinSecretLocked();
+      if (slots_total_) {
+        wanted.party_size = static_cast<int>(slots_total_ - slots_open_);
+        wanted.party_max = static_cast<int>(slots_total_);
+      }
     }
   }
   if (!enabled) {
     discord->Close();
     return;
-  }
-  if (wanted.joinable) {
-    // Built outside the lock: JoinSecret takes it.
-    wanted.join_secret = JoinSecret();
   }
   discord->SetActivity(wanted);
   discord->Pump();
@@ -902,6 +1064,7 @@ void RexNet::SetGameConfig(GameConfig config) {
   game_config_ = std::move(config);
   if (game_config_.advertised_title_id) {
     title_id_ = game_config_.advertised_title_id;
+    join_secret_dirty_ = true;
     PushRichLocked();  // re-push presence under the advertised id
   }
   // §17.5: ambient shard is opt-in per title. Applied here rather than at
@@ -984,14 +1147,20 @@ void RexNet::OnGuestProperty(uint32_t property_id, const uint8_t* value, uint32_
   }
 }
 
-void RexNet::AcceptInvite(const InviteInfo& invite) {
+bool RexNet::AcceptInvite(const InviteInfo& invite) {
   {
     std::lock_guard lock(mutex_);
+    if (pending_accept_ && SamePeer(pending_accept_->first, invite.peer) &&
+        pending_accept_->second == invite.session_id) {
+      return false;  // already armed for this host and session
+    }
     pending_accept_ = {invite.peer, invite.session_id};
+    pending_accept_since_ = std::chrono::steady_clock::now();
     accepted_invite_.reset();
     std::erase_if(invites_, [&](const InviteInfo& i) { return SamePeer(i.peer, invite.peer); });
   }
   InviteReply(invite.peer, true);
+  return true;
 }
 
 std::optional<RexNet::AcceptedInvite> RexNet::accepted_invite() {
@@ -1073,14 +1242,46 @@ std::string RexNet::display_name() {
   return display_name_;
 }
 
+namespace {
+
+/// A remembered friend name as friend_names.txt holds it: control characters
+/// (newlines included -- the file is line-oriented) stripped, at most
+/// kFriendNameMax bytes, cut on a UTF-8 boundary.
+constexpr size_t kFriendNameMax = 64;
+/// A line is `<base58 peer id> <name>\n`; peer ids are under 64 characters.
+constexpr size_t kFriendNameLine = 64 + 1 + kFriendNameMax + 2;
+
+std::string SanitizeFriendName(std::string_view name) {
+  std::string out;
+  out.reserve(std::min(name.size(), kFriendNameMax));
+  for (const char c : name) {
+    const auto byte = static_cast<unsigned char>(c);
+    if (byte < 0x20 || byte == 0x7F) {
+      continue;
+    }
+    out.push_back(c);
+  }
+  if (out.size() > kFriendNameMax) {
+    size_t cut = kFriendNameMax;
+    while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80) {
+      --cut;  // never split a multi-byte sequence
+    }
+    out.resize(cut);
+  }
+  return out;
+}
+
+}  // namespace
+
 void RexNet::RememberFriendName(const RexNetPeerId& peer, const std::string& name) {
-  if (name.empty()) {
+  const std::string clean = SanitizeFriendName(name);
+  if (clean.empty()) {
     return;
   }
   uint8_t key[20];
   OnlineKey(peer, key);
   std::lock_guard lock(mutex_);
-  friend_names_[std::string(reinterpret_cast<const char*>(key), 20)] = name;
+  friend_names_[std::string(reinterpret_cast<const char*>(key), 20)] = clean;
   SaveFriendNamesLocked();
 }
 
@@ -1094,7 +1295,9 @@ void RexNet::SetGameTitleName(const std::string& name) {
   PushRichLocked();
 }
 
-// friend_names.txt: one "<base58 peer id> <name>" per line.
+// friend_names.txt: one "<base58 peer id> <name>" per line; the name is
+// sanitized on every path that stores one (SanitizeFriendName), so a newline
+// can never make one entry read as two.
 void RexNet::SaveFriendNamesLocked() {
   const auto path = data_dir_ / "friend_names.txt";
   FILE* f = std::fopen(path.string().c_str(), "wb");
@@ -1118,7 +1321,11 @@ void RexNet::SaveFriendNamesLocked() {
       continue;
     }
     const std::string id = PeerIdString(peer);
-    std::fprintf(f, "%s %s\n", id.c_str(), name.c_str());
+    const std::string clean = SanitizeFriendName(name);
+    if (clean.empty()) {
+      continue;
+    }
+    std::fprintf(f, "%s %s\n", id.c_str(), clean.c_str());
   }
   std::fclose(f);
 }
@@ -1129,9 +1336,17 @@ void RexNet::LoadFriendNamesLocked() {
   if (!f) {
     return;
   }
-  char line[192];
+  char line[kFriendNameLine];
   while (std::fgets(line, sizeof(line), f)) {
     std::string_view view(line);
+    const bool whole = !view.empty() && view.back() == '\n';
+    if (!whole) {
+      // Longer than any line this file writes: skip the rest of it rather
+      // than read its tail as another entry.
+      int c;
+      while ((c = std::fgetc(f)) != EOF && c != '\n') {
+      }
+    }
     while (!view.empty() && (view.back() == '\n' || view.back() == '\r')) {
       view.remove_suffix(1);
     }
@@ -1143,10 +1358,13 @@ void RexNet::LoadFriendNamesLocked() {
     if (!peer) {
       continue;
     }
+    const std::string name = SanitizeFriendName(view.substr(space + 1));
+    if (name.empty()) {
+      continue;
+    }
     uint8_t key[20];
     OnlineKey(*peer, key);
-    friend_names_[std::string(reinterpret_cast<const char*>(key), 20)] =
-        std::string(view.substr(space + 1));
+    friend_names_[std::string(reinterpret_cast<const char*>(key), 20)] = name;
   }
   std::fclose(f);
 }
@@ -1282,7 +1500,8 @@ std::vector<RexNet::Connection> RexNet::SnapshotConnections() {
     conn.virtual_ip = vip;
     conn.peer = peer;
     if (auto it = statuses_.find(vip); it != statuses_.end()) {
-      conn.status = it->second;
+      conn.status = it->second.status;
+      conn.degraded = it->second.degraded;
     }
     uint8_t key[20];
     OnlineKey(peer, key);
@@ -1419,7 +1638,37 @@ void RexNet::Pump() {
   while (rexnet_poll_event(handle_, &event)) {
     HandleEvent(event);
   }
-  DiscordPump();
+  const auto now = std::chrono::steady_clock::now();
+  Housekeep(now);
+  // Discord's IPC is not delivery work: at most 4 Hz, never per event wake.
+  if (now - discord_last_pump_ >= kDiscordPumpInterval) {
+    discord_last_pump_ = now;
+    DiscordPump();
+  }
+}
+
+void RexNet::Housekeep(std::chrono::steady_clock::time_point now) {
+  std::optional<Notice> timed_out;
+  {
+    std::lock_guard lock(mutex_);
+    if (pending_accept_ && now - pending_accept_since_ > kAcceptTimeout) {
+      Notice notice;
+      notice.kind = Notice::Kind::kJoinTimedOut;
+      notice.peer = pending_accept_->first;
+      notice.message = "the host did not answer";
+      timed_out = std::move(notice);
+      pending_accept_.reset();
+    }
+    std::erase_if(join_requests_, [&](const JoinRequestEntry& e) {
+      return now - e.received > kJoinRequestLifetime;
+    });
+    std::erase_if(invites_, [&](const InviteInfo& i) { return now >= i.expires; });
+  }
+  if (timed_out) {
+    REXNET_WARN("join to {}'s session: the host did not answer within {} s",
+                PeerIdString(timed_out->peer), kAcceptTimeout.count());
+    RaiseNotice(std::move(*timed_out));
+  }
 }
 
 void RexNet::HandleEvent(const RexNetEvent& event) {
@@ -1433,7 +1682,7 @@ void RexNet::HandleEvent(const RexNetEvent& event) {
         OnlineKey(event.peer, key);
         control_linked_[std::string(reinterpret_cast<const char*>(key), 20)] = true;
         auto it = statuses_.find(event.virtual_ip);
-        pending = it != statuses_.end() && it->second == ConnectStatus::kPending;
+        pending = it != statuses_.end() && it->second.status == ConnectStatus::kPending;
       }
       // Control connection is up; XNET_CONNECT_STATUS_CONNECTED waits
       // for the game plane, so kick the punch now (§8.4). Also punch
@@ -1447,14 +1696,35 @@ void RexNet::HandleEvent(const RexNetEvent& event) {
     case REXNET_EVENT_PUNCH_RESULT: {
       std::lock_guard lock(mutex_);
       if (auto vip = virtual_ips_.Find(event.peer)) {
-        statuses_[*vip] = event.flag ? ConnectStatus::kConnected : ConnectStatus::kLost;
+        PeerLink& link = statuses_[*vip];
+        if (event.flag) {
+          link = PeerLink{ConnectStatus::kConnected, false};
+        } else if (link.status != ConnectStatus::kConnected) {
+          // A failed punch is not a lost peer: the core follows it with
+          // DEGRADED when the tunnel carries the peer, or DISCONNECTED when
+          // nothing does. Until then the link stays pending.
+          link = PeerLink{ConnectStatus::kPending, false};
+        }
+      }
+      break;
+    }
+    case REXNET_EVENT_DEGRADED: {
+      // The peer is reachable through the control tunnel: CONNECTED, so the
+      // title sends, flagged so the overlay can say which path it is.
+      std::lock_guard lock(mutex_);
+      if (auto vip = virtual_ips_.Find(event.peer)) {
+        statuses_[*vip] = PeerLink{ConnectStatus::kConnected, true};
+        REXNET_INFO("10.77.{}.{} reachable over the tunnel (punch failed)", (*vip >> 8) & 0xFF,
+                    *vip & 0xFF);
+      } else {
+        REXNET_DEBUG("degraded event for a peer without a virtual ip");
       }
       break;
     }
     case REXNET_EVENT_PEER_DISCONNECTED: {
       std::lock_guard lock(mutex_);
       if (auto vip = virtual_ips_.Find(event.peer)) {
-        statuses_[*vip] = ConnectStatus::kLost;
+        statuses_[*vip] = PeerLink{ConnectStatus::kLost, false};
       }
       uint8_t key[20];
       OnlineKey(event.peer, key);
@@ -1487,35 +1757,21 @@ void RexNet::HandleEvent(const RexNetEvent& event) {
         info.note.assign(reinterpret_cast<const char*>(event.data + 1 + name_len),
                          event.data_len - 1 - name_len);
       }
+      info.display_name = SanitizeFriendName(info.display_name);
+      // The name a request carries labels its SENDER and nobody else: it is
+      // keyed by the peer the core says the request came from, never by
+      // anything in the payload.
       uint8_t key[20];
       OnlineKey(event.peer, key);
-      bool joiner = false;
       {
         std::lock_guard lock(mutex_);
         if (!info.display_name.empty()) {
           friend_names_[std::string(reinterpret_cast<const char*>(key), 20)] = info.display_name;
         }
-        // Someone who joined OUR session through an invite we handed out: the
-        // note names the session id, which only the join material carries, so
-        // the request is the invite coming back and needs no answer from the
-        // player.
-        if (session_id_.has_value()) {
-          std::string hex;
-          for (uint8_t byte : *session_id_) {
-            char pair[3];
-            std::snprintf(pair, sizeof(pair), "%02x", byte);
-            hex += pair;
-          }
-          joiner = info.note == "discord:" + hex;
-        }
-        if (!joiner) {
-          friend_requests_.push_back(std::move(info));
-        }
-      }
-      if (joiner) {
-        REXNET_INFO("{} joined our session through an invite; accepting their friend request",
-                    info.display_name.empty() ? PeerIdString(event.peer) : info.display_name);
-        rexnet_friend_accept(handle_, &event.peer);
+        // One pending request per peer; a repeat replaces the older.
+        std::erase_if(friend_requests_,
+                      [&](const FriendRequestInfo& r) { return SamePeer(r.peer, event.peer); });
+        friend_requests_.push_back(std::move(info));
       }
       break;
     }
@@ -1550,6 +1806,7 @@ void RexNet::HandleEvent(const RexNetEvent& event) {
       } else {
         current_shard_.reset();
       }
+      join_secret_dirty_ = true;
       break;
     }
     case REXNET_EVENT_FRIEND_DELIVERED: {
@@ -1571,8 +1828,25 @@ void RexNet::HandleEvent(const RexNetEvent& event) {
       if (event.data_len >= 16) {
         std::memcpy(info.session_id.data(), event.data, 16);
       }
+      info.expires = std::chrono::steady_clock::now() + kInviteLifetime;
       std::lock_guard lock(mutex_);
+      // One pending invite per peer: a newer one replaces the older, which
+      // named a session that may no longer exist.
+      std::erase_if(invites_, [&](const InviteInfo& i) { return SamePeer(i.peer, event.peer); });
       invites_.push_back(std::move(info));
+      break;
+    }
+    case REXNET_EVENT_INVITE_FAILED: {
+      // The invite we sent did not reach the peer (no route, old build, or
+      // they are gone); the title tells the player.
+      std::string why(reinterpret_cast<const char*>(event.data), event.data_len);
+      REXNET_WARN("invite to {} failed{}{}", PeerIdString(event.peer), why.empty() ? "" : ": ",
+                  why);
+      Notice notice;
+      notice.kind = Notice::Kind::kInviteFailed;
+      notice.peer = event.peer;
+      notice.message = why.empty() ? "the invite could not be delivered" : why;
+      RaiseNotice(std::move(notice));
       break;
     }
     case REXNET_EVENT_INVITE_REPLIED:
@@ -1849,13 +2123,21 @@ void RexNet::HandleEvent(const RexNetEvent& event) {
       std::string endpoint(reinterpret_cast<const char*>(event.data), event.data_len);
       REXNET_INFO("public endpoint {} (share for a direct connect)", endpoint);
       std::lock_guard lock(mutex_);
-      public_endpoints_.insert(std::move(endpoint));
+      if (public_endpoints_.insert(std::move(endpoint)).second) {
+        join_secret_dirty_ = true;
+      }
       break;
     }
-    case REXNET_EVENT_ERROR:
-      REXNET_WARN("{}",
-                  std::string_view(reinterpret_cast<const char*>(event.data), event.data_len));
+    case REXNET_EVENT_ERROR: {
+      std::string text(reinterpret_cast<const char*>(event.data), event.data_len);
+      REXNET_WARN("{}", text);
+      Notice notice;
+      notice.kind = Notice::Kind::kError;
+      notice.peer = event.peer;
+      notice.message = std::move(text);
+      RaiseNotice(std::move(notice));
       break;
+    }
     default:
       break;
   }

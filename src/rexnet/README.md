@@ -157,17 +157,119 @@ large_text = "Title name"
 ```
 
 While a local session admits a joiner the activity carries a party and a **join secret**,
-`RexNet::JoinSecret()`: `REXJ2|title|peer|session|shard|endpoint`. A friend who accepts the
-invite gets that secret on their side and `RexNet::JoinFromSecret()` does the whole join:
+`RexNet::JoinSecret()`: `REXJ3|title|peer|session|shard|endpoint|token`. A friend who accepts
+the invite gets that secret on their side and `RexNet::JoinFromSecret()` does the whole join:
 dials the carried public endpoint if there is one, arms the accept so the title's own
-accepted-invite path runs, searches for the host's descriptor, befriends the host with a
-note naming the session (which the host's node accepts without asking), and enters the
-host's title shard by id (`rexnet_shard_join`), so the two are in the same ambient tier
-as well as the same session. "Ask to Join" is approved while the session is joinable.
+accepted-invite path runs (`AcceptInvite`), queries the host's descriptor with the token
+(`rexnet_session_query`) with a DHT search as the fallback, and enters the host's title shard
+by id (`rexnet_shard_join`), so the two are in the same ambient tier as well as the same
+session. A join makes nobody a friend: friendship stays the players' own decision. The secret
+is cached and rebuilt only when one of its inputs changes.
 
 The host may state the two lines live (`RexNet::SetDiscordActivity`, the player's whereabouts
 for instance) and turn presence off as a player setting (`SetDiscordEnabled`); otherwise the
-config defaults stand and joinable means "a local session exists".
+config defaults stand and joinable means "a local session exists". Discord's IPC is pumped at
+most four times a second from the event pump, never per event wake, over a non-blocking socket
+with a bounded outbox; PING is answered, a CLOSE drops the connection, and a handshake Discord
+refuses (an application id it does not know) backs the reconnect off 15 s -> 60 s -> 300 s.
+
+### The join token
+
+`SessionCreate` draws a random 64-bit **join token** (`std::random_device` seeding
+`mt19937_64`) and hands it to the core (`rexnet_session_set_join_token`; `SessionDelete` clears
+it). It is the proof that join material came from the host: the core serves a private
+session's descriptor only to a `rexnet_session_query` carrying the current token, so the peer
+id and session id alone -- visible to anyone the host ever played with -- no longer open a
+private game. `JoinFromSecret` accepts three forms:
+
+| Form | Fields | Token |
+|---|---|---|
+| `REXJ3` | `REXJ3\|title\|peer\|session\|shard\|endpoint\|token` (token = 16 hex digits) | carried |
+| `REXJ2` | `REXJ2\|title\|peer\|session\|shard\|endpoint` | 0 (public sessions only) |
+| first cut | `peer\|title\|session` | 0 (public sessions only) |
+
+`RexNet::join_token()` reads the current one (0 = none).
+
+The core's admission rule, exactly: a **public** session's descriptor is served to any
+querier; a **private** one only to a peer the host invited (`rexnet_send_invite` records it)
+or one whose query carries the current token. The right token admits the peer for good --
+its later queries and its join need no token -- and the admitted set is cleared with the
+session, on create as on delete. A private session's id never rides the shard beat; only a
+public one is announced to the ambient tier. The query from a build without the token field
+still parses as "no token".
+
+### Ask to Join: the policy is the title's
+
+`RexNet::SetJoinRequestPolicy(JoinRequestPolicy)` says who gets through Discord's "Ask to
+Join" without the host's say-so; the default is **Ask**.
+
+- `Ask` -- every request is queued. The title drains them with `TakeJoinRequests()`
+  (`{user_id, user_name}` as Discord named them) and answers with
+  `ReplyJoinRequest(user_id, accept)`: accept sends `SEND_ACTIVITY_JOIN_INVITE`, decline
+  `CLOSE_ACTIVITY_REQUEST`. A request unanswered for 60 s is dropped silently; Discord's own
+  timeout is shorter, so there is nobody left to answer.
+- `Friends` -- a Discord user the title has linked to a RexNet friend
+  (`LinkDiscordUser(user_id, peer)`) is approved at once; anyone else is queued as under Ask.
+  RexNet keeps only the map; where the link comes from (an account link, a profile) is the
+  title's knowledge.
+- `All` -- approved while the session admits a joiner.
+
+Whatever the policy, nothing is approved while the session is not joinable.
+
+### One accept at a time, and a timeout
+
+`AcceptInvite` (which every join path goes through: a received invite, an uninvited join to
+a friend's session, Discord's Join, pasted material) arms one pending accept per host and
+session. A repeat for the same host and session while one is pending returns false and is not
+re-armed, so a second press or a second Discord Join cannot run the title's join twice. A host
+that never answers times out after 20 s: the pending accept is cleared and the title hears it
+as a notice.
+
+### Notices
+
+Errors the player should see go through one path: `SetNoticeSink` (called from the pump
+thread) and `TakeNotices()` for titles that poll. `Notice::Kind` is `kError` (the core's
+`REXNET_EVENT_ERROR` text), `kInviteFailed` (`REXNET_EVENT_INVITE_FAILED`: the invite to
+`peer` did not land) or `kJoinTimedOut` (the host named by `peer` did not answer the accept).
+Received invites are one per peer (a newer one replaces the older) and expire five minutes
+after receipt.
+
+### Slots
+
+`SetSessionSlots(open, total)` states the local session's occupancy to the core
+(`rexnet_session_set_slots`): it is what the descriptor advertises and what Discord shows as
+the party size. RexNet never sees the title's join and leave calls -- they are XGI messages the
+kernel layer handles -- so the XGI shim or the title calls this after each change; nothing is
+inferred.
+
+### DEGRADED means connected over the tunnel
+
+`REXNET_EVENT_DEGRADED` says the punch failed and the peer is reachable through the control
+tunnel. The shim marks that peer `kConnected` with `PeerLink::degraded` set (visible as
+`Connection::degraded` and "connected (tunnel)" in the F6 overlay), so a title that gates its
+sends on `XNET_CONNECT_STATUS_CONNECTED` (XRNM) sends and the core carries the datagrams over
+the tunnel. A failed punch on its own leaves the link **pending**, never lost: the core follows
+it with DEGRADED when the tunnel carries the peer or `PEER_DISCONNECTED` when nothing does.
+A tunnelled peer whose control connection blips is resumed on the tunnel the moment the
+connection is back (DEGRADED again, no second punch), and the recovery grace outlasts a punch
+so a re-punched peer is never reported gone while its punch is still resolving. The core never
+tunnels to a peer it holds no control connection to: there is nothing to carry it.
+
+### Datagram size
+
+`REXNET_EVENT_DATA_MAX` (1472) is the contract both ways. A guest datagram larger than that is
+dropped at the sender and, should one arrive, at the receiver -- counted (`oversized_drops` in
+the shard status line), never truncated into something the title would misparse. Guest TCP
+reads are chunked to fit an event with their stream id.
+
+### Shard membership and addresses
+
+Membership is pruned: a member leaves the table on gossipsub unsubscribe, on departure
+(connection gone and recovery exhausted), or after 95 s without a beat or descriptor. While a
+**session is up** -- a local session, a peer in one with us by invite, or title traffic in the
+last 20 s -- no address moves: a member arriving or leaving mid-game is placed beside, or
+removed from, the pinned host table, and the full re-derivation waits until the session is
+over. A warmed or tunnelled game plane carrying nothing is not a session and pins nothing.
 
 ## Reachability, recovery and hygiene (from the original-Xbox fork review, 2026-10-07)
 

@@ -25,13 +25,20 @@ namespace rex::net {
 /// join secret. The secret is RexNet's own join material (`RexNet::JoinSecret`),
 /// so a Discord "Join" lands as `RexNet::JoinFromSecret` on the other machine.
 ///
-/// Every frame is a little-endian opcode and length followed by JSON. Reads are
-/// non-blocking and happen from `Pump`, which the owner calls from its own pump
-/// thread; `SetActivity` may be called from any thread.
+/// Every frame is a little-endian opcode and length followed by JSON. The
+/// socket is non-blocking in both directions: reads drain what is there, and
+/// writes go through a bounded outbox flushed as the socket accepts them, so
+/// `Pump` never waits on Discord. `Pump` is called from the owner's pump
+/// thread; `SetActivity` and `ReplyJoinRequest` may be called from any thread
+/// and take effect on the next pump. PING is answered with PONG and a CLOSE
+/// from Discord drops the connection.
 ///
 /// Discord not running is the ordinary case and is silent; a connection that
-/// drops is retried on the usual cadence. Nothing here depends on the title: the
-/// application id and the two default lines come from the title's rexnet.toml.
+/// drops is retried every 15 s. A handshake Discord refuses (an application id
+/// it does not know) backs off 15 s -> 60 s -> 300 s, and only the first
+/// refusal and the first close are logged above debug. Nothing here depends on
+/// the title: the application id and the two default lines come from the
+/// title's rexnet.toml.
 class DiscordPresence {
  public:
   struct Activity {
@@ -49,8 +56,11 @@ class DiscordPresence {
   struct Callbacks {
     /// The player accepted an invite: the secret the host advertised.
     std::function<void(const std::string& secret)> on_join;
-    /// Someone asked to join: answer true to send them the invite.
-    std::function<bool(const std::string& user_id, const std::string& user_name)> on_join_request;
+    /// Someone asked to join. true sends them the invite now, false closes the
+    /// request now, nullopt leaves it open for the owner to answer later with
+    /// ReplyJoinRequest. No callback = closed.
+    std::function<std::optional<bool>(const std::string& user_id, const std::string& user_name)>
+        on_join_request;
   };
 
   struct Assets {
@@ -69,6 +79,10 @@ class DiscordPresence {
   void Pump();
   /// Clears the activity and closes the connection.
   void Close();
+  /// Answer an open Ask to Join: accept = SEND_ACTIVITY_JOIN_INVITE, decline =
+  /// CLOSE_ACTIVITY_REQUEST. Queued and sent on the next pump while connected;
+  /// dropped if the connection is down (Discord has already timed it out).
+  void ReplyJoinRequest(const std::string& user_id, bool accept);
 
   bool connected() const { return state_ == State::kReady; }
 
@@ -79,32 +93,62 @@ class DiscordPresence {
   bool OpenEndpoint(const std::string& endpoint);
   static std::vector<std::string> Endpoints();
   void Drop();
+  /// Queue one frame in the outbox and flush what the socket takes.
   bool WriteFrame(uint32_t op, const std::string& json);
+  /// Push outbox bytes until the socket would block; false = connection gone.
+  bool FlushOutbox();
+  /// Read what is there without waiting, then dispatch whole frames by opcode.
   void ReadAvailable();
+  void DispatchInbox();
   void HandleFrame(const std::string& json);
   void HandleFrameChecked(const std::string& json);
   void PumpChecked();
   bool SendCommand(const std::string& json);
   std::string BuildSetActivity(const Activity& activity) const;
   void ApplyWanted();
+  void SendPendingReplies();
+  /// The handshake was refused: lengthen the retry interval one step.
+  void BackOff();
 
   std::string application_id_;
   Assets assets_;
   Callbacks callbacks_;
   int64_t started_unix_ = 0;
 
-  mutable std::mutex mutex_;
+  mutable std::mutex mutex_;  // wanted_ and pending_replies_: any thread
   Activity wanted_;
+  struct Reply {
+    std::string user_id;
+    bool accept = false;
+  };
+  std::vector<Reply> pending_replies_;
   Activity shown_;
   bool shown_valid_ = false;
 
   State state_ = State::kDisconnected;
   std::chrono::steady_clock::time_point last_attempt_{};
   std::chrono::steady_clock::time_point handshake_started_{};
+  /// Current reconnect interval: 15 s, lengthened by each refused handshake
+  /// (BackOff), reset by a READY.
+  std::chrono::seconds retry_interval_{15};
+  /// Logged once at info, then at debug, until a READY resets them.
+  bool refusal_logged_ = false;
+  bool close_logged_ = false;
   std::string endpoint_;
   std::vector<uint8_t> inbox_;
+  /// Bytes the socket has not taken yet (kMaxOutbox bounds it; past that the
+  /// connection is dropped rather than the game thread held).
+  std::vector<uint8_t> outbox_;
 #if defined(_WIN32)
-  void* pipe_ = nullptr;  // HANDLE
+  void* pipe_ = nullptr;  // HANDLE, opened overlapped
+  /// One overlapped write in flight at a time: `write_buffer_` holds the
+  /// bytes handed to the kernel and is not touched until it completes, so
+  /// `outbox_` may grow meanwhile. The OVERLAPPED blocks live on the heap so
+  /// windows.h stays out of this header.
+  void* write_overlapped_ = nullptr;  // OVERLAPPED*, owns its hEvent
+  void* read_overlapped_ = nullptr;   // OVERLAPPED*, owns its hEvent
+  bool write_pending_ = false;
+  std::vector<uint8_t> write_buffer_;
 #else
   int fd_ = -1;
 #endif

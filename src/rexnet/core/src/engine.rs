@@ -53,7 +53,7 @@ use crate::shard::{self, Candidate, Migration, Placement, ShardDesc, DEFAULT_SHA
 use crate::subnet;
 use crate::tcp::{StreamHeader, StreamId, StreamInfo, StreamTable, STREAM_HEADER_LEN, STREAM_SCHEMA};
 use crate::crypto::{self, LocalKeyAgreement};
-use crate::game_plane::{Emitter, GamePlane};
+use crate::game_plane::{now_micros, Emitter, GamePlane};
 use crate::tunnel;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -119,19 +119,45 @@ fn multiaddr_is_global(addr: &Multiaddr) -> bool {
     false
 }
 
-/// Game-plane frame types (first byte on the game socket).
 /// Smallest RTT change worth telling the shim about; below this it is noise.
 const RTT_REPORT_DELTA_MS: u32 = 5;
 
 /// `[type][nonce 16][echo 8]`.
 const PROBE_FRAME_LEN: usize = 25;
 
-/// Microseconds since the process started. Only ever compared with itself.
-fn now_micros() -> u64 {
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_micros() as u64
+/// Once per key per window, for diagnostics that would otherwise fire per
+/// packet. Keys are forgotten once their window has passed, so the table is
+/// bounded by what is actually being complained about.
+struct WarnLimiter<K> {
+    window: Duration,
+    last: HashMap<K, Instant>,
 }
 
+impl<K: std::hash::Hash + Eq + Copy> WarnLimiter<K> {
+    fn new(window: Duration) -> Self {
+        Self { window, last: HashMap::new() }
+    }
+
+    fn allow(&mut self, key: K) -> bool {
+        let now = Instant::now();
+        if self.last.len() >= 256 {
+            let window = self.window;
+            self.last.retain(|_, at| now.saturating_duration_since(*at) < window);
+        }
+        match self.last.get(&key) {
+            Some(at) if now.saturating_duration_since(*at) < self.window => false,
+            _ => {
+                self.last.insert(key, now);
+                true
+            }
+        }
+    }
+}
+
+/// Window of the per-packet warnings (unknown virtual IP, no keys).
+const PACKET_WARN_WINDOW: Duration = Duration::from_secs(10);
+
+/// Game-plane frame types (first byte on the game socket).
 pub const FRAME_DATA: u8 = 0x01;
 const FRAME_PROBE: u8 = 0x02;
 const FRAME_PROBE_ACK: u8 = 0x03;
@@ -189,12 +215,30 @@ const SHARD_WARM_CONNECT_LIMIT: usize = 24;
 /// How long an invite may wait for its peer to become reachable. An invite
 /// that finally lands minutes after the user asked is worse than none: they
 /// have moved on, and the session it names may be gone. Matches the 5 minute
-/// expiry carried in the invite itself.
+/// expiry carried in the invite itself. Also bounds a queued Decline, and how
+/// long an accepted invite counts as a session before title traffic has to
+/// speak for itself.
 const INVITE_DEFER_MAX: Duration = Duration::from_secs(300);
+/// Delivery attempts for one invite before the host is told it failed: the
+/// first send, and one re-queue for the next connection.
+const INVITE_ATTEMPTS: u8 = 2;
+/// A peer that exchanged a title datagram with us this recently is in a
+/// session with us, whatever the control plane thinks. Generous against
+/// titles that heartbeat slowly; short enough that a finished game frees
+/// the addresses within the minute.
+const TITLE_TRAFFIC_WINDOW: Duration = Duration::from_secs(20);
+/// A shard member that has not been heard on the topic (beat or descriptor)
+/// for this long is gone: three beats missed, with slack for gossip delay.
+const SHARD_MEMBER_TIMEOUT: Duration = Duration::from_secs(95);
 /// Friends and peers we owe a message are looked up in the DHT and dialled on
-/// this backoff while they stay away: first after 30 s, doubling to 10 min.
+/// this backoff while they stay away: first after 30 s, doubling to 10 min,
+/// with +-20 % jitter so a population does not retry in lockstep.
 const PEER_LOOKUP_FIRST: Duration = Duration::from_secs(30);
 const PEER_LOOKUP_MAX: Duration = Duration::from_secs(600);
+const RETRY_JITTER: f64 = 0.2;
+/// Sources whose frames are held before they map to a peer. Bounds what an
+/// unmapped sender -- or a flood of them -- can make us hold.
+const ORPHAN_SOURCES_MAX: usize = 64;
 /// Our own reachability record (`protocol::peer_key`) is published at each
 /// heartbeat until a DHT node stores it, then refreshed every ten minutes so
 /// new addresses and lost stores recover (kad's own republish is 12 h).
@@ -206,7 +250,10 @@ const GAME_PORT_LEASE: Duration = Duration::from_secs(3600);
 /// A game peer whose last control connection dropped is given this long to
 /// come back before the title is told it left: the title's own timeouts are
 /// longer, and a QUIC path that died often has a TCP or relay path alive.
-const PEER_RECOVERY_GRACE: Duration = Duration::from_secs(5);
+/// Longer than a punch can take to resolve, so a peer whose connection
+/// returns late in the grace still gets its game path back (punched or
+/// tunnelled) before the title hears it left.
+const PEER_RECOVERY_GRACE: Duration = Duration::from_secs(8);
 const PEER_RECOVERY_TICK: Duration = Duration::from_millis(250);
 const PEER_RECOVERY_RETRY: Duration = Duration::from_secs(1);
 /// After a direct QUIC path failed, other routes to that peer are tried first
@@ -228,6 +275,18 @@ struct PeerRecovery {
     started: Instant,
     next_dial: Instant,
     looked_up: bool,
+    /// The peer rode the tunnel when its connection dropped. Its punch
+    /// failed once already, so the reconnect goes straight back to the
+    /// tunnel instead of waiting out a second failure.
+    tunneled: bool,
+}
+
+/// An invite (offer or reply) held for a connection, with how many sends it
+/// has already survived.
+struct PendingInvite {
+    msg: InviteMsg,
+    queued: Instant,
+    attempts: u8,
 }
 
 fn direct_quic(addr: &Multiaddr) -> bool {
@@ -314,9 +373,11 @@ fn reconnect_routes(routes: Option<&PeerRoutes>, now: Instant) -> Vec<Multiaddr>
     addresses.sort_by_key(route_priority);
     addresses
 }
-/// How often a peer still owed a friend message is dialled and looked up again.
-/// Short enough that a friend who comes online is reached within a few of the
-/// shard sweeps that find them; the retries are quiet, so the cost is a dial.
+/// How often the deferred-message queues (friend messages, invites) are
+/// swept. This is only the polling cadence: a peer that stays away is
+/// dialled and looked up on the `PEER_LOOKUP_FIRST`..`PEER_LOOKUP_MAX`
+/// backoff, so its first retry comes 30 s (+-20 %) after the first failure,
+/// not 15 s. The sweep itself is quiet; what it does cost is a dial.
 const FRIEND_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 /// A friend message may ride a relayed connection that has to be set up first
 /// (reservation, circuit, noise); the library's 10 s covered a warm LAN dial.
@@ -347,6 +408,12 @@ const PUNCH_TIMEOUT: Duration = Duration::from_secs(6);
 const _: () = assert!(
     PUNCH_QUEUE_MAX_AGE.as_secs() > PUNCH_TIMEOUT.as_secs(),
     "queued datagrams must outlive the punch timeout"
+);
+// Invariant: a reconnect inside the grace re-punches, and that punch must be
+// allowed to resolve (succeed or fall back) before recovery gives up.
+const _: () = assert!(
+    PEER_RECOVERY_GRACE.as_secs() > PUNCH_TIMEOUT.as_secs(),
+    "recovery grace must outlast a punch by at least a second"
 );
 /// How often to check for punches that have run out of time.
 const PUNCH_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -394,11 +461,17 @@ pub enum Command {
     /// sessions additionally publish a DHT provider record (§10).
     SessionCreate { id: [u8; 16], slots_total: u8, slots_open: u8, is_public: bool },
     SessionDelete,
+    /// Set the local session's join token (0 = none): a query carrying it is
+    /// served a private descriptor and its sender is remembered as invited.
+    SessionSetJoinToken { token: u64 },
+    /// Update the slots served in the local descriptor.
+    SessionSetSlots { open: u32, total: u32 },
     /// Find public sessions for our title via DHT provider records, then
     /// query each advertiser; results arrive as [`Event::SessionFound`].
     SessionSearch,
-    /// Ask one peer for its session descriptor.
-    SessionQuery { peer: PeerId },
+    /// Ask one peer for its session descriptor, presenting `token` (0 =
+    /// none) for a private one.
+    SessionQuery { peer: PeerId, token: u64 },
     /// Opt in to the ambient title shard (§17.3, §17.5). Idempotent; a cap of
     /// 0 means the spec default.
     ShardEnable { cap: u16 },
@@ -448,6 +521,10 @@ pub enum Event {
     InviteReceived { peer: PeerId, title_id: u32, session_id: [u8; 16] },
     /// reply: 1 = accepted, 0 = declined.
     InviteReplied { peer: PeerId, reply: u8 },
+    /// An invite or reply to `peer` was not delivered after its retry, or
+    /// waited out INVITE_DEFER_MAX. The host must hear it: nothing else says
+    /// the invitee never saw the invite.
+    InviteFailed { peer: PeerId, message: String },
     PunchResult { peer: PeerId, ok: bool },
     SessionFound {
         host: PeerId,
@@ -547,6 +624,10 @@ struct EchoPayload(Vec<u8>);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionQuery {
     schema: u8, // = 1
+    /// The host's join token, 0 for none. Defaulted on decode so a query
+    /// from a build without the field still parses as "no token".
+    #[serde(default)]
+    token: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -564,6 +645,9 @@ struct LocalSession {
     slots_total: u8,
     slots_open: u8,
     is_public: bool,
+    /// Admits a querier to a private descriptor; 0 = none. Lives and dies
+    /// with the session.
+    join_token: u64,
 }
 
 /// §8.1 presence, pushed over `/rexnet/presence/1.0.0` to mutual friends
@@ -642,7 +726,9 @@ struct ShardBeat {
     /// Per-title ambient KVs -- orb positions and the like. Opaque to core.
     rich: Vec<u8>,
     /// Set when hosting something joinable, so shard members can join in
-    /// progress without first becoming friends.
+    /// progress without first becoming friends. Public sessions only: a
+    /// private session is the host's to hand out, and the beat reaches the
+    /// whole shard.
     session_id: Option<[u8; 16]>,
 }
 
@@ -695,9 +781,11 @@ enum StreamEvent {
     ConnectFailed { peer: PeerId, dst_port: u16, error: String },
 }
 
-/// Largest guest read handed over in one event; keeps a chatty stream from
-/// producing unbounded event payloads.
-const STREAM_READ_CHUNK: usize = 4096;
+/// Largest guest read handed over in one event: the event payload less the
+/// 8-byte stream id that prefixes it. A larger read would be truncated by
+/// the fixed event, silently losing stream bytes; a smaller one just means
+/// more events.
+const STREAM_READ_CHUNK: usize = crate::ffi::REXNET_EVENT_DATA_MAX - 8;
 
 /// Drive one guest connection: header already exchanged, now shuttle bytes
 /// until either side closes.
@@ -1206,9 +1294,12 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             },
             announced_vip: None,
             invited: HashSet::new(),
+            session_peers: HashMap::new(),
             pending_invites: HashMap::new(),
+            inflight_invites: HashMap::new(),
             pending_friend_msgs: HashMap::new(),
             inflight_friend: HashMap::new(),
+            unsupported_reported: HashSet::new(),
             peer_lookups: HashMap::new(),
             own_key_query: None,
             own_key_at: None,
@@ -1232,6 +1323,9 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             pending_shard_search: None,
             pending_shard_queries: HashMap::new(),
             shard_member_peers: HashSet::new(),
+            shard_member_heard: HashMap::new(),
+            shard_hosts: std::collections::BTreeMap::new(),
+            readdress_deferred: false,
             shard_reachable_attempted: HashSet::new(),
             shard_swept_at: None,
             last_shard_move: None,
@@ -1265,6 +1359,8 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             pending_punch_offers: HashMap::new(),
             pending_find: HashMap::new(),
             pending_echo: HashMap::new(),
+            unknown_vip_warns: WarnLimiter::new(PACKET_WARN_WINDOW),
+            no_keys_warns: WarnLimiter::new(PACKET_WARN_WINDOW),
         }
         .run(cmd_rx, game_rx, stream_rx, tunnel_rx),
     );
@@ -1296,14 +1392,23 @@ struct Engine {
     my_presence: PresenceMsg,
     /// Last address handed to the shim, so re-announcing is free.
     announced_vip: Option<u32>,
-    /// Peers we invited to the current session; they may fetch its
-    /// descriptor even when the session is private.
+    /// Peers admitted to the current session's descriptor even when it is
+    /// private: those we invited, and those whose query carried the join
+    /// token. Cleared with the session, both on create and delete.
     invited: HashSet<PeerId>,
+    /// Peers in a session with us by invite -- ours they accepted, or theirs
+    /// we accepted -- and when. Counts toward `game_in_progress` for
+    /// INVITE_DEFER_MAX; after that title traffic has to speak for itself.
+    session_peers: HashMap<PeerId, Instant>,
     /// Invites waiting for a connection. An invite is usually the *first*
     /// thing we ever send a peer, so at that moment there is frequently no
     /// connection and often no known address either -- sending blind meant
     /// the first invite reliably failed and the user had to try twice.
-    pending_invites: HashMap<PeerId, (InviteMsg, Instant)>,
+    /// Replies take the same path: the inviter's connection may have gone
+    /// while the human decided.
+    pending_invites: HashMap<PeerId, PendingInvite>,
+    /// Invites in flight, so a failure can re-queue once and then be told.
+    inflight_invites: HashMap<OutboundRequestId, (PeerId, PendingInvite)>,
     /// Friend messages waiting for a connection, exactly as invites
     /// wait above. A friend request is the FIRST thing we ever send a peer -- a
     /// friend code carries a key and a name, no address -- so sending it blind
@@ -1314,6 +1419,9 @@ struct Engine {
     /// Friend messages in flight, so an outbound failure can put the
     /// message back in the queue instead of losing it.
     inflight_friend: HashMap<OutboundRequestId, (PeerId, FriendMsg)>,
+    /// (peer, protocol) pairs already reported as an older build, so the
+    /// player hears it once and not on every retry.
+    unsupported_reported: HashSet<(PeerId, &'static str)>,
     /// DHT lookups for one peer's own reachability record, by query.
     peer_lookups: HashMap<kad::QueryId, PeerId>,
     /// The publish of our own record in flight, and when one last stuck.
@@ -1363,7 +1471,19 @@ struct Engine {
     pending_shard_queries: HashMap<OutboundRequestId, PeerId>,
     /// Peer ids heard on our shard topic. Larger than the gossipsub mesh:
     /// these are everyone in the shard, not just who we relay through.
+    /// Pruned on unsubscribe, departure, and SHARD_MEMBER_TIMEOUT silence.
     shard_member_peers: HashSet<PeerId>,
+    /// When each member was last heard (beat or descriptor), for the prune.
+    shard_member_heard: HashMap<PeerId, Instant>,
+    /// The shard's host table, ourselves included: rebuilt from the whole
+    /// membership by `readdress_all`, extended one newcomer at a time
+    /// without moving anyone while a game is up. Every shard address is
+    /// read from here, never re-derived on the spot, so a membership change
+    /// can only move an address when this table is rebuilt.
+    shard_hosts: std::collections::BTreeMap<PeerId, u8>,
+    /// Membership changed while addresses were pinned by a game; the full
+    /// table is rebuilt once no game is in progress.
+    readdress_deferred: bool,
     /// Shard members we have already tried to make reachable, so a 30 s
     /// heartbeat does not re-dial or re-query them every time.
     shard_reachable_attempted: HashSet<PeerId>,
@@ -1450,6 +1570,10 @@ struct Engine {
 
     pending_find: HashMap<kad::QueryId, (PeerId, oneshot::Sender<Result<Vec<Multiaddr>, String>>)>,
     pending_echo: HashMap<OutboundRequestId, (Instant, oneshot::Sender<Result<Duration, String>>)>,
+
+    /// Per-packet complaints, said once per address per PACKET_WARN_WINDOW.
+    unknown_vip_warns: WarnLimiter<u32>,
+    no_keys_warns: WarnLimiter<PeerId>,
 }
 
 impl Engine {
@@ -1484,13 +1608,26 @@ impl Engine {
         }
         self.announce_local_address();
 
-        let mut heartbeat = tokio::time::interval(PRESENCE_HEARTBEAT);
-        let mut shard_rescan = tokio::time::interval(SHARD_RESCAN_INTERVAL);
-        let mut punch_watchdog = tokio::time::interval(PUNCH_WATCHDOG_INTERVAL);
-        let mut shard_status = tokio::time::interval(SHARD_STATUS_INTERVAL);
-        let mut relay_check = tokio::time::interval(RELAY_RETRY_INTERVAL);
-        let mut friend_retry = tokio::time::interval(FRIEND_RETRY_INTERVAL);
-        let mut recovery_tick = tokio::time::interval(PEER_RECOVERY_TICK);
+        // Every timer starts one period out. A `tokio::time::interval` fires
+        // at once, and seven of them firing together at startup -- before a
+        // single connection or DHT answer exists -- was a burst of work that
+        // could only fail. The one exception is the relay check: a NAT'd
+        // node wants a mesh relay early, and ten seconds is enough for the
+        // kad bootstrap to have something to answer with.
+        let now = tokio::time::Instant::now();
+        let mut heartbeat = tokio::time::interval_at(now + PRESENCE_HEARTBEAT, PRESENCE_HEARTBEAT);
+        let mut shard_rescan =
+            tokio::time::interval_at(now + SHARD_RESCAN_INTERVAL, SHARD_RESCAN_INTERVAL);
+        let mut punch_watchdog =
+            tokio::time::interval_at(now + PUNCH_WATCHDOG_INTERVAL, PUNCH_WATCHDOG_INTERVAL);
+        let mut shard_status =
+            tokio::time::interval_at(now + SHARD_STATUS_INTERVAL, SHARD_STATUS_INTERVAL);
+        let mut relay_check =
+            tokio::time::interval_at(now + Duration::from_secs(10), RELAY_RETRY_INTERVAL);
+        let mut friend_retry =
+            tokio::time::interval_at(now + FRIEND_RETRY_INTERVAL, FRIEND_RETRY_INTERVAL);
+        let mut recovery_tick =
+            tokio::time::interval_at(now + PEER_RECOVERY_TICK, PEER_RECOVERY_TICK);
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
@@ -1508,9 +1645,9 @@ impl Engine {
                     self.shard_beat();
                     self.publish_own_key();
                 }
-                _ = friend_retry.tick() => self.friend_retry(),
+                _ = friend_retry.tick() => self.retry_deferred_messages(),
                 _ = recovery_tick.tick() => self.maintain_recoveries(),
-                _ = punch_watchdog.tick() => self.check_punch_deadlines(),
+                _ = punch_watchdog.tick() => self.watchdog(),
                 _ = shard_status.tick() => self.log_shard_status(),
                 _ = relay_check.tick() => {
                     self.retry_dead_relays();
@@ -1615,19 +1752,30 @@ impl Engine {
         self.friend_seek(peer);
     }
 
-    /// Every way we have of reaching a peer we hold no address for --
-    /// a dial over whatever kad, mdns or identify already know, a DHT peer lookup,
-    /// and a shard sweep, since another Fable II player publishes a shard provider
-    /// record that carries their addresses.
+    /// Every way we have of reaching a peer we hold no address for -- a
+    /// dial over whatever kad, mdns or identify already know, a DHT peer
+    /// lookup, and a shard sweep, since another player of the same title
+    /// publishes a shard provider record that carries their addresses.
+    ///
+    /// Never marks the peer wanted: this runs on every background retry, and
+    /// a dial failure here is the normal state of a friend who is offline,
+    /// not an error the player should see each time. Delivery is reported
+    /// when it happens (FriendDelivered).
     fn friend_seek(&mut self, peer: PeerId) {
-        self.wanted_peers.insert(peer);
-        if let Err(err) = self.swarm.dial(peer) {
-            tracing::debug!(%peer, %err, "friend dial failed; trying DHT");
-        }
-        self.lookup_peer(peer);
+        self.seek_peer(peer);
         if self.shard_enabled && self.pending_shard_search.is_none() {
             self.shard_discover();
         }
+    }
+
+    /// Dial on what is known and look the peer up both ways: its own
+    /// reachability record and the closest-peers walk.
+    fn seek_peer(&mut self, peer: PeerId) {
+        if let Err(err) = self.swarm.dial(peer) {
+            tracing::debug!(%peer, %err, "dial failed; trying DHT");
+        }
+        self.lookup_peer(peer);
+        self.swarm.behaviour_mut().kad.get_closest_peers(peer);
     }
 
     /// Find one peer's addresses through its own reachability record. One
@@ -1656,33 +1804,124 @@ impl Engine {
         }
     }
 
-    /// Every FRIEND_RETRY_INTERVAL, try again for every peer still owed a friend
-    /// message. Quiet retries: not marked wanted, so a peer that is simply
-    /// offline does not raise an error each time.
-    fn friend_retry(&mut self) {
+    /// Every FRIEND_RETRY_INTERVAL: expire what has waited too long, send
+    /// what can be sent now, and go looking for the rest. Quiet retries: no
+    /// peer is marked wanted, so one that is simply offline raises no error.
+    fn retry_deferred_messages(&mut self) {
+        let now = Instant::now();
+        // A Decline that could not be delivered in INVITE_DEFER_MAX is not
+        // worth delivering: the requester has long since stopped waiting.
+        self.pending_friend_msgs.retain(|peer, (msg, queued)| {
+            let expired = matches!(msg, FriendMsg::Decline { .. })
+                && now.saturating_duration_since(*queued) > INVITE_DEFER_MAX;
+            if expired {
+                tracing::debug!(%peer, "undeliverable friend decline expired");
+            }
+            !expired
+        });
+        // An invite that waited out its deferral is a failure the host hears.
+        let stale: Vec<PeerId> = self
+            .pending_invites
+            .iter()
+            .filter(|(_, pending)| now.saturating_duration_since(pending.queued) > INVITE_DEFER_MAX)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in stale {
+            self.pending_invites.remove(&peer);
+            self.invite_failed(peer, "peer did not become reachable in time");
+        }
+
+        // Connected peers with a message queued and nothing in flight: the
+        // message was put back by a failure while the connection stayed up,
+        // and nothing else would send it until the peer reconnected.
+        let inflight_friend: HashSet<PeerId> =
+            self.inflight_friend.values().map(|(peer, _)| *peer).collect();
+        let sendable: Vec<PeerId> = self
+            .pending_friend_msgs
+            .keys()
+            .filter(|peer| self.connected.contains(peer) && !inflight_friend.contains(peer))
+            .copied()
+            .collect();
+        for peer in sendable {
+            if let Some((msg, _)) = self.pending_friend_msgs.remove(&peer) {
+                tracing::debug!(%peer, "re-sending queued friend message on the live connection");
+                let id = self.swarm.behaviour_mut().friend.send_request(&peer, msg.clone());
+                self.inflight_friend.insert(id, (peer, msg));
+            }
+        }
+        let inflight_invite: HashSet<PeerId> =
+            self.inflight_invites.values().map(|(peer, _)| *peer).collect();
+        let sendable: Vec<PeerId> = self
+            .pending_invites
+            .keys()
+            .filter(|peer| self.connected.contains(peer) && !inflight_invite.contains(peer))
+            .copied()
+            .collect();
+        for peer in sendable {
+            if let Some(pending) = self.pending_invites.remove(&peer) {
+                self.send_invite_now(peer, pending);
+            }
+        }
+
         // Friends we are not connected to as well as peers owed a message: a
         // friend who comes back online is found the same way a stranger is.
-        let now = Instant::now();
         let mut waiting: HashSet<PeerId> = self.pending_friend_msgs.keys().copied().collect();
+        waiting.extend(self.pending_invites.keys().copied());
         waiting.extend(self.friend_store.friends().copied());
         waiting.retain(|peer| !self.connected.contains(peer));
         for peer in waiting {
             if !retry_due(&mut self.lookup_retry_at, peer, now, PEER_LOOKUP_FIRST, PEER_LOOKUP_MAX) {
                 continue;
             }
-            tracing::info!(%peer, "looking up peer");
-            if let Err(err) = self.swarm.dial(peer) {
-                tracing::debug!(%peer, %err, "retry dial failed");
-            }
-            self.lookup_peer(peer);
+            tracing::debug!(%peer, "looking up peer");
+            self.seek_peer(peer);
         }
         let keep: HashSet<PeerId> = self
             .pending_friend_msgs
             .keys()
+            .chain(self.pending_invites.keys())
             .chain(self.friend_store.friends())
             .copied()
             .collect();
         self.lookup_retry_at.retain(|peer, _| keep.contains(peer));
+    }
+
+    /// Hand an invite (offer or reply) to the connection now, or hold it
+    /// for the next one. One path for both directions: the inviter's
+    /// connection can be gone by the time the human has answered, and a
+    /// reply sent blind then was lost exactly as the first offer used to be.
+    fn invite_send(&mut self, peer: PeerId, msg: InviteMsg) {
+        let pending = PendingInvite { msg, queued: Instant::now(), attempts: 0 };
+        if self.connected.contains(&peer) {
+            self.send_invite_now(peer, pending);
+            return;
+        }
+        tracing::info!(%peer, "invite deferred until connected");
+        self.pending_invites.insert(peer, pending);
+        self.seek_peer(peer);
+    }
+
+    /// Put an invite on the wire and track it. An accepting reply also asks
+    /// the host for its descriptor, which is what the shim builds the join
+    /// material from; the host serves it to us as an invitee.
+    fn send_invite_now(&mut self, peer: PeerId, mut pending: PendingInvite) {
+        self.announce_peer(peer);
+        pending.attempts = pending.attempts.saturating_add(1);
+        let accepting = matches!(pending.msg, InviteMsg::Reply { accept: true, .. });
+        let id = self.swarm.behaviour_mut().invite.send_request(&peer, pending.msg.clone());
+        self.inflight_invites.insert(id, (peer, pending));
+        if accepting {
+            self.swarm
+                .behaviour_mut()
+                .session
+                .send_request(&peer, SessionQuery { schema: 1, token: 0 });
+        }
+    }
+
+    /// The invite is not going to arrive: say so, once, with the peer.
+    fn invite_failed(&mut self, peer: PeerId, reason: &str) {
+        tracing::warn!(%peer, reason, "invite not delivered");
+        self.emit(Event::InviteFailed { peer, message: format!("invite to {peer} not delivered: {reason}") });
     }
 
     fn shard_enter(&mut self, desc: ShardDesc) {
@@ -1715,13 +1954,104 @@ impl Engine {
         }
     }
 
-    /// A game path to some peer is up: punched, tunnelled, or being punched.
-    /// Addresses must not move while it is.
+    /// A session is up and addresses must not move: we host one, a peer is
+    /// in one with us by invite (for INVITE_DEFER_MAX), or a peer exchanged
+    /// title datagrams with us inside TITLE_TRAFFIC_WINDOW. A warmed or
+    /// tunnelled game plane that carries nothing is not a game: counting it
+    /// pinned every shard member's address for as long as the shard lived.
     fn game_in_progress(&self) -> bool {
-        self.local_session.is_some()
-            || !self.tunneled_peers.is_empty()
-            || !self.punch_deadline.is_empty()
-            || self.announced.iter().any(|p| self.game_plane_ready(p))
+        if self.local_session.is_some() {
+            return true;
+        }
+        let now = Instant::now();
+        if self
+            .session_peers
+            .values()
+            .any(|since| now.saturating_duration_since(*since) < INVITE_DEFER_MAX)
+        {
+            return true;
+        }
+        !self.plane.peers_active_within(TITLE_TRAFFIC_WINDOW).is_empty()
+    }
+
+    /// A peer joined our shard. Mid-game nobody's address may move, so the
+    /// newcomer takes a free host beside the pinned table and the full
+    /// re-derivation waits for the game to end; otherwise the whole table is
+    /// rebuilt from one snapshot, as placement requires.
+    fn shard_member_arrived(&mut self, peer: PeerId) {
+        self.shard_member_heard.insert(peer, Instant::now());
+        if !self.shard_member_peers.insert(peer) {
+            return;
+        }
+        if !self.game_in_progress() {
+            self.readdress_all();
+            return;
+        }
+        self.readdress_deferred = true;
+        match subnet::assign_without_moving(&self.shard_hosts, &peer) {
+            Some(host) => {
+                self.shard_hosts.insert(peer, host);
+            }
+            None => tracing::warn!(%peer, "shard subnet full; newcomer left on the reserved range"),
+        }
+        // A newcomer that already holds an address keeps it: it may be the
+        // very partner the game is with. Its vip is read from the pinned
+        // table when it is first announced, and settles with everyone else's
+        // once the game ends.
+        tracing::info!(
+            %peer, "shard member placed without moving anyone; full readdress deferred until the game ends"
+        );
+    }
+
+    /// A member left the shard (unsubscribed, departed, or fell silent). Its
+    /// host is freed; nobody moves while a game is up.
+    fn shard_member_left(&mut self, peer: PeerId, why: &str) {
+        if !self.shard_member_peers.remove(&peer) {
+            return;
+        }
+        self.shard_member_heard.remove(&peer);
+        self.shard_reachable_attempted.remove(&peer);
+        self.shard_hosts.remove(&peer);
+        tracing::info!(%peer, why, remaining = self.shard_member_peers.len(), "shard member removed");
+        if !self.connected.contains(&peer) {
+            // No control connection: its punch nonces and tunnel are stale,
+            // and a peer the shim never heard of needs no address.
+            self.pending_punch_nonce.retain(|_, p| *p != peer);
+            self.punch_deadline.remove(&peer);
+            self.pending_datagrams.remove(&peer);
+            self.tunneled_peers.remove(&peer);
+            self.close_tunnel(&peer);
+            if !self.announced.contains(&peer) {
+                if let Some(vip) = self.vip_by_peer.remove(&peer) {
+                    self.peer_by_vip.remove(&vip);
+                    self.plane.clear_vip(&peer);
+                }
+            }
+        }
+        if self.game_in_progress() {
+            self.readdress_deferred = true;
+        } else {
+            self.readdress_all();
+        }
+    }
+
+    /// Members not heard for SHARD_MEMBER_TIMEOUT are gone. One sweep for
+    /// all of them, from the watchdog.
+    fn prune_shard_members(&mut self) {
+        let now = Instant::now();
+        let silent: Vec<PeerId> = self
+            .shard_member_peers
+            .iter()
+            .filter(|peer| {
+                self.shard_member_heard
+                    .get(peer)
+                    .is_none_or(|at| now.saturating_duration_since(*at) >= SHARD_MEMBER_TIMEOUT)
+            })
+            .copied()
+            .collect();
+        for peer in silent {
+            self.shard_member_left(peer, "silent");
+        }
     }
 
     /// Leave the current shard, unsubscribing and withdrawing our record.
@@ -1734,7 +2064,9 @@ impl Engine {
         let key = kad::RecordKey::new(&crate::protocol::shard_key(self.title_id));
         self.swarm.behaviour_mut().kad.stop_providing(&key);
         self.shard_member_peers.clear();
+        self.shard_member_heard.clear();
         self.shard_reachable_attempted.clear();
+        self.readdress_deferred = false;
         tracing::info!(shard = %hex16(&current.shard_id), "left shard");
         self.emit(Event::ShardLeft { shard_id: current.shard_id });
         self.readdress_all();
@@ -1762,7 +2094,7 @@ impl Engine {
 
     /// Ask one peer directly what shard it is in.
     fn shard_query_peer(&mut self, peer: PeerId) {
-        tracing::info!(%peer, "querying peer for its shard");
+        tracing::debug!(%peer, "querying peer for its shard");
         let title_id = self.title_id;
         let req = self
             .swarm
@@ -1869,7 +2201,7 @@ impl Engine {
                     tracing::debug!("shard settle skipped (migration cooldown)");
                     return;
                 }
-                tracing::info!(
+                tracing::debug!(
                     current = %hex16(&current.shard_id),
                     candidates = candidates.len(),
                     session_active,
@@ -1957,7 +2289,7 @@ impl Engine {
         if !self.connected.contains(&peer) {
             return; // the punch offer needs a control connection to ride
         }
-        tracing::info!(%peer, "warming game plane for shard member");
+        tracing::debug!(%peer, "warming game plane for shard member");
         self.begin_punch(peer);
     }
 
@@ -1972,7 +2304,9 @@ impl Engine {
             schema: 1,
             state: self.my_presence.state,
             rich: self.my_presence.rich.clone(),
-            session_id: self.local_session.as_ref().map(|s| s.id),
+            // A private session id reaching the whole shard is a leak: the
+            // host hands it out by invite or token, not by broadcast.
+            session_id: self.local_session.as_ref().filter(|s| s.is_public).map(|s| s.id),
         };
         let Ok(bytes) = postcard::to_allocvec(&beat) else {
             return;
@@ -2113,9 +2447,13 @@ impl Engine {
     /// probing, so a partial update can hand a newcomer an address another
     /// member is still holding.
     ///
-    /// Safe to do here because migration is suppressed while a session is
-    /// active (§17.3.3), so this does not re-address anyone mid-co-op.
+    /// Only ever called with no game in progress -- callers that learn of a
+    /// membership change mid-game extend the pinned table instead and set
+    /// `readdress_deferred`, which the watchdog turns into this call once the
+    /// game is over -- so this never re-addresses anyone mid-co-op.
     fn readdress_all(&mut self) {
+        self.readdress_deferred = false;
+        self.rebuild_shard_hosts();
         // A peer in neither membership table cannot be derived -- `assign`
         // would not place it, and every such peer would collapse onto the same
         // fallback address. Drop them; a reconnect derives a fresh one.
@@ -2138,18 +2476,39 @@ impl Engine {
         self.announce_local_address();
     }
 
-    /// Shard members get their derived address on the shard's /24 (§17.3.5);
-    /// everyone else gets one from the reserved subnet.
+    /// The shard host table from the whole membership, ourselves included:
+    /// our own peer id has to be in it too, or a remote could be handed the
+    /// host octet we occupy. Empty outside a shard.
+    fn rebuild_shard_hosts(&mut self) {
+        self.shard_hosts.clear();
+        if self.current_shard.is_none() {
+            return;
+        }
+        let mut members: Vec<PeerId> = self.shard_member_peers.iter().copied().collect();
+        members.push(*self.swarm.local_peer_id());
+        self.shard_hosts = subnet::assign(&members);
+    }
+
+    /// Shard members get their address on the shard's /24 (§17.3.5) from the
+    /// pinned host table; everyone else gets one from the reserved subnet.
     fn derive_vip(&mut self, peer: PeerId) -> u32 {
         if let Some(current) = self.current_shard.clone() {
             if self.shard_member_peers.contains(&peer) {
-                // Our own peer id has to be in the table too, or a remote
-                // could be handed the host octet we occupy.
-                let mut members: Vec<PeerId> =
-                    self.shard_member_peers.iter().copied().collect();
-                members.push(*self.swarm.local_peer_id());
-                if let Some(host) = subnet::assign(&members).get(&peer) {
-                    let vip = subnet::address(VIP_NETWORK_BASE, &current.shard_id, *host);
+                let host = match self.shard_hosts.get(&peer) {
+                    Some(host) => Some(*host),
+                    // A member the table has not caught up with yet is placed
+                    // beside it, never by rebuilding it: a rebuild is what
+                    // moves addresses, and it has its own moment.
+                    None => {
+                        let placed = subnet::assign_without_moving(&self.shard_hosts, &peer);
+                        if let Some(host) = placed {
+                            self.shard_hosts.insert(peer, host);
+                        }
+                        placed
+                    }
+                };
+                if let Some(host) = host {
+                    let vip = subnet::address(VIP_NETWORK_BASE, &current.shard_id, host);
                     tracing::debug!(
                         %peer, addr = %format_vip(vip), "shard address assigned"
                     );
@@ -2304,7 +2663,9 @@ impl Engine {
     }
 
     /// Engine-side sealing for held and broadcast traffic; live traffic goes
-    /// through `GamePlane::try_send` without touching this loop.
+    /// through `GamePlane::try_send` without touching this loop. `None` means
+    /// no keys: dropped rather than sent in clear, and said once per peer per
+    /// window rather than per packet.
     fn seal_datagram(
         &mut self,
         peer: PeerId,
@@ -2312,7 +2673,11 @@ impl Engine {
         dst_port: u16,
         data: &[u8],
     ) -> Option<Vec<u8>> {
-        self.plane.seal(peer, src_port, dst_port, data)
+        let frame = self.plane.seal(peer, src_port, dst_port, data);
+        if frame.is_none() && self.no_keys_warns.allow(peer) {
+            tracing::warn!(%peer, "no game-plane keys; datagram dropped rather than sent in clear");
+        }
+        frame
     }
 
     /// Engine-side decryption for frames held before their endpoint mapped.
@@ -2367,6 +2732,8 @@ impl Engine {
             // report WriterGone). Either way this datagram is gone -- which is
             // what "UDP" means to the guest.
             *self.tunnel_drops.entry(peer).or_insert(0) += 1;
+        } else {
+            self.plane.note_traffic(peer);
         }
     }
 
@@ -2383,6 +2750,7 @@ impl Engine {
                 }
                 self.announce_peer(peer);
                 let virtual_ip = self.vip_for(peer);
+                self.plane.note_traffic(peer);
                 // Surfaced exactly as a punched datagram would be: the guest
                 // must not be able to tell which path carried it.
                 self.emit(Event::Datagram { virtual_ip, src_port, dst_port, data });
@@ -2417,7 +2785,16 @@ impl Engine {
 
     /// A punch has run out of time: fall back to the tunnel so the player can
     /// still connect, and tell the shim the link is degraded.
+    ///
+    /// Only for a peer we hold a control connection to. The tunnel rides
+    /// that connection, so a peer that was never connected has nothing to
+    /// fall back to; telling the shim it was degraded would tell it the peer
+    /// was reachable, which is the one thing it is not.
     fn tunnel_fallback(&mut self, peer: PeerId) {
+        if !self.connected.contains(&peer) {
+            tracing::debug!(%peer, "no control connection; nothing to tunnel over");
+            return;
+        }
         if !self.tunneled_peers.insert(peer) {
             return;
         }
@@ -2430,8 +2807,10 @@ impl Engine {
         self.game_path_recovered(peer, "tunnel");
     }
 
-    /// Give up on punches that have exceeded PUNCH_TIMEOUT.
-    fn check_punch_deadlines(&mut self) {
+    /// The once-a-second sweep: punches past their deadline, held frames past
+    /// their age, silent shard members, and a readdress that waited for a
+    /// game to end.
+    fn watchdog(&mut self) {
         self.prune_orphan_frames();
         let expired: Vec<PeerId> = self
             .punch_deadline
@@ -2444,6 +2823,11 @@ impl Engine {
         for peer in expired {
             self.punch_deadline.remove(&peer);
             self.tunnel_fallback(peer);
+        }
+        self.prune_shard_members();
+        if self.readdress_deferred && !self.game_in_progress() {
+            tracing::info!("game over; applying the deferred shard readdress");
+            self.readdress_all();
         }
     }
 
@@ -2481,6 +2865,7 @@ impl Engine {
                 .filter(|p| self.connected.contains(p))
                 .count(),
             tunneled = self.tunneled_peers.len(),
+            oversized_drops = self.plane.oversized_drops(),
             "shard status"
         );
     }
@@ -2532,6 +2917,12 @@ impl Engine {
     fn begin_punch(&mut self, peer: PeerId) {
         if self.force_tunnel {
             tracing::debug!(%peer, "punch skipped (force_tunnel)");
+            if !self.connected.contains(&peer) {
+                // The tunnel needs the connection; held datagrams go when
+                // it comes (ConnectionEstablished starts the game path).
+                self.seek_peer(peer);
+                return;
+            }
             self.tunnel_fallback(peer);
             return;
         }
@@ -2540,7 +2931,7 @@ impl Engine {
         let candidates = self.local_candidates();
         self.pending_punch_nonce.insert(nonce, peer);
         let eph_pub = self.local_game_pubkey(peer);
-        tracing::info!(
+        tracing::debug!(
             %peer,
             candidates = ?candidates,
             local_addr = %format_vip(self.local_vip()),
@@ -2586,7 +2977,9 @@ impl Engine {
         // one of the things §17.6 flags as unmeasured at that size.
         let members: Vec<PeerId> = self.shard_member_peers.iter().copied().collect();
         let mut sent = 0usize;
+        let mut tunneled = 0usize;
         let mut punching = 0usize;
+        let mut unreachable = 0usize;
         for peer in members {
             match self.plane.endpoint(&peer) {
                 Some(endpoint) if self.plane.has_keys(&peer) => {
@@ -2597,15 +2990,26 @@ impl Engine {
                 }
                 // Punched but not yet keyed. Skipped quietly: the beat repeats.
                 Some(_) => {}
-                None => {
-                    if self.pending_punch_offers.values().all(|p| *p != peer) {
-                        self.begin_punch(peer);
-                    }
+                None if self.tunneled_peers.contains(&peer) => {
+                    // Degraded members take the same path a unicast would.
+                    self.send_tunneled(peer, src_port, dst_port, data.to_vec());
+                    tunneled += 1;
+                }
+                None if self.punch_deadline.contains_key(&peer)
+                    || self.pending_punch_offers.values().any(|p| *p == peer) =>
+                {
+                    punching += 1; // a punch is already in flight
+                }
+                None if self.connected.contains(&peer) => {
+                    self.begin_punch(peer);
                     punching += 1;
                 }
+                // No control connection to carry the offer: the beat repeats,
+                // and shard_ensure_reachable is working on the connection.
+                None => unreachable += 1,
             }
         }
-        tracing::debug!(dst_port, sent, punching, "shard broadcast");
+        tracing::debug!(dst_port, sent, tunneled, punching, unreachable, "shard broadcast");
     }
 
     /// Tell the shim our current address, so the XNADDR it reports to the
@@ -2718,18 +3122,21 @@ impl Engine {
 
     /// A request-response failure worth saying. UnsupportedProtocols is the
     /// one that is not a network fault: the peer is a RexNet build without
-    /// this protocol, and the player should hear that, not "no answer".
+    /// this protocol, and the player should hear that -- once per peer and
+    /// protocol, not on every retry -- rather than "no answer".
     fn note_outbound_failure(
         &mut self,
         peer: PeerId,
-        what: &str,
+        what: &'static str,
         error: &request_response::OutboundFailure,
     ) {
         if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
-            tracing::warn!(%peer, what, "peer runs a build without this protocol");
-            self.emit(Event::Error {
-                message: format!("{peer} runs an older build that cannot take a {what} message"),
-            });
+            if self.unsupported_reported.insert((peer, what)) {
+                tracing::warn!(%peer, what, "peer runs a build without this protocol");
+                self.emit(Event::Error {
+                    message: format!("{peer} runs an older build that cannot take a {what} message"),
+                });
+            }
         } else {
             tracing::debug!(%peer, what, %error, "request failed");
         }
@@ -2803,10 +3210,16 @@ impl Engine {
         }
     }
 
+    /// The peer is gone for good (no recovery, or recovery failed): it is no
+    /// longer in a session with us, no longer a shard member, and the shim
+    /// hears it left if it ever heard it arrive.
     fn report_peer_departure(&mut self, peer: PeerId) {
+        self.session_peers.remove(&peer);
+        self.plane.forget_traffic(&peer);
         if self.announced.remove(&peer) {
             self.emit(Event::PeerDisconnected { peer });
         }
+        self.shard_member_left(peer, "disconnected");
     }
 
     /// A circuit listener ended: free its relay slot; if it failed, back the
@@ -2857,14 +3270,12 @@ impl Engine {
         self.emit(Event::LocalAddress { virtual_ip: vip });
     }
 
-    /// Our own address: our host on the shard's /24 when we are in one, else
+    /// Our own address: our host on the shard's /24 when we are in one, read
+    /// from the pinned table so it moves only when the table is rebuilt; else
     /// the reserved-range identity the shim uses before any shard exists.
     fn local_vip(&self) -> u32 {
         if let Some(current) = &self.current_shard {
-            let mut members: Vec<PeerId> = self.shard_member_peers.iter().copied().collect();
-            let local = *self.swarm.local_peer_id();
-            members.push(local);
-            if let Some(host) = subnet::assign(&members).get(&local) {
+            if let Some(host) = self.shard_hosts.get(self.swarm.local_peer_id()) {
                 return subnet::address(VIP_NETWORK_BASE, &current.shard_id, *host);
             }
         }
@@ -2978,6 +3389,22 @@ impl Engine {
                     // and the title then waits out its own timeout. Hold the
                     // frames until the endpoint is mapped instead; this is the
                     // receive-side mirror of the send-side punch queue.
+                    //
+                    // Bounded in sources as well as depth: the source whose
+                    // oldest frame is oldest makes room for a new one.
+                    if !self.orphan_frames.contains_key(&addr)
+                        && self.orphan_frames.len() >= ORPHAN_SOURCES_MAX
+                    {
+                        let oldest = self
+                            .orphan_frames
+                            .iter()
+                            .filter_map(|(source, queue)| queue.first().map(|(at, _)| (*at, *source)))
+                            .min()
+                            .map(|(_, source)| source);
+                        if let Some(source) = oldest {
+                            self.orphan_frames.remove(&source);
+                        }
+                    }
                     let queue = self.orphan_frames.entry(addr).or_default();
                     if queue.len() >= PUNCH_QUEUE_MAX {
                         queue.remove(0);
@@ -3070,7 +3497,12 @@ impl Engine {
                     return true;
                 }
                 let Some(peer) = self.peer_by_vip.get(&virtual_ip) else {
-                    tracing::warn!(virtual_ip, "datagram to unknown virtual IP dropped");
+                    if self.unknown_vip_warns.allow(virtual_ip) {
+                        tracing::warn!(
+                            addr = %format_vip(virtual_ip),
+                            "datagram to unknown virtual IP dropped (further drops to this address silent for a while)"
+                        );
+                    }
                     return true;
                 };
                 let peer = *peer;
@@ -3173,39 +3605,36 @@ impl Engine {
                     session_id: session.id,
                     expires_unix: expires,
                 };
+                // Invited peers are served the descriptor even when the
+                // session is private; the invite is the host handing it out.
                 self.invited.insert(peer);
-                if self.connected.contains(&peer) {
-                    self.swarm.behaviour_mut().invite.send_request(&peer, msg);
-                } else {
-                    // Not connected yet: hold the invite, dial, and send on
-                    // ConnectionEstablished. Also kick a DHT lookup -- we may
-                    // not hold an address for this peer at all, which is the
-                    // usual reason a first invite fails outright.
-                    tracing::info!(%peer, "invite deferred until connected");
-                    self.pending_invites.insert(peer, (msg, Instant::now()));
-                    self.wanted_peers.insert(peer);
-                    if let Err(err) = self.swarm.dial(peer) {
-                        tracing::debug!(%peer, %err, "invite dial failed; trying DHT");
-                    }
-                    self.swarm.behaviour_mut().kad.get_closest_peers(peer);
-                }
+                // The player asked for this peer: a dial failure is theirs to
+                // hear. Retries after that are quiet.
+                self.wanted_peers.insert(peer);
+                self.invite_send(peer, msg);
             }
             Command::InviteReply { peer, accept } => {
-                let msg = InviteMsg::Reply { schema: 1, session_id: [0; 16], accept };
-                self.swarm.behaviour_mut().invite.send_request(&peer, msg);
                 if accept {
-                    // Fetch the host's descriptor so the shim can build the
-                    // join material (served to invitees even for private
-                    // sessions).
-                    self.swarm.behaviour_mut().session.send_request(&peer, SessionQuery { schema: 1 });
+                    // Accepting puts us in their session: addresses are
+                    // pinned from here, until title traffic takes over or
+                    // the deferral runs out.
+                    self.session_peers.insert(peer, Instant::now());
                 }
+                let msg = InviteMsg::Reply { schema: 1, session_id: [0; 16], accept };
+                // Same deferral as the offer; the descriptor query that an
+                // accept needs goes with the reply (send_invite_now).
+                self.invite_send(peer, msg);
             }
             Command::SessionCreate { id, slots_total, slots_open, is_public } => {
                 tracing::info!(
                     session_id = %hex16(&id), slots_total, slots_open, is_public,
                     "session created"
                 );
-                self.local_session = Some(LocalSession { id, slots_total, slots_open, is_public });
+                // Admissions belong to one session: nobody invited to the
+                // last one is invited to this one.
+                self.invited.clear();
+                self.local_session =
+                    Some(LocalSession { id, slots_total, slots_open, is_public, join_token: 0 });
                 if is_public {
                     let key = kad::RecordKey::new(&crate::protocol::session_key(self.title_id));
                     if let Err(err) = self.swarm.behaviour_mut().kad.start_providing(key) {
@@ -3214,6 +3643,7 @@ impl Engine {
                 }
             }
             Command::SessionDelete => {
+                self.invited.clear();
                 if let Some(session) = self.local_session.take() {
                     tracing::info!(session_id = %hex16(&session.id), "session deleted");
                     if session.is_public {
@@ -3223,6 +3653,24 @@ impl Engine {
                     }
                 }
             }
+            Command::SessionSetJoinToken { token } => match self.local_session.as_mut() {
+                Some(session) => {
+                    session.join_token = token;
+                    tracing::info!(has_token = token != 0, "session join token set");
+                }
+                None => tracing::debug!("join token set with no local session; ignored"),
+            },
+            Command::SessionSetSlots { open, total } => match self.local_session.as_mut() {
+                Some(session) => {
+                    session.slots_open = u8::try_from(open).unwrap_or(u8::MAX);
+                    session.slots_total = u8::try_from(total).unwrap_or(u8::MAX);
+                    tracing::info!(
+                        slots_open = session.slots_open, slots_total = session.slots_total,
+                        "session slots updated"
+                    );
+                }
+                None => tracing::debug!("session slots set with no local session; ignored"),
+            },
             Command::ShardEnable { cap } => {
                 self.shard_cap = if cap == 0 { DEFAULT_SHARD_CAP } else { cap };
                 if !self.shard_enabled {
@@ -3345,12 +3793,16 @@ impl Engine {
             Command::ShardStatus { reply } => {
                 let _ = reply.send(self.current_shard.as_ref().map(|d| d.shard_id));
             }
-            Command::SessionQuery { peer } => {
+            Command::SessionQuery { peer, token } => {
                 // Ask one host for its descriptor directly: a join that already
                 // knows the host (an invite, a pasted code) need not wait on a
-                // DHT search. The answer takes the same path a search result does.
+                // DHT search. The answer takes the same path a search result
+                // does. The token, if any, is what admits us to a private one.
                 self.wanted_peers.insert(peer);
-                self.swarm.behaviour_mut().session.send_request(&peer, SessionQuery { schema: 1 });
+                self.swarm
+                    .behaviour_mut()
+                    .session
+                    .send_request(&peer, SessionQuery { schema: 1, token });
             }
             Command::SessionSearch => {
                 let key = kad::RecordKey::new(&crate::protocol::session_key(self.title_id));
@@ -3403,14 +3855,31 @@ impl Engine {
                 tracing::debug!(%peer_id, endpoint = %endpoint.get_remote_address(), "connected");
                 self.remember_peer_routes(peer_id, reconnect_address(&endpoint));
                 if num_established.get() == 1 {
-                    // A game peer coming back: rebuild its game path now rather
-                    // than at the title's next datagram, which may be a while.
-                    if self.recovering.contains_key(&peer_id) {
-                        tracing::info!(%peer_id, "control connection back; re-punching the game path");
-                        self.begin_punch(peer_id);
-                    }
                     let wanted = self.wanted_peers.remove(&peer_id);
                     self.connected.insert(peer_id);
+                    // A game peer coming back: rebuild its game path now rather
+                    // than at the title's next datagram, which may be a while.
+                    // One that was tunnelled goes straight back to the tunnel:
+                    // its punch has failed once already, and the restored
+                    // control connection is the whole of what the tunnel needs.
+                    if let Some(recovery) = self.recovering.get(&peer_id) {
+                        if recovery.tunneled {
+                            tracing::info!(%peer_id, "control connection back; resuming the tunnel");
+                            self.tunnel_fallback(peer_id);
+                        } else {
+                            tracing::info!(%peer_id, "control connection back; re-punching the game path");
+                            self.begin_punch(peer_id);
+                        }
+                    }
+                    // Datagrams held for this peer were waiting on exactly
+                    // this connection: start the game path they need.
+                    if self.pending_datagrams.contains_key(&peer_id)
+                        && !self.punch_deadline.contains_key(&peer_id)
+                        && !self.tunneled_peers.contains(&peer_id)
+                        && !self.game_plane_ready(&peer_id)
+                    {
+                        self.begin_punch(peer_id);
+                    }
                     // Peers we didn't ask for (kad crawl, autonat dial-backs)
                     // stay unannounced until they speak a rexnet protocol.
                     if wanted || self.friend_store.is_friend(&peer_id) {
@@ -3426,15 +3895,12 @@ impl Engine {
                     }
                     // Deliver any invite that was waiting on this connection,
                     // unless the user has long since moved on.
-                    if let Some((msg, queued)) = self.pending_invites.remove(&peer_id) {
-                        if queued.elapsed() <= INVITE_DEFER_MAX {
+                    if let Some(pending) = self.pending_invites.remove(&peer_id) {
+                        if pending.queued.elapsed() <= INVITE_DEFER_MAX {
                             tracing::info!(%peer_id, "sending deferred invite");
-                            self.announce_peer(peer_id);
-                            self.swarm.behaviour_mut().invite.send_request(&peer_id, msg);
+                            self.send_invite_now(peer_id, pending);
                         } else {
-                            tracing::info!(
-                                %peer_id, "dropping stale deferred invite"
-                            );
+                            self.invite_failed(peer_id, "peer became reachable too late");
                         }
                     }
                     // A friend message that waited for this peer goes now.
@@ -3477,11 +3943,12 @@ impl Engine {
                             }
                         }
                         if !self.recovering.contains_key(&peer_id) {
+                            let tunneled = self.tunneled_peers.contains(&peer_id);
                             self.recovering.insert(
                                 peer_id,
-                                PeerRecovery { started: now, next_dial: now, looked_up: false },
+                                PeerRecovery { started: now, next_dial: now, looked_up: false, tunneled },
                             );
-                            tracing::info!(%peer_id, "game peer transport lost; attempting bounded recovery");
+                            tracing::info!(%peer_id, tunneled, "game peer transport lost; attempting bounded recovery");
                         }
                     }
                     self.connected.remove(&peer_id);
@@ -3618,17 +4085,38 @@ impl Engine {
                 request_response::Event::OutboundFailure { peer, error, .. },
             )) => self.note_outbound_failure(peer, "session", &error),
             SwarmEvent::Behaviour(BehaviourEvent::Invite(
-                request_response::Event::OutboundFailure { peer, error, .. },
-            )) => self.note_outbound_failure(peer, "invite", &error),
+                request_response::Event::OutboundFailure { peer, request_id, error, .. },
+            )) => {
+                self.note_outbound_failure(peer, "invite", &error);
+                let Some((_, pending)) = self.inflight_invites.remove(&request_id) else { return };
+                let unsupported =
+                    matches!(error, request_response::OutboundFailure::UnsupportedProtocols);
+                if pending.attempts < INVITE_ATTEMPTS && !unsupported {
+                    // Once more, on the next connection; the second failure
+                    // is reported, not retried into silence.
+                    tracing::info!(%peer, %error, attempt = pending.attempts, "invite not delivered; queued once more");
+                    self.pending_invites.insert(peer, pending);
+                    self.seek_peer(peer);
+                } else {
+                    self.invite_failed(peer, &error.to_string());
+                }
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Session(request_response::Event::Message {
                 peer,
                 message,
                 ..
             })) => match message {
-                request_response::Message::Request { channel, .. } => {
-                    // Serve our descriptor to queriers. Private sessions are
-                    // only served to peers we invited (they never touch the
-                    // DHT either).
+                request_response::Message::Request { request, channel, .. } => {
+                    // Serve our descriptor to queriers. A private session is
+                    // served only to a peer we invited or one presenting the
+                    // join token (they never touch the DHT either). The right
+                    // token admits the peer for good: its later queries and
+                    // its join need not carry it.
+                    let token_ok = request.token != 0
+                        && self.local_session.as_ref().is_some_and(|s| s.join_token == request.token);
+                    if token_ok && self.invited.insert(peer) {
+                        tracing::info!(%peer, "session query carried the join token; peer admitted");
+                    }
                     let invited = self.invited.contains(&peer);
                     let desc = self
                         .local_session
@@ -3687,15 +4175,19 @@ impl Engine {
             SwarmEvent::Behaviour(BehaviourEvent::Friend(
                 request_response::Event::OutboundFailure { peer, request_id, error, .. },
             )) => {
-                // The message is not lost. It goes back in the queue
-                // and leaves on the next connection; the failure is stated, where
-                // before it fell through to a trace line nobody saw.
+                // The message is not lost. It goes back in the queue and
+                // leaves on the next connection, or on this one at the next
+                // sweep. Quietly: delivery is reported when it happens
+                // (FriendDelivered), and a peer that is offline is not an
+                // error to show the player on every retry. The one exception
+                // is a peer that cannot take the message at all.
                 if let Some((_, msg)) = self.inflight_friend.remove(&request_id) {
                     self.note_outbound_failure(peer, "friend", &error);
-                    tracing::warn!(%peer, %error, "friend message failed; queued for retry");
-                    self.emit(Event::Error {
-                        message: format!("friend message to {peer} not delivered yet: {error}"),
-                    });
+                    if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
+                        tracing::debug!(%peer, "friend message dropped: peer cannot take it");
+                        return;
+                    }
+                    tracing::debug!(%peer, %error, "friend message failed; queued for retry");
                     self.pending_friend_msgs.entry(peer).or_insert((msg, Instant::now()));
                     self.friend_seek(peer);
                 }
@@ -3735,15 +4227,13 @@ impl Engine {
                                     .send_request(&peer, FriendMsg::Accept { schema: 1 });
                                 self.emit(Event::FriendAccepted { peer });
                             } else if self.friend_store.request_received(peer, &display_name, &note) {
-                                // A joiner naming our session came with our own invite
-                                // material; a private descriptor is served to them.
-                                if let Some(session) = self.local_session.as_ref() {
-                                    if note == format!("discord:{}", hex16(&session.id)) {
-                                        self.invited.insert(peer);
-                                    }
-                                }
-                                // A repeat of a request already shown stays shown once;
-                                // the sender re-sends after every restart (see run()).
+                                // Shown as stored: a stranger's text, sanitised
+                                // and capped by the store. A repeat of a request
+                                // already shown stays shown once and rewrites
+                                // nothing; the sender re-sends after every
+                                // restart (see run()).
+                                let (display_name, note) =
+                                    self.friend_store.inbound_text(&peer).unwrap_or_default();
                                 self.emit(Event::FriendRequest { peer, display_name, note });
                             }
                         }
@@ -3774,24 +4264,39 @@ impl Engine {
                 message,
                 ..
             })) => {
-                if let request_response::Message::Request { request, channel, .. } = message {
-                    let _ =
-                        self.swarm.behaviour_mut().invite.send_response(channel, Ack { schema: 1 });
-                    match request {
-                        InviteMsg::Offer { title_id, session_id, expires_unix, .. } => {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            if expires_unix != 0 && now > expires_unix {
-                                tracing::debug!(%peer, "expired invite dropped");
-                            } else {
-                                self.announce_peer(peer);
-                                self.emit(Event::InviteReceived { peer, title_id, session_id });
-                            }
+                match message {
+                    request_response::Message::Response { request_id, .. } => {
+                        if let Some((_, pending)) = self.inflight_invites.remove(&request_id) {
+                            tracing::debug!(%peer, msg = ?pending.msg, "invite message delivered");
                         }
-                        InviteMsg::Reply { accept, .. } => {
-                            self.emit(Event::InviteReplied { peer, reply: accept as u8 });
+                    }
+                    request_response::Message::Request { request, channel, .. } => {
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .invite
+                            .send_response(channel, Ack { schema: 1 });
+                        match request {
+                            InviteMsg::Offer { title_id, session_id, expires_unix, .. } => {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                if expires_unix != 0 && now > expires_unix {
+                                    tracing::debug!(%peer, "expired invite dropped");
+                                } else {
+                                    self.announce_peer(peer);
+                                    self.emit(Event::InviteReceived { peer, title_id, session_id });
+                                }
+                            }
+                            InviteMsg::Reply { accept, .. } => {
+                                if accept {
+                                    // They are in our session now: pinned
+                                    // like any session peer.
+                                    self.session_peers.insert(peer, Instant::now());
+                                }
+                                self.emit(Event::InviteReplied { peer, reply: accept as u8 });
+                            }
                         }
                     }
                 }
@@ -3804,7 +4309,7 @@ impl Engine {
                 request_response::Message::Request { request, channel, .. } => {
                     // Responder half of §8.4: answer with our candidates
                     // under the offer's nonce, then probe toward theirs.
-                    tracing::info!(
+                    tracing::debug!(
                         %peer,
                         theirs = ?request.candidates,
                         "punch offer received"
@@ -3838,7 +4343,9 @@ impl Engine {
                         let _ = reply.send(Err(error.to_string()));
                     }
                     // The offer itself never landed, so no probes are coming.
-                    // No reason to sit out the full timeout.
+                    // No reason to sit out the full timeout. A peer we never
+                    // connected to (DialFailure) has no tunnel to fall back
+                    // to either; tunnel_fallback declines it.
                     self.punch_deadline.remove(&peer);
                     self.tunnel_fallback(peer);
                 }
@@ -3868,7 +4375,7 @@ impl Engine {
                     self.pending_shard_queries.remove(&request_id);
                     if let Some(desc) = response {
                         if desc.title_id == self.title_id && desc.schema == 1 {
-                            tracing::info!(
+                            tracing::debug!(
                                 %peer, shard = %hex16(&desc.shard_id),
                                 members = desc.members_hint, "shard descriptor received"
                             );
@@ -3878,10 +4385,8 @@ impl Engine {
                             // beat or no beat: its address on our /24 must agree with
                             // the one it derives for itself, and waiting up to a
                             // heartbeat for the gossip left the two sides disagreeing.
-                            if self.current_shard.as_ref().is_some_and(|c| c.shard_id == arrived)
-                                && self.shard_member_peers.insert(peer)
-                            {
-                                self.readdress_all();
+                            if self.current_shard.as_ref().is_some_and(|c| c.shard_id == arrived) {
+                                self.shard_member_arrived(peer);
                             }
                             if self.shard_preferred == Some(arrived)
                                 && !self.current_shard.as_ref().is_some_and(|c| c.shard_id == arrived)
@@ -3925,12 +4430,10 @@ impl Engine {
                 let Some(source) = message.source else { return };
                 match postcard::from_bytes::<ShardBeat>(&message.data) {
                     Ok(beat) if beat.schema == 1 => {
-                        if self.shard_member_peers.insert(source) {
-                            // A peer we already knew off-shard belongs on our
-                            // /24 now, and their arrival can shift placement
-                            // for everyone, so re-derive from one snapshot.
-                            self.readdress_all();
-                        }
+                        // A peer we already knew off-shard belongs on our
+                        // /24 now; shard_member_arrived decides whether that
+                        // can be applied yet.
+                        self.shard_member_arrived(source);
                         self.shard_ensure_reachable(source);
                         self.shard_warm_game_plane(source);
                         self.emit(Event::ShardPresence {
@@ -3944,6 +4447,19 @@ impl Engine {
                     Err(err) => tracing::debug!(%source, %err, "shard beat: malformed"),
                 }
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed {
+                peer_id,
+                topic,
+            })) => {
+                // Leaving our topic is leaving the shard; its host is freed.
+                let ours = self.current_shard.as_ref().is_some_and(|current| {
+                    gossipsub::IdentTopic::new(crate::protocol::shard_topic(&current.shard_id)).hash()
+                        == topic
+                });
+                if ours {
+                    self.shard_member_left(peer_id, "unsubscribed");
+                }
+            }
             SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
                 relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
             )) => self.mark_relay(relay_peer_id, true),
@@ -3951,13 +4467,13 @@ impl Engine {
                 relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. },
             )) => self.mark_relay(relay_peer_id, true),
             // We are serving as someone's relay -- the "seed" half of the mesh.
-            // Logged at info because it is exactly the behaviour a player wants
-            // to confirm ("am I helping others connect?").
+            // Per-circuit detail at debug; the role change itself is what
+            // `mark_relay` says at info.
             SwarmEvent::Behaviour(BehaviourEvent::RelayServer(event)) => {
-                tracing::info!(?event, "relay server (we are relaying for the mesh)");
+                tracing::debug!(?event, "relay server (we are relaying for the mesh)");
             }
             SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
-                tracing::info!(?event, "dcutr");
+                tracing::debug!(?event, "dcutr");
             }
             SwarmEvent::Behaviour(BehaviourEvent::Autonat(event)) => {
                 tracing::debug!(?event, "autonat");
@@ -4062,7 +4578,7 @@ impl Engine {
                             self.swarm
                                 .behaviour_mut()
                                 .session
-                                .send_request(&peer, SessionQuery { schema: 1 });
+                                .send_request(&peer, SessionQuery { schema: 1, token: 0 });
                         }
                     }
                     if !last {
@@ -4145,7 +4661,9 @@ fn own_key_due(last_stored: Option<Instant>, now: Instant) -> bool {
     last_stored.map_or(true, |at| now.saturating_duration_since(at) >= OWN_KEY_REPUBLISH)
 }
 
-/// Exponential retry per peer: true when `peer` is due, scheduling the next.
+/// Exponential retry per peer: true when `peer` is due, scheduling the next
+/// at the doubled delay with +-RETRY_JITTER, so nodes that failed together
+/// do not retry together.
 fn retry_due(
     retries: &mut HashMap<PeerId, (Instant, Duration)>,
     peer: PeerId,
@@ -4158,7 +4676,9 @@ fn retry_due(
         Some(&(_, delay)) => (delay * 2).min(max),
         None => first,
     };
-    retries.insert(peer, (now + delay, delay));
+    let jitter = rand::Rng::gen_range(&mut rand::thread_rng(), -RETRY_JITTER..=RETRY_JITTER);
+    let scheduled = delay.mul_f64(1.0 + jitter);
+    retries.insert(peer, (now + scheduled, delay));
     true
 }
 

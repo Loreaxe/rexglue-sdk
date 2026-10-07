@@ -91,6 +91,15 @@ enum class ConnectStatus : uint32_t {
   kLost = 3,
 };
 
+/// Game-plane link state for one peer. `status` is what the guest reads;
+/// `degraded` says the connected path is the control tunnel rather than a
+/// punched socket (REXNET_EVENT_DEGRADED). A degraded peer is CONNECTED: the
+/// title must send, and the core carries the datagrams over the tunnel.
+struct PeerLink {
+  ConnectStatus status = ConnectStatus::kIdle;
+  bool degraded = false;
+};
+
 /// Guest notification ids (XNotificationKey: mask_index<<25 | ver<<16 | id).
 constexpr uint32_t kXNotifySystemSignInChanged = 0x0000000A;
 constexpr uint32_t kXNotifyLiveConnectionChanged = 0x02000001;
@@ -256,8 +265,18 @@ class RexNet {
   void SessionDelete();
   /// Kick a DHT session search; results accumulate (poll TakeSessionResults).
   void SessionSearch();
-  /// Ask one host for its descriptor directly; the answer lands like a search result.
-  void SessionQuery(const RexNetPeerId& peer);
+  /// Ask one host for its descriptor directly; the answer lands like a search
+  /// result. `token` is the host's join token (from its join material); a
+  /// private session answers only a query that carries the current one, 0 =
+  /// none (public sessions, legacy material).
+  void SessionQuery(const RexNetPeerId& peer, uint64_t token = 0);
+  /// The join token the local session currently advertises (0 = none).
+  /// Generated at SessionCreate; carried in REXJ3 join material.
+  uint64_t join_token();
+  /// Occupancy of the local session as the core advertises it (descriptor,
+  /// Discord party size). RexNet never sees the title's join/leave calls --
+  /// the XGI layer or the title states them here after each change.
+  void SetSessionSlots(uint32_t open, uint32_t total);
   std::optional<std::array<uint8_t, 16>> current_session_id();
 
   struct SessionResult {
@@ -294,7 +313,13 @@ class RexNet {
     RexNetPeerId peer;
     uint32_t title_id = 0;
     std::array<uint8_t, 16> session_id{};
+    /// When the invite stops being offered (kInviteLifetime after receipt);
+    /// expired entries are dropped by the pump. Default = never, for
+    /// invites a caller raises for itself.
+    std::chrono::steady_clock::time_point expires = std::chrono::steady_clock::time_point::max();
   };
+  /// How long a received invite stays pending before the pump drops it.
+  static constexpr std::chrono::seconds kInviteLifetime{300};
   struct PresenceInfo {
     uint32_t title_id = 0;
     uint8_t state = 0;
@@ -373,8 +398,36 @@ class RexNet {
   /// Accept a received invite: replies to the host and, once the session
   /// descriptor arrives, records it and fires XN_LIVE_INVITE_ACCEPTED so
   /// the title's existing join flow runs (§8.3).
-  void AcceptInvite(const InviteInfo& invite);
+  ///
+  /// One accept at a time per host and session: while one is pending (armed
+  /// and not yet resolved or timed out) a repeat for the same host and
+  /// session is ignored and returns false, so a second press, a second
+  /// Discord Join or a second JoinFromSecret cannot re-arm it and run the
+  /// title's join twice. A pending accept the host never answers expires
+  /// after kAcceptTimeout and reaches the title as Notice::kJoinTimedOut.
+  bool AcceptInvite(const InviteInfo& invite);
+  static constexpr std::chrono::seconds kAcceptTimeout{20};
   std::optional<AcceptedInvite> accepted_invite();
+
+  // --- Notices (errors the title shows the player) --------------------
+
+  /// Something the title should tell the player, as the core or this module
+  /// stated it. Delivered to the notice sink from the pump thread and kept
+  /// in a queue drained by TakeNotices for callers that poll instead.
+  struct Notice {
+    enum class Kind : uint32_t {
+      kError = 0,         // REXNET_EVENT_ERROR: `message` is the core's text
+      kInviteFailed = 1,  // REXNET_EVENT_INVITE_FAILED: the invite to `peer` did not land
+      kJoinTimedOut = 2,  // AcceptInvite: `peer` (the host) did not answer in time
+    };
+    Kind kind = Kind::kError;
+    RexNetPeerId peer{};  // valid for kInviteFailed and kJoinTimedOut
+    std::string message;
+  };
+  using NoticeSink = std::function<void(const Notice& notice)>;
+  void SetNoticeSink(NoticeSink sink);
+  /// Notices since the last call; drained on read.
+  std::vector<Notice> TakeNotices();
 
   /// Write a guest-endian XNADDR (36 bytes: ina, inaOnline, wPortOnline,
   /// abEnet, abOnline) for a peer, for XSESSION_INFO and friends.
@@ -446,16 +499,51 @@ class RexNet {
   std::optional<std::array<uint8_t, 16>> current_shard_id();
 
   /// Everything a joiner needs, as one string to hand out of band — a Discord
-  /// join secret, a pasted code: version, title id, our peer id, the session
-  /// id, our shard id and a public endpoint when one is confirmed. Empty when
-  /// there is no local session to join.
+  /// join secret, a pasted code: `REXJ3|title|peer|session|shard|endpoint|token`.
+  /// The token is the session's join token (SessionCreate), the proof that
+  /// the material came from the host; the core serves a private session's
+  /// descriptor only to a query carrying it. Empty when there is no local
+  /// session to join. Cached; rebuilt only when one of its inputs changes.
   std::string JoinSecret();
   /// Join from that material: dial the endpoint if it carried one, arm the
-  /// accept so the title's own invite path runs, search for the host's
-  /// descriptor, befriend the host with a note naming the session, and enter
-  /// the host's shard. False when the material does not parse, names another
-  /// title, or the node is down.
+  /// accept so the title's own invite path runs (AcceptInvite, with its
+  /// one-pending-per-session guard), query the host's descriptor with the
+  /// token, search as the fallback, and enter the host's shard. Accepts
+  /// REXJ3, REXJ2 (no token) and the first cut's `peer|title|session`. False
+  /// when the material does not parse, names another title, or the node is
+  /// down.
   bool JoinFromSecret(const std::string& secret);
+
+  // --- Discord "Ask to Join" ---------------------------------------------
+
+  /// Who may join through Discord's Ask to Join without the host's say-so.
+  /// Ask (default): every request is queued for the title to answer through
+  /// ReplyJoinRequest. Friends: a Discord user the title has linked to a
+  /// RexNet friend (LinkDiscordUser) is approved at once, anyone else is
+  /// queued as under Ask. All: every request is approved while the session
+  /// admits a joiner. A request is never approved while the session is not
+  /// joinable, whatever the policy.
+  enum class JoinRequestPolicy { Ask, Friends, All };
+  void SetJoinRequestPolicy(JoinRequestPolicy policy);
+  JoinRequestPolicy join_request_policy();
+
+  /// A Discord user asking to join, as Discord named them.
+  struct JoinRequest {
+    std::string user_id;
+    std::string user_name;
+  };
+  /// Queued requests since the last call; drained on read. A request the
+  /// title has not answered within kJoinRequestLifetime is dropped silently
+  /// (Discord's own timeout is shorter, so there is nobody left to answer).
+  std::vector<JoinRequest> TakeJoinRequests();
+  static constexpr std::chrono::seconds kJoinRequestLifetime{60};
+  /// Answer a queued request: accept sends the Discord invite, decline
+  /// closes it. Any thread.
+  void ReplyJoinRequest(const std::string& user_id, bool accept);
+  /// Tell the Friends policy which RexNet peer a Discord user is. The title
+  /// owns that knowledge (its own account link, a friend's profile); RexNet
+  /// keeps only the map.
+  void LinkDiscordUser(const std::string& user_id, const RexNetPeerId& peer);
 
   /// What Discord shows: the two lines, and whether the local session admits a
   /// joiner (nullopt = whenever a local session exists). Any thread.
@@ -470,6 +558,7 @@ class RexNet {
     RexNetPeerId peer;
     uint32_t virtual_ip = 0;
     ConnectStatus status = ConnectStatus::kIdle;
+    bool degraded = false;        // connected over the control tunnel, not a punched socket
     bool control_linked = false;  // libp2p control connection is up
     bool is_friend = false;       // mutual-consent friend (§8.2)
     bool is_relay = false;        // currently carrying our traffic (§9)
@@ -513,6 +602,11 @@ class RexNet {
   void StartPumpThread();
   void HandleEvent(const RexNetEvent& event);
   void SetStatus(uint32_t virtual_ip, ConnectStatus status);
+  /// Expire what has a lifetime (pending accept, join requests, invites);
+  /// notices raised here are delivered after the lock is released.
+  void Housekeep(std::chrono::steady_clock::time_point now);
+  /// Deliver one notice: sink if set, queue for TakeNotices either way.
+  void RaiseNotice(Notice notice);
 
   RexNetHandle* handle_ = nullptr;
   RexNetPeerId local_peer_id_{};
@@ -521,8 +615,17 @@ class RexNet {
   // mutable: const accessors (PeerRttMs) still need to lock.
   mutable std::mutex mutex_;
   VirtualIpTable virtual_ips_;
-  std::unordered_map<uint32_t, ConnectStatus> statuses_;
+  std::unordered_map<uint32_t, PeerLink> statuses_;
   std::optional<std::array<uint8_t, 16>> session_id_;
+  /// Join token advertised with the local session (0 = none); REXJ3 carries it.
+  uint64_t join_token_ = 0;
+  uint32_t slots_open_ = 0;
+  uint32_t slots_total_ = 0;
+  /// JoinSecret cache; dirty whenever one of its inputs (session, token,
+  /// title id, shard, public endpoints) changes.
+  std::string join_secret_cache_;
+  bool join_secret_dirty_ = true;
+  std::string JoinSecretLocked();
   std::vector<SessionResult> session_results_;
   std::vector<FriendRequestInfo> friend_requests_;
   std::vector<RexNetPeerId> declined_requests_;
@@ -555,8 +658,23 @@ class RexNet {
   /// The XEX's own title id, kept beside the advertised one so a join secret
   /// written under either is accepted.
   uint32_t xex_title_id_ = 0;
+  /// DiscordPump runs from Pump at most every kDiscordPumpInterval, never on
+  /// every event wake: the pump thread delivers datagrams and must not pay
+  /// for Discord's IPC on each one.
+  static constexpr std::chrono::milliseconds kDiscordPumpInterval{250};
+  std::chrono::steady_clock::time_point discord_last_pump_{};
   void DiscordPump();
   void ConfigureDiscordLocked();
+  JoinRequestPolicy join_request_policy_ = JoinRequestPolicy::Ask;
+  struct JoinRequestEntry {
+    JoinRequest request;
+    std::chrono::steady_clock::time_point received;
+  };
+  std::vector<JoinRequestEntry> join_requests_;
+  /// Discord user id -> RexNet peer, as the title linked them (Friends policy).
+  std::unordered_map<std::string, RexNetPeerId> discord_user_peers_;
+  NoticeSink notice_sink_;
+  std::vector<Notice> notices_;
 
   StreamAcceptSink stream_accept_sink_;
   StreamDataSink stream_data_sink_;
@@ -593,6 +711,7 @@ class RexNet {
   void PushRichLocked();  // rebuild blob + SetPresence; call with mutex_ held
 
   std::optional<std::pair<RexNetPeerId, std::array<uint8_t, 16>>> pending_accept_;
+  std::chrono::steady_clock::time_point pending_accept_since_{};
   std::optional<AcceptedInvite> accepted_invite_;
   DatagramSink datagram_sink_;
   NotifySink notify_sink_;

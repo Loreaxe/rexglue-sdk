@@ -114,6 +114,30 @@ pub fn assign(members: &[PeerId]) -> BTreeMap<PeerId, u8> {
     out
 }
 
+/// Place one newcomer beside an existing table without moving anyone in it:
+/// its preferred host if free, else the next free one by linear probing.
+/// `None` when the subnet is full.
+///
+/// Used while addresses are pinned -- a game is up and the titles on both
+/// ends hold every address in live sockets -- so a third member arriving
+/// cannot displace a player mid-game the way [`assign`] can. The table it
+/// extends is rebuilt with [`assign`] once addresses may move again; until
+/// then the newcomer's address may differ from the one it derives for itself,
+/// which is the price of not moving the players who are actually playing.
+pub fn assign_without_moving(existing: &BTreeMap<PeerId, u8>, newcomer: &PeerId) -> Option<u8> {
+    if let Some(host) = existing.get(newcomer) {
+        return Some(*host);
+    }
+    let mut taken = [false; 256];
+    for host in existing.values() {
+        taken[*host as usize] = true;
+    }
+    let start = preferred_host(newcomer);
+    (0..USABLE_HOSTS)
+        .map(|step| HOST_MIN + (((start - HOST_MIN) as usize + step) % USABLE_HOSTS) as u8)
+        .find(|candidate| !taken[*candidate as usize])
+}
+
 /// Full virtual IP for a member: `10.77.<subnet>.<host>`, host byte order.
 pub fn address(network_base: u32, shard_id: &[u8; 16], host: u8) -> u32 {
     network_base | (u32::from(subnet_octet(shard_id)) << 8) | u32::from(host)
@@ -212,6 +236,23 @@ mod tests {
         assert_eq!(host, base | (u32::from(octet) << 8) | 9);
         // Broadcast is the same /24, host 255.
         assert_eq!(broadcast_address(base, &shard), (host & !0xFF) | 255);
+    }
+
+    #[test]
+    fn a_newcomer_is_placed_without_moving_anyone() {
+        let members = peers(40);
+        let table = assign(&members);
+        let newcomer = PeerId::random();
+        let host = assign_without_moving(&table, &newcomer).expect("room in the subnet");
+        assert!((HOST_MIN..=HOST_MAX).contains(&host));
+        assert!(!table.values().any(|h| *h == host), "newcomer took a held host");
+        // Idempotent for a peer already placed.
+        let mut extended = table.clone();
+        extended.insert(newcomer, host);
+        assert_eq!(assign_without_moving(&extended, &newcomer), Some(host));
+        // The held table is untouched by construction; a full subnet refuses.
+        let full = assign(&peers(USABLE_HOSTS));
+        assert_eq!(assign_without_moving(&full, &PeerId::random()), None);
     }
 
     #[test]

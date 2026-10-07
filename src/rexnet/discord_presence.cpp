@@ -9,7 +9,9 @@
 
 #include "rex/net/discord_presence.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -23,7 +25,7 @@
 #if defined(_WIN32)
 #include <windows.h>
 #else
-#include <poll.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -35,17 +37,36 @@ namespace {
 
 #define DISCORD_INFO(...) REXLOG_CAT_INFO(::rex::log::net(), __VA_ARGS__)
 #define DISCORD_DEBUG(...) REXLOG_CAT_DEBUG(::rex::log::net(), __VA_ARGS__)
+/// Info the first time, debug after, until `flag` is cleared again.
+#define DISCORD_INFO_ONCE(flag, ...) \
+  do {                               \
+    if (flag) {                      \
+      DISCORD_DEBUG(__VA_ARGS__);    \
+    } else {                         \
+      DISCORD_INFO(__VA_ARGS__);     \
+      (flag) = true;                 \
+    }                                \
+  } while (0)
 
+/// Discord IPC opcodes.
 constexpr uint32_t kOpHandshake = 0;
 constexpr uint32_t kOpFrame = 1;
 constexpr uint32_t kOpClose = 2;
+constexpr uint32_t kOpPing = 3;
+constexpr uint32_t kOpPong = 4;
 
 /// Discord stops reading a client that goes quiet; connecting is cheap, so a
 /// client that is not there is retried on this cadence and never logged twice.
 constexpr std::chrono::seconds kRetryInterval{15};
+/// Reconnect interval after a refused handshake: one step per refusal.
+constexpr std::chrono::seconds kRetryRefusedOnce{60};
+constexpr std::chrono::seconds kRetryRefusedMax{300};
 constexpr std::chrono::seconds kHandshakeTimeout{2};
 /// A frame larger than this is not Discord talking to us.
 constexpr size_t kMaxFrame = 1u << 20;
+/// Bytes the socket may owe us before the connection is dropped instead of
+/// the pump thread waiting on it.
+constexpr size_t kMaxOutbox = 256u << 10;
 
 std::string Nonce() {
   static thread_local std::mt19937_64 rng{std::random_device{}()};
@@ -69,6 +90,16 @@ uint32_t ProcessId() {
 #endif
 }
 
+/// The answer to an Ask to Join, as Discord's IPC takes it.
+std::string JoinReplyCommand(const std::string& user_id, bool accept) {
+  nlohmann::json answer = {
+      {"cmd", accept ? "SEND_ACTIVITY_JOIN_INVITE" : "CLOSE_ACTIVITY_REQUEST"},
+      {"args", {{"user_id", user_id}}},
+      {"nonce", Nonce()},
+  };
+  return answer.dump();
+}
+
 }  // namespace
 
 DiscordPresence::DiscordPresence(std::string application_id, Assets assets, Callbacks callbacks)
@@ -77,7 +108,7 @@ DiscordPresence::DiscordPresence(std::string application_id, Assets assets, Call
       callbacks_(std::move(callbacks)),
       started_unix_(NowUnix()) {
   // First attempt on the first pump: an interval ago, so nothing waits 15 s.
-  last_attempt_ = std::chrono::steady_clock::now() - kRetryInterval;
+  last_attempt_ = std::chrono::steady_clock::now() - retry_interval_;
 }
 
 DiscordPresence::~DiscordPresence() { Close(); }
@@ -87,9 +118,15 @@ void DiscordPresence::SetActivity(const Activity& activity) {
   wanted_ = activity;
 }
 
+void DiscordPresence::ReplyJoinRequest(const std::string& user_id, bool accept) {
+  std::lock_guard lock(mutex_);
+  pending_replies_.push_back({user_id, accept});
+}
+
 void DiscordPresence::Close() {
   if (state_ != State::kDisconnected) {
     // A clear before the close, so the presence does not outlive the game.
+    // Best effort: the socket takes what it takes without waiting.
     nlohmann::json clear = {
         {"cmd", "SET_ACTIVITY"},
         {"args", {{"pid", ProcessId()}}},
@@ -113,7 +150,7 @@ void DiscordPresence::Pump() {
 void DiscordPresence::PumpChecked() {
   if (state_ == State::kDisconnected) {
     const auto now = std::chrono::steady_clock::now();
-    if (now - last_attempt_ < kRetryInterval) {
+    if (now - last_attempt_ < retry_interval_) {
       return;
     }
     last_attempt_ = now;
@@ -122,17 +159,43 @@ void DiscordPresence::PumpChecked() {
     }
   }
 
+  // Whatever the socket would not take last time goes first.
+  if (!FlushOutbox()) {
+    DISCORD_INFO_ONCE(close_logged_, "discord: connection closed");
+    Drop();
+    return;
+  }
+
   ReadAvailable();
+  if (state_ == State::kDisconnected) {
+    return;
+  }
 
   if (state_ == State::kHandshaking &&
       std::chrono::steady_clock::now() - handshake_started_ > kHandshakeTimeout) {
-    DISCORD_INFO("discord: no answer to the handshake on {}", endpoint_);
+    DISCORD_INFO_ONCE(refusal_logged_, "discord: no answer to the handshake on {}", endpoint_);
     Drop();
     return;
   }
 
   if (state_ == State::kReady) {
+    SendPendingReplies();
     ApplyWanted();
+  }
+}
+
+void DiscordPresence::SendPendingReplies() {
+  std::vector<Reply> replies;
+  {
+    std::lock_guard lock(mutex_);
+    replies.swap(pending_replies_);
+  }
+  for (const Reply& reply : replies) {
+    if (!SendCommand(JoinReplyCommand(reply.user_id, reply.accept))) {
+      return;
+    }
+    DISCORD_INFO("discord: join request from {} {}", reply.user_id,
+                 reply.accept ? "approved" : "declined");
   }
 }
 
@@ -184,7 +247,7 @@ bool DiscordPresence::SendCommand(const std::string& json) {
     return false;
   }
   if (!WriteFrame(kOpFrame, json)) {
-    DISCORD_INFO("discord: connection lost");
+    DISCORD_INFO_ONCE(close_logged_, "discord: connection lost");
     Drop();
     return false;
   }
@@ -209,6 +272,10 @@ bool DiscordPresence::TryConnect() {
     return true;
   }
   return false;
+}
+
+void DiscordPresence::BackOff() {
+  retry_interval_ = retry_interval_ < kRetryRefusedOnce ? kRetryRefusedOnce : kRetryRefusedMax;
 }
 
 namespace {
@@ -257,6 +324,9 @@ void DiscordPresence::HandleFrameChecked(const std::string& json) {
   if (state_ == State::kHandshaking) {
     if (evt == "READY") {
       state_ = State::kReady;
+      retry_interval_ = kRetryInterval;
+      refusal_logged_ = false;
+      close_logged_ = false;
       DISCORD_INFO("discord: connected on {}", endpoint_);
       // Without these Discord shows the party but tells us nothing when it is used.
       for (const char* name : {"ACTIVITY_JOIN", "ACTIVITY_JOIN_REQUEST"}) {
@@ -269,7 +339,10 @@ void DiscordPresence::HandleFrameChecked(const std::string& json) {
         SendCommand(sub.dump());
       }
     } else if (evt == "ERROR") {
-      DISCORD_INFO("discord: handshake refused: {}", data.dump());
+      // An application id Discord does not know: it will say so every time,
+      // so the retries stretch out and only the first is worth a line.
+      DISCORD_INFO_ONCE(refusal_logged_, "discord: handshake refused: {}", data.dump());
+      BackOff();
       Drop();
     }
     return;
@@ -289,14 +362,52 @@ void DiscordPresence::HandleFrameChecked(const std::string& json) {
     if (user_id.empty()) {
       return;
     }
-    const bool approve = callbacks_.on_join_request ? callbacks_.on_join_request(user_id, name) : false;
-    DISCORD_INFO("discord: {} asks to join: {}", name, approve ? "approved" : "declined");
-    nlohmann::json answer = {
-        {"cmd", approve ? "SEND_ACTIVITY_JOIN_INVITE" : "CLOSE_ACTIVITY_REQUEST"},
-        {"args", {{"user_id", user_id}}},
-        {"nonce", Nonce()},
-    };
-    SendCommand(answer.dump());
+    const std::optional<bool> answer = callbacks_.on_join_request
+                                           ? callbacks_.on_join_request(user_id, name)
+                                           : std::optional<bool>(false);
+    if (!answer.has_value()) {
+      DISCORD_INFO("discord: {} asks to join: waiting for the host", name);
+      return;
+    }
+    DISCORD_INFO("discord: {} asks to join: {}", name, *answer ? "approved" : "declined");
+    SendCommand(JoinReplyCommand(user_id, *answer));
+  }
+}
+
+void DiscordPresence::DispatchInbox() {
+  while (state_ != State::kDisconnected && inbox_.size() >= 8) {
+    uint32_t op = 0;
+    uint32_t len = 0;
+    std::memcpy(&op, inbox_.data(), 4);
+    std::memcpy(&len, inbox_.data() + 4, 4);
+    if (len > kMaxFrame) {
+      Drop();
+      return;
+    }
+    if (inbox_.size() < 8 + len) {
+      break;
+    }
+    std::string payload(reinterpret_cast<const char*>(inbox_.data() + 8), len);
+    inbox_.erase(inbox_.begin(), inbox_.begin() + 8 + len);
+    switch (op) {
+      case kOpFrame:
+        HandleFrame(payload);
+        break;
+      case kOpPing:
+        // Answered with the same payload, as the protocol asks.
+        if (!WriteFrame(kOpPong, payload)) {
+          Drop();
+          return;
+        }
+        break;
+      case kOpClose:
+        DISCORD_DEBUG("discord: close from the client: {}", payload);
+        Drop();
+        return;
+      case kOpPong:
+      default:
+        break;
+    }
   }
 }
 
@@ -329,51 +440,136 @@ std::vector<std::string> DiscordPresence::Endpoints() {
   return out;
 }
 
+bool DiscordPresence::WriteFrame(uint32_t op, const std::string& json) {
 #if defined(_WIN32)
+  if (pipe_ == nullptr) {
+    return false;
+  }
+#else
+  if (fd_ < 0) {
+    return false;
+  }
+#endif
+  if (outbox_.size() + 8 + json.size() > kMaxOutbox) {
+    // Discord has stopped reading; the connection is dropped by the caller.
+    return false;
+  }
+  const uint32_t len = static_cast<uint32_t>(json.size());
+  const size_t at = outbox_.size();
+  outbox_.resize(at + 8 + json.size());
+  std::memcpy(outbox_.data() + at, &op, 4);
+  std::memcpy(outbox_.data() + at + 4, &len, 4);
+  std::memcpy(outbox_.data() + at + 8, json.data(), json.size());
+  return FlushOutbox();
+}
+
+#if defined(_WIN32)
+
+namespace {
+OVERLAPPED* NewOverlapped() {
+  auto* ov = new OVERLAPPED{};
+  ov->hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+  return ov;
+}
+
+void FreeOverlapped(void*& slot) {
+  auto* ov = static_cast<OVERLAPPED*>(slot);
+  if (ov) {
+    if (ov->hEvent) {
+      CloseHandle(ov->hEvent);
+    }
+    delete ov;
+  }
+  slot = nullptr;
+}
+}  // namespace
 
 bool DiscordPresence::OpenEndpoint(const std::string& endpoint) {
   HANDLE pipe = CreateFileA(endpoint.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                            OPEN_EXISTING, 0, nullptr);
+                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
   if (pipe == INVALID_HANDLE_VALUE) {
     return false;
   }
   pipe_ = pipe;
+  write_overlapped_ = NewOverlapped();
+  read_overlapped_ = NewOverlapped();
+  write_pending_ = false;
+  write_buffer_.clear();
+  outbox_.clear();
   return true;
 }
 
 void DiscordPresence::Drop() {
   if (pipe_ != nullptr) {
-    CloseHandle(static_cast<HANDLE>(pipe_));
+    auto* pipe = static_cast<HANDLE>(pipe_);
+    if (write_pending_) {
+      // The kernel still owns write_buffer_ and the OVERLAPPED: cancel and
+      // wait for the cancellation to land before either is freed.
+      auto* ov = static_cast<OVERLAPPED*>(write_overlapped_);
+      CancelIoEx(pipe, ov);
+      DWORD done = 0;
+      GetOverlappedResult(pipe, ov, &done, TRUE);
+      write_pending_ = false;
+    }
+    CloseHandle(pipe);
     pipe_ = nullptr;
   }
+  FreeOverlapped(write_overlapped_);
+  FreeOverlapped(read_overlapped_);
+  write_buffer_.clear();
+  outbox_.clear();
   state_ = State::kDisconnected;
   shown_valid_ = false;
   inbox_.clear();
+  std::lock_guard lock(mutex_);
+  pending_replies_.clear();
 }
 
-bool DiscordPresence::WriteFrame(uint32_t op, const std::string& json) {
+bool DiscordPresence::FlushOutbox() {
   if (pipe_ == nullptr) {
     return false;
   }
-  std::vector<uint8_t> frame(8 + json.size());
-  const uint32_t len = static_cast<uint32_t>(json.size());
-  std::memcpy(frame.data(), &op, 4);
-  std::memcpy(frame.data() + 4, &len, 4);
-  std::memcpy(frame.data() + 8, json.data(), json.size());
+  auto* pipe = static_cast<HANDLE>(pipe_);
+  auto* ov = static_cast<OVERLAPPED*>(write_overlapped_);
+  if (write_pending_) {
+    DWORD done = 0;
+    if (!GetOverlappedResult(pipe, ov, &done, FALSE)) {
+      return GetLastError() == ERROR_IO_INCOMPLETE;
+    }
+    write_pending_ = false;
+    write_buffer_.clear();
+  }
+  if (outbox_.empty()) {
+    return true;
+  }
+  write_buffer_.swap(outbox_);
+  outbox_.clear();
+  ResetEvent(ov->hEvent);
+  ov->Offset = 0;
+  ov->OffsetHigh = 0;
   DWORD written = 0;
-  return WriteFile(static_cast<HANDLE>(pipe_), frame.data(), static_cast<DWORD>(frame.size()),
-                   &written, nullptr) &&
-         written == frame.size();
+  if (WriteFile(pipe, write_buffer_.data(), static_cast<DWORD>(write_buffer_.size()), &written,
+                ov)) {
+    write_buffer_.clear();
+    return true;
+  }
+  if (GetLastError() == ERROR_IO_PENDING) {
+    write_pending_ = true;
+    return true;
+  }
+  return false;
 }
 
 void DiscordPresence::ReadAvailable() {
   if (pipe_ == nullptr) {
     return;
   }
+  auto* pipe = static_cast<HANDLE>(pipe_);
+  auto* ov = static_cast<OVERLAPPED*>(read_overlapped_);
   for (;;) {
     DWORD available = 0;
-    if (!PeekNamedPipe(static_cast<HANDLE>(pipe_), nullptr, 0, nullptr, &available, nullptr)) {
-      DISCORD_INFO("discord: connection closed");
+    if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
+      DISCORD_INFO_ONCE(close_logged_, "discord: connection closed");
       Drop();
       return;
     }
@@ -381,27 +577,30 @@ void DiscordPresence::ReadAvailable() {
       break;
     }
     uint8_t buf[4096];
+    const DWORD want = std::min<DWORD>(available, sizeof(buf));
+    ResetEvent(ov->hEvent);
+    ov->Offset = 0;
+    ov->OffsetHigh = 0;
     DWORD got = 0;
-    if (!ReadFile(static_cast<HANDLE>(pipe_), buf, sizeof(buf), &got, nullptr) || got == 0) {
-      Drop();
-      return;
+    if (!ReadFile(pipe, buf, want, &got, ov)) {
+      // Only what PeekNamedPipe reported is asked for, so a pending read
+      // completes at once; waiting on it is bounded.
+      if (GetLastError() != ERROR_IO_PENDING || !GetOverlappedResult(pipe, ov, &got, TRUE)) {
+        DISCORD_INFO_ONCE(close_logged_, "discord: connection closed");
+        Drop();
+        return;
+      }
     }
-    inbox_.insert(inbox_.end(), buf, buf + got);
-  }
-  while (inbox_.size() >= 8) {
-    uint32_t len = 0;
-    std::memcpy(&len, inbox_.data() + 4, 4);
-    if (len > kMaxFrame) {
-      Drop();
-      return;
-    }
-    if (inbox_.size() < 8 + len) {
+    if (got == 0) {
       break;
     }
-    std::string json(reinterpret_cast<const char*>(inbox_.data() + 8), len);
-    inbox_.erase(inbox_.begin(), inbox_.begin() + 8 + len);
-    HandleFrame(json);
+    inbox_.insert(inbox_.end(), buf, buf + got);
+    if (inbox_.size() > kMaxFrame + 8) {
+      Drop();
+      return;
+    }
   }
+  DispatchInbox();
 }
 
 #else
@@ -415,6 +614,7 @@ bool DiscordPresence::OpenEndpoint(const std::string& endpoint) {
   if (fd < 0) {
     return false;
   }
+  fcntl(fd, F_SETFD, FD_CLOEXEC);
   sockaddr_un addr{};
   addr.sun_family = AF_UNIX;
   if (endpoint.size() >= sizeof(addr.sun_path)) {
@@ -422,11 +622,19 @@ bool DiscordPresence::OpenEndpoint(const std::string& endpoint) {
     return false;
   }
   std::strncpy(addr.sun_path, endpoint.c_str(), sizeof(addr.sun_path) - 1);
+  // A unix-socket connect completes in the call; non-blocking from then on so
+  // neither a full send buffer nor a quiet client can hold the pump thread.
   if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
     close(fd);
     return false;
   }
+  const int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+    close(fd);
+    return false;
+  }
   fd_ = fd;
+  outbox_.clear();
   return true;
 }
 
@@ -435,28 +643,36 @@ void DiscordPresence::Drop() {
     close(fd_);
     fd_ = -1;
   }
+  outbox_.clear();
   state_ = State::kDisconnected;
   shown_valid_ = false;
   inbox_.clear();
+  std::lock_guard lock(mutex_);
+  pending_replies_.clear();
 }
 
-bool DiscordPresence::WriteFrame(uint32_t op, const std::string& json) {
+bool DiscordPresence::FlushOutbox() {
   if (fd_ < 0) {
     return false;
   }
-  std::vector<uint8_t> frame(8 + json.size());
-  const uint32_t len = static_cast<uint32_t>(json.size());
-  std::memcpy(frame.data(), &op, 4);
-  std::memcpy(frame.data() + 4, &len, 4);
-  std::memcpy(frame.data() + 8, json.data(), json.size());
   size_t sent = 0;
-  while (sent < frame.size()) {
-    const ssize_t n = send(fd_, frame.data() + sent, frame.size() - sent, MSG_NOSIGNAL);
-    if (n <= 0) {
-      return false;
+  while (sent < outbox_.size()) {
+    const ssize_t n =
+        send(fd_, outbox_.data() + sent, outbox_.size() - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+    if (n > 0) {
+      sent += static_cast<size_t>(n);
+      continue;
     }
-    sent += static_cast<size_t>(n);
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      break;  // the rest waits for the next pump
+    }
+    outbox_.erase(outbox_.begin(), outbox_.begin() + static_cast<std::ptrdiff_t>(sent));
+    return false;
   }
+  outbox_.erase(outbox_.begin(), outbox_.begin() + static_cast<std::ptrdiff_t>(sent));
   return true;
 }
 
@@ -465,37 +681,27 @@ void DiscordPresence::ReadAvailable() {
     return;
   }
   for (;;) {
-    pollfd pfd{fd_, POLLIN, 0};
-    const int ready = poll(&pfd, 1, 0);
-    if (ready <= 0) {
-      break;
-    }
     uint8_t buf[4096];
     const ssize_t got = recv(fd_, buf, sizeof(buf), MSG_DONTWAIT);
-    if (got == 0 || (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-      DISCORD_INFO("discord: connection closed");
-      Drop();
-      return;
+    if (got > 0) {
+      inbox_.insert(inbox_.end(), buf, buf + got);
+      if (inbox_.size() > kMaxFrame + 8) {
+        Drop();
+        return;
+      }
+      continue;
     }
-    if (got < 0) {
+    if (got < 0 && errno == EINTR) {
+      continue;
+    }
+    if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       break;
     }
-    inbox_.insert(inbox_.end(), buf, buf + got);
+    DISCORD_INFO_ONCE(close_logged_, "discord: connection closed");
+    Drop();
+    return;
   }
-  while (inbox_.size() >= 8) {
-    uint32_t len = 0;
-    std::memcpy(&len, inbox_.data() + 4, 4);
-    if (len > kMaxFrame) {
-      Drop();
-      return;
-    }
-    if (inbox_.size() < 8 + len) {
-      break;
-    }
-    std::string json(reinterpret_cast<const char*>(inbox_.data() + 8), len);
-    inbox_.erase(inbox_.begin(), inbox_.begin() + 8 + len);
-    HandleFrame(json);
-  }
+  DispatchInbox();
 }
 
 #endif

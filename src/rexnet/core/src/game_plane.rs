@@ -25,7 +25,9 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use libp2p::PeerId;
 use tokio::net::UdpSocket;
@@ -33,24 +35,79 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::crypto::{self, SessionKeys};
 use crate::engine::{Event, FRAME_DATA};
+use crate::ffi::REXNET_EVENT_DATA_MAX;
+
+/// Microseconds since the process started. Only ever compared with itself.
+pub(crate) fn now_micros() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+/// How often the oversized-datagram drop is said out loud. The count in the
+/// line is the running total, so the line is a report, not a frequency.
+const OVERSIZED_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Event sink shared by the engine and the fast paths. Every emit pings the
 /// notify so a blocked `rexnet_wait_event` wakes at once instead of at the
 /// next pump tick.
+///
+/// Also the one place every inbound datagram passes on its way to the shim,
+/// which makes it the right choke point for the event-size contract: a
+/// payload the fixed event cannot carry is dropped and counted here, never
+/// truncated, whichever path (fast, engine, tunnel) produced it.
 #[derive(Clone)]
 pub struct Emitter {
     tx: mpsc::UnboundedSender<Event>,
     notify: Arc<Notify>,
+    /// Datagrams dropped for exceeding `REXNET_EVENT_DATA_MAX`, both
+    /// directions, since start. Read by [`GamePlane::oversized_drops`].
+    oversized: Arc<AtomicU64>,
+    /// `now_micros()` of the last oversized warning, for the rate limit.
+    oversized_warned_at: Arc<AtomicU64>,
 }
 
 impl Emitter {
     pub fn new(tx: mpsc::UnboundedSender<Event>, notify: Arc<Notify>) -> Self {
-        Self { tx, notify }
+        Self {
+            tx,
+            notify,
+            oversized: Arc::new(AtomicU64::new(0)),
+            oversized_warned_at: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn emit(&self, event: Event) {
+        if let Event::Datagram { data, virtual_ip, .. } = &event {
+            if data.len() > REXNET_EVENT_DATA_MAX {
+                self.drop_oversized(data.len(), "inbound", *virtual_ip);
+                return;
+            }
+        }
         let _ = self.tx.send(event);
         self.notify.notify_one();
+    }
+
+    /// Count a datagram the event contract cannot carry; say so at most once
+    /// per `OVERSIZED_WARN_INTERVAL`, with the running total.
+    pub fn drop_oversized(&self, len: usize, direction: &str, virtual_ip: u32) {
+        let total = self.oversized.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = now_micros();
+        let last = self.oversized_warned_at.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= OVERSIZED_WARN_INTERVAL.as_micros() as u64
+            && self
+                .oversized_warned_at
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                len, max = REXNET_EVENT_DATA_MAX, direction, virtual_ip, total,
+                "datagram larger than an event can carry; dropped, not truncated"
+            );
+        }
+    }
+
+    pub fn oversized_drops(&self) -> u64 {
+        self.oversized.load(Ordering::Relaxed)
     }
 }
 
@@ -61,6 +118,10 @@ struct Tables {
     peer_by_endpoint: HashMap<SocketAddr, PeerId>,
     vip_by_peer: HashMap<PeerId, u32>,
     peer_by_vip: HashMap<u32, PeerId>,
+    /// When a title datagram last crossed the plane to or from each peer,
+    /// on any path. This is what makes a peer a *session* peer: a warmed
+    /// game plane that carries nothing is not a game.
+    last_traffic: HashMap<PeerId, Instant>,
 }
 
 pub struct GamePlane {
@@ -149,24 +210,63 @@ impl GamePlane {
         }
     }
 
+    // --- Title traffic, the measure of a live session -----------------------
+
+    /// A title datagram went to or came from `peer` by a path that bypasses
+    /// the tables here (the tunnel); the fast paths record their own.
+    pub fn note_traffic(&self, peer: PeerId) {
+        self.lock().last_traffic.insert(peer, Instant::now());
+    }
+
+    /// Peers with title traffic inside `window`. Stale entries are dropped on
+    /// the way, so the table stays bounded by the peers actually heard.
+    pub fn peers_active_within(&self, window: Duration) -> Vec<PeerId> {
+        let now = Instant::now();
+        let mut t = self.lock();
+        t.last_traffic.retain(|_, at| now.saturating_duration_since(*at) < window);
+        t.last_traffic.keys().copied().collect()
+    }
+
+    pub fn forget_traffic(&self, peer: &PeerId) {
+        self.lock().last_traffic.remove(peer);
+    }
+
+    /// Datagrams dropped for exceeding the event payload, both directions.
+    pub fn oversized_drops(&self) -> u64 {
+        self.emitter.oversized_drops()
+    }
+
+    /// An outbound datagram no event on the far side could carry: dropped
+    /// here rather than sent to be dropped there.
+    pub fn drop_oversized(&self, len: usize, virtual_ip: u32) {
+        self.emitter.drop_oversized(len, "outbound", virtual_ip);
+    }
+
     // --- Sealing, used by the engine for queued and broadcast traffic ------
 
-    /// `None` when there are no keys — the caller drops it. No plaintext
-    /// fallback: that would be a downgrade an attacker could force.
+    /// `None` when there are no keys — the caller drops it and says so. No
+    /// plaintext fallback: that would be a downgrade an attacker could force.
+    /// Silent here on purpose: this runs under the tables lock, and the
+    /// caller rate-limits the complaint.
     pub fn seal(&self, peer: PeerId, src_port: u16, dst_port: u16, data: &[u8]) -> Option<Vec<u8>> {
         let mut t = self.lock();
-        let Some(keys) = t.keys.get_mut(&peer) else {
-            tracing::warn!(%peer, "no game-plane keys; datagram dropped rather than sent in clear");
-            return None;
-        };
-        seal_with(keys, peer, src_port, dst_port, data)
+        let keys = t.keys.get_mut(&peer)?;
+        let frame = seal_with(keys, peer, src_port, dst_port, data);
+        if frame.is_some() {
+            t.last_traffic.insert(peer, Instant::now());
+        }
+        frame
     }
 
     /// Authenticate and decrypt an inbound game datagram.
     pub fn open(&self, peer: PeerId, frame: &[u8]) -> Option<(u16, u16, Vec<u8>)> {
         let mut t = self.lock();
         let keys = t.keys.get_mut(&peer)?;
-        open_with(keys, peer, frame)
+        let opened = open_with(keys, peer, frame);
+        if opened.is_some() {
+            t.last_traffic.insert(peer, Instant::now());
+        }
+        opened
     }
 
     // --- Fast paths --------------------------------------------------------
@@ -186,6 +286,7 @@ impl GamePlane {
             return false;
         };
         if let Some(frame) = seal_with(keys, peer, src_port, dst_port, data) {
+            t.last_traffic.insert(peer, Instant::now());
             // Non-blocking on purpose: the guest thinks this is UDP, and a
             // full socket buffer should drop rather than stall a game thread.
             let _ = self.socket.try_send_to(&frame, endpoint);
@@ -213,7 +314,11 @@ impl GamePlane {
             };
             // Authentic-but-rejected frames (replays, short records) are
             // consumed here: the engine could do nothing more with them.
-            open_with(keys, peer, frame).map(|(src_port, dst_port, data)| Event::Datagram {
+            let opened = open_with(keys, peer, frame);
+            if opened.is_some() {
+                t.last_traffic.insert(peer, Instant::now());
+            }
+            opened.map(|(src_port, dst_port, data)| Event::Datagram {
                 virtual_ip: vip,
                 src_port,
                 dst_port,

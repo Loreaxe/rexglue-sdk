@@ -61,7 +61,12 @@
 #define REXNET_EVENT_DATAGRAM 10
 
 /**
- * Punch failed; traffic for `peer` rides the control tunnel (degraded).
+ * Traffic for `peer` rides the control tunnel (degraded game plane, §14):
+ * its punch failed, or its control connection came back after a blip and
+ * it was tunnelled before. Emitted each time the tunnel engages. From this
+ * point the peer is as usable as after a successful PUNCH_RESULT -- the
+ * shim may treat DEGRADED as connected; no PUNCH_RESULT follows for it.
+ * Fixed at 11.
  */
 #define REXNET_EVENT_DEGRADED 11
 
@@ -137,6 +142,35 @@
  * A friend request we sent reached `peer` (they acknowledged it).
  */
 #define REXNET_EVENT_FRIEND_DELIVERED 26
+
+/**
+ * An invite (or invite reply) to `peer` could not be delivered after its
+ * retry, or it waited out INVITE_DEFER_MAX for a connection that never
+ * came. data = UTF-8 reason. The host should hear this: the invitee never
+ * saw the invite.
+ */
+#define REXNET_EVENT_INVITE_FAILED 27
+
+/**
+ * Return codes of the `-> int32_t` entry points: the call is non-blocking,
+ * so this says only whether the command was taken, never how it went.
+ */
+#define REXNET_OK 0
+
+/**
+ * `handle` was NULL.
+ */
+#define REXNET_ERR_HANDLE -1
+
+/**
+ * A peer id argument was NULL or not a valid multihash.
+ */
+#define REXNET_ERR_PEER -2
+
+/**
+ * The engine has shut down and takes no more commands.
+ */
+#define REXNET_ERR_ENGINE -3
 
 typedef struct RexNetHandle RexNetHandle;
 
@@ -438,6 +472,28 @@ void rexnet_session_create(struct RexNetHandle *handle,
 void rexnet_session_delete(struct RexNetHandle *handle);
 
 /**
+ * Set the local session's join token; 0 = none. A peer whose session query
+ * carries this token is served the descriptor even when the session is
+ * private, and is remembered as invited so its later queries and joins need
+ * no token. The token is held with the local session and cleared with it;
+ * with no session up the call is a no-op. Returns a `REXNET_*` code.
+ *
+ * # Safety
+ * `handle` from [`rexnet_init`].
+ */
+int32_t rexnet_session_set_join_token(struct RexNetHandle *handle, uint64_t token);
+
+/**
+ * Update the local session's slot counts as served to queriers; values above
+ * 255 saturate. With no session up the call is a no-op. Returns a `REXNET_*`
+ * code.
+ *
+ * # Safety
+ * `handle` from [`rexnet_init`].
+ */
+int32_t rexnet_session_set_slots(struct RexNetHandle *handle, uint32_t open, uint32_t total);
+
+/**
  * Guest TCP connect to a peer's virtual IP (§18). Result arrives as a
  * StreamOpened or StreamConnectFailed event.
  *
@@ -492,12 +548,16 @@ void rexnet_shard_join(struct RexNetHandle *handle, const uint8_t *shard_id);
 /**
  * Ask one peer for its session descriptor; the answer arrives as a
  * SESSION_FOUND event like a search result. For a join that already knows
- * the host (an invite, a pasted code).
+ * the host (an invite, a pasted code). `token` (0 = none) is the host's
+ * join token: a private session is served only to a peer the host invited
+ * or one presenting the right token. Returns a `REXNET_*` code.
  *
  * # Safety
  * `handle` from [`rexnet_init`]; `peer` valid.
  */
-void rexnet_session_query(struct RexNetHandle *handle, const struct RexNetPeerId *peer);
+int32_t rexnet_session_query(struct RexNetHandle *handle,
+                             const struct RexNetPeerId *peer,
+                             uint64_t token);
 
 /**
  * Leave any shard and stop publishing/scanning.

@@ -199,7 +199,12 @@ pub const REXNET_EVENT_INVITE_REPLIED: u32 = 7;
 pub const REXNET_EVENT_PUNCH_RESULT: u32 = 8;
 pub const REXNET_EVENT_SESSION_FOUND: u32 = 9;
 pub const REXNET_EVENT_DATAGRAM: u32 = 10;
-/// Punch failed; traffic for `peer` rides the control tunnel (degraded).
+/// Traffic for `peer` rides the control tunnel (degraded game plane, §14):
+/// its punch failed, or its control connection came back after a blip and
+/// it was tunnelled before. Emitted each time the tunnel engages. From this
+/// point the peer is as usable as after a successful PUNCH_RESULT -- the
+/// shim may treat DEGRADED as connected; no PUNCH_RESULT follows for it.
+/// Fixed at 11.
 pub const REXNET_EVENT_DEGRADED: u32 = 11;
 pub const REXNET_EVENT_ERROR: u32 = 12;
 pub const REXNET_EVENT_FRIEND_REMOVED: u32 = 13;
@@ -233,6 +238,11 @@ pub const REXNET_EVENT_SHARD_JOINED: u32 = 24;
 pub const REXNET_EVENT_SHARD_LEFT: u32 = 25;
 /// A friend request we sent reached `peer` (they acknowledged it).
 pub const REXNET_EVENT_FRIEND_DELIVERED: u32 = 26;
+/// An invite (or invite reply) to `peer` could not be delivered after its
+/// retry, or it waited out INVITE_DEFER_MAX for a connection that never
+/// came. data = UTF-8 reason. The host should hear this: the invitee never
+/// saw the invite.
+pub const REXNET_EVENT_INVITE_FAILED: u32 = 27;
 
 /// Rust-side view of the same numbering.
 #[repr(u32)]
@@ -265,7 +275,18 @@ pub enum RexNetEventKind {
     ShardJoined = REXNET_EVENT_SHARD_JOINED,
     ShardLeft = REXNET_EVENT_SHARD_LEFT,
     FriendDelivered = REXNET_EVENT_FRIEND_DELIVERED,
+    InviteFailed = REXNET_EVENT_INVITE_FAILED,
 }
+
+/// Return codes of the `-> int32_t` entry points: the call is non-blocking,
+/// so this says only whether the command was taken, never how it went.
+pub const REXNET_OK: i32 = 0;
+/// `handle` was NULL.
+pub const REXNET_ERR_HANDLE: i32 = -1;
+/// A peer id argument was NULL or not a valid multihash.
+pub const REXNET_ERR_PEER: i32 = -2;
+/// The engine has shut down and takes no more commands.
+pub const REXNET_ERR_ENGINE: i32 = -3;
 
 /// Fixed-size POD event, drained once per frame via [`rexnet_poll_event`].
 /// Variable payloads (presence records, session descriptors, datagrams,
@@ -439,6 +460,11 @@ fn fill_event(out: &mut RexNetEvent, event: Event) {
             out.kind = RexNetEventKind::FriendDelivered as u32;
             out.peer = RexNetPeerId::from_peer(&peer);
         }
+        Event::InviteFailed { peer, message } => {
+            out.kind = RexNetEventKind::InviteFailed as u32;
+            out.peer = RexNetPeerId::from_peer(&peer);
+            set_data(out, message.as_bytes());
+        }
         Event::ShardLeft { shard_id } => {
             out.kind = RexNetEventKind::ShardLeft as u32;
             set_data(out, &shard_id);
@@ -591,6 +617,18 @@ unsafe fn with_handle(handle: *mut RexNetHandle, f: impl FnOnce(&RexNetHandle)) 
             f(handle);
         }
     }));
+}
+
+/// Enqueue one command, reporting whether it was taken (`REXNET_*` codes).
+unsafe fn send_command(handle: *mut RexNetHandle, cmd: Command) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(handle) = handle.as_ref() else { return REXNET_ERR_HANDLE };
+        match handle.cmd_tx.send(cmd) {
+            Ok(()) => REXNET_OK,
+            Err(_) => REXNET_ERR_ENGINE,
+        }
+    }))
+    .unwrap_or(REXNET_ERR_ENGINE)
 }
 
 /// Block the calling thread until an event is queued or `timeout_ms`
@@ -989,6 +1027,30 @@ pub unsafe extern "C" fn rexnet_session_delete(handle: *mut RexNetHandle) {
     });
 }
 
+/// Set the local session's join token; 0 = none. A peer whose session query
+/// carries this token is served the descriptor even when the session is
+/// private, and is remembered as invited so its later queries and joins need
+/// no token. The token is held with the local session and cleared with it;
+/// with no session up the call is a no-op. Returns a `REXNET_*` code.
+///
+/// # Safety
+/// `handle` from [`rexnet_init`].
+#[no_mangle]
+pub unsafe extern "C" fn rexnet_session_set_join_token(handle: *mut RexNetHandle, token: u64) -> i32 {
+    send_command(handle, Command::SessionSetJoinToken { token })
+}
+
+/// Update the local session's slot counts as served to queriers; values above
+/// 255 saturate. With no session up the call is a no-op. Returns a `REXNET_*`
+/// code.
+///
+/// # Safety
+/// `handle` from [`rexnet_init`].
+#[no_mangle]
+pub unsafe extern "C" fn rexnet_session_set_slots(handle: *mut RexNetHandle, open: u32, total: u32) -> i32 {
+    send_command(handle, Command::SessionSetSlots { open, total })
+}
+
 /// Guest TCP connect to a peer's virtual IP (§18). Result arrives as a
 /// StreamOpened or StreamConnectFailed event.
 ///
@@ -1071,17 +1133,22 @@ pub unsafe extern "C" fn rexnet_shard_join(handle: *mut RexNetHandle, shard_id: 
 
 /// Ask one peer for its session descriptor; the answer arrives as a
 /// SESSION_FOUND event like a search result. For a join that already knows
-/// the host (an invite, a pasted code).
+/// the host (an invite, a pasted code). `token` (0 = none) is the host's
+/// join token: a private session is served only to a peer the host invited
+/// or one presenting the right token. Returns a `REXNET_*` code.
 ///
 /// # Safety
 /// `handle` from [`rexnet_init`]; `peer` valid.
 #[no_mangle]
-pub unsafe extern "C" fn rexnet_session_query(handle: *mut RexNetHandle, peer: *const RexNetPeerId) {
-    with_handle(handle, |h| {
-        if let Some(peer) = peer.as_ref().and_then(RexNetPeerId::to_peer) {
-            let _ = h.cmd_tx.send(Command::SessionQuery { peer });
-        }
-    });
+pub unsafe extern "C" fn rexnet_session_query(
+    handle: *mut RexNetHandle,
+    peer: *const RexNetPeerId,
+    token: u64,
+) -> i32 {
+    let Some(peer) = peer.as_ref().and_then(RexNetPeerId::to_peer) else {
+        return REXNET_ERR_PEER;
+    };
+    send_command(handle, Command::SessionQuery { peer, token })
 }
 
 /// Leave any shard and stop publishing/scanning.
@@ -1125,6 +1192,13 @@ pub unsafe extern "C" fn rexnet_send_datagram(
     reliable: bool,
 ) {
     with_handle(handle, |h| {
+        // No event on the far side can carry more than this, so the datagram
+        // is dropped here, counted, and never truncated into something the
+        // title would misparse.
+        if len as usize > REXNET_EVENT_DATA_MAX {
+            h.plane.drop_oversized(len as usize, virtual_ip);
+            return;
+        }
         // Ready peer: sealed and sent on this thread. Everything else (punch
         // in flight, tunnel, broadcast) is the engine's to route.
         if !data.is_null() && len > 0 {
