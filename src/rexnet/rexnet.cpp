@@ -14,6 +14,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string_view>
@@ -646,10 +647,347 @@ std::string EndpointToMultiaddr(const std::string& endpoint, const std::string& 
   return std::string(v6 ? "/ip6/" : "/ip4/") + host + "/udp/" + port + "/quic-v1/p2p/" + peer;
 }
 
-/// Join material versions. REXJ3 adds the join token; REXJ2 is read, never
-/// written, so material from the previous build still joins a public session.
+/// Text join material, read and never written: REXJ3 with the join token,
+/// REXJ2 without it. Both run past Discord's limit with a shard set.
 constexpr const char* kJoinSecretVersion = "REXJ3";
 constexpr const char* kJoinSecretVersionNoToken = "REXJ2";
+
+/// Discord refuses a SET_ACTIVITY whose secrets.join is longer than this, and
+/// the party with it: no Join button at all.
+constexpr size_t kJoinSecretMax = 128;
+
+/// REXJ4, the written form: bytes in base64url without padding. Byte 0 is
+/// version << 4 | flags, then title (BE), peer, session, [shard], [endpoint],
+/// token (BE). At most 95 bytes, 127 characters.
+constexpr uint8_t kJoinV4 = 0x40;
+constexpr uint8_t kJoinHasShard = 0x01;
+constexpr uint8_t kJoinEndpointV4 = 0x02;
+constexpr uint8_t kJoinEndpointV6 = 0x04;
+/// The peer is the 32-byte ed25519 key; otherwise a length byte and the id.
+constexpr uint8_t kJoinPeerEd25519 = 0x08;
+/// An ed25519 peer id is this identity-multihash prefix and the key.
+constexpr uint8_t kEd25519PeerPrefix[6] = {0x00, 0x24, 0x08, 0x01, 0x12, 0x20};
+
+struct JoinMaterial {
+  uint32_t title = 0;
+  RexNetPeerId peer{};
+  std::array<uint8_t, 16> session{};
+  std::optional<std::array<uint8_t, 16>> shard;
+  /// `host:port` as the external-address event states it; empty = none.
+  std::string endpoint;
+  uint64_t token = 0;
+};
+
+constexpr char kBase64Url[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+std::string Base64UrlEncode(const std::vector<uint8_t>& in) {
+  std::string out;
+  uint32_t acc = 0;
+  int bits = 0;
+  for (uint8_t byte : in) {
+    acc = (acc << 8) | byte;
+    bits += 8;
+    while (bits >= 6) {
+      bits -= 6;
+      out += kBase64Url[(acc >> bits) & 0x3F];
+    }
+  }
+  if (bits > 0) {
+    out += kBase64Url[(acc << (6 - bits)) & 0x3F];
+  }
+  return out;
+}
+
+std::optional<std::vector<uint8_t>> Base64UrlDecode(const std::string& in) {
+  std::vector<uint8_t> out;
+  uint32_t acc = 0;
+  int bits = 0;
+  for (char c : in) {
+    const char* at = std::strchr(kBase64Url, c);
+    if (c == '\0' || at == nullptr) {
+      return std::nullopt;
+    }
+    acc = (acc << 6) | static_cast<uint32_t>(at - kBase64Url);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(static_cast<uint8_t>(acc >> bits));
+    }
+  }
+  return out;
+}
+
+/// `a.b.c.d:port` or `[v6]:port` to its address bytes and port. An address
+/// this cannot read (a v6 with an embedded v4) is left out of the material,
+/// and the join finds the host through the DHT instead.
+bool ParseEndpoint(const std::string& endpoint, bool& v6, std::array<uint8_t, 16>& addr,
+                   uint16_t& port) {
+  const size_t colon = endpoint.rfind(':');
+  if (colon == std::string::npos || colon + 1 >= endpoint.size()) {
+    return false;
+  }
+  unsigned long port_value = 0;
+  {
+    char* end = nullptr;
+    port_value = std::strtoul(endpoint.c_str() + colon + 1, &end, 10);
+    if (*end != '\0' || port_value == 0 || port_value > 0xFFFF) {
+      return false;
+    }
+  }
+  port = static_cast<uint16_t>(port_value);
+  std::string host = endpoint.substr(0, colon);
+  addr.fill(0);
+  if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+    host = host.substr(1, host.size() - 2);
+  }
+  if (host.find(':') == std::string::npos) {
+    v6 = false;
+    unsigned a, b, c, d;
+    char extra;
+    if (std::sscanf(host.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra) != 4 || a > 255 ||
+        b > 255 || c > 255 || d > 255) {
+      return false;
+    }
+    addr[0] = static_cast<uint8_t>(a);
+    addr[1] = static_cast<uint8_t>(b);
+    addr[2] = static_cast<uint8_t>(c);
+    addr[3] = static_cast<uint8_t>(d);
+    return true;
+  }
+  v6 = true;
+  // Groups either side of a "::"; the gap between them is zeros.
+  std::vector<uint16_t> head, tail;
+  std::vector<uint16_t>* side = &head;
+  size_t i = 0;
+  if (host.compare(0, 2, "::") == 0) {
+    side = &tail;
+    i = 2;
+  }
+  while (i < host.size()) {
+    size_t end = host.find(':', i);
+    if (end == std::string::npos) {
+      end = host.size();
+    }
+    const std::string group = host.substr(i, end - i);
+    if (group.empty() || group.size() > 4 ||
+        group.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+      return false;
+    }
+    side->push_back(static_cast<uint16_t>(std::strtoul(group.c_str(), nullptr, 16)));
+    i = end + 1;
+    if (end + 1 < host.size() && host[end + 1] == ':') {
+      if (side == &tail) {
+        return false;
+      }
+      side = &tail;
+      i = end + 2;
+    }
+  }
+  const bool gap = side == &tail;
+  if (head.size() + tail.size() > (gap ? 7u : 8u) || (!gap && head.size() != 8)) {
+    return false;
+  }
+  for (size_t g = 0; g < head.size(); ++g) {
+    addr[2 * g] = static_cast<uint8_t>(head[g] >> 8);
+    addr[2 * g + 1] = static_cast<uint8_t>(head[g]);
+  }
+  for (size_t g = 0; g < tail.size(); ++g) {
+    const size_t at = 16 - 2 * (tail.size() - g);
+    addr[at] = static_cast<uint8_t>(tail[g] >> 8);
+    addr[at + 1] = static_cast<uint8_t>(tail[g]);
+  }
+  return true;
+}
+
+std::string FormatEndpoint(bool v6, const uint8_t* addr, uint16_t port) {
+  if (!v6) {
+    return fmt::format("{}.{}.{}.{}:{}", addr[0], addr[1], addr[2], addr[3], port);
+  }
+  std::string host;
+  for (int g = 0; g < 8; ++g) {
+    host += fmt::format("{}{:x}", g ? ":" : "", (addr[2 * g] << 8) | addr[2 * g + 1]);
+  }
+  return fmt::format("[{}]:{}", host, port);
+}
+
+void PutBE(std::vector<uint8_t>& out, uint64_t value, int bytes) {
+  for (int i = bytes - 1; i >= 0; --i) {
+    out.push_back(static_cast<uint8_t>(value >> (8 * i)));
+  }
+}
+
+std::string EncodeJoinMaterial(const JoinMaterial& m) {
+  bool v6 = false;
+  std::array<uint8_t, 16> addr{};
+  uint16_t port = 0;
+  const bool has_endpoint = !m.endpoint.empty() && ParseEndpoint(m.endpoint, v6, addr, port);
+  const bool ed25519 =
+      m.peer.len == 38 && std::memcmp(m.peer.bytes, kEd25519PeerPrefix, 6) == 0;
+
+  std::vector<uint8_t> out;
+  uint8_t head = kJoinV4;
+  head |= m.shard ? kJoinHasShard : 0;
+  head |= has_endpoint ? (v6 ? kJoinEndpointV6 : kJoinEndpointV4) : 0;
+  head |= ed25519 ? kJoinPeerEd25519 : 0;
+  out.push_back(head);
+  PutBE(out, m.title, 4);
+  if (ed25519) {
+    out.insert(out.end(), m.peer.bytes + 6, m.peer.bytes + 38);
+  } else {
+    out.push_back(m.peer.len);
+    out.insert(out.end(), m.peer.bytes, m.peer.bytes + m.peer.len);
+  }
+  out.insert(out.end(), m.session.begin(), m.session.end());
+  if (m.shard) {
+    out.insert(out.end(), m.shard->begin(), m.shard->end());
+  }
+  if (has_endpoint) {
+    out.insert(out.end(), addr.begin(), addr.begin() + (v6 ? 16 : 4));
+    PutBE(out, port, 2);
+  }
+  PutBE(out, m.token, 8);
+  return Base64UrlEncode(out);
+}
+
+std::optional<JoinMaterial> DecodeJoinMaterial(const std::string& text) {
+  const std::optional<std::vector<uint8_t>> bytes = Base64UrlDecode(text);
+  if (!bytes || bytes->empty() || ((*bytes)[0] & 0xF0) != kJoinV4) {
+    return std::nullopt;
+  }
+  const std::vector<uint8_t>& in = *bytes;
+  const uint8_t head = in[0];
+  size_t at = 1;
+  auto take = [&](size_t n) -> const uint8_t* {
+    if (at + n > in.size()) {
+      return nullptr;
+    }
+    const uint8_t* p = in.data() + at;
+    at += n;
+    return p;
+  };
+  auto take_be = [&](int n, uint64_t& value) {
+    const uint8_t* p = take(n);
+    if (!p) {
+      return false;
+    }
+    value = 0;
+    for (int i = 0; i < n; ++i) {
+      value = (value << 8) | p[i];
+    }
+    return true;
+  };
+
+  JoinMaterial m;
+  uint64_t title = 0;
+  if (!take_be(4, title)) {
+    return std::nullopt;
+  }
+  m.title = static_cast<uint32_t>(title);
+  if (head & kJoinPeerEd25519) {
+    const uint8_t* key = take(32);
+    if (!key) {
+      return std::nullopt;
+    }
+    m.peer.len = 38;
+    std::memcpy(m.peer.bytes, kEd25519PeerPrefix, 6);
+    std::memcpy(m.peer.bytes + 6, key, 32);
+  } else {
+    const uint8_t* len = take(1);
+    const uint8_t* id = len && *len <= sizeof(m.peer.bytes) ? take(*len) : nullptr;
+    if (!id) {
+      return std::nullopt;
+    }
+    m.peer.len = *len;
+    std::memcpy(m.peer.bytes, id, *len);
+  }
+  const uint8_t* session = take(16);
+  if (!session) {
+    return std::nullopt;
+  }
+  std::memcpy(m.session.data(), session, 16);
+  if (head & kJoinHasShard) {
+    const uint8_t* shard = take(16);
+    if (!shard) {
+      return std::nullopt;
+    }
+    m.shard.emplace();
+    std::memcpy(m.shard->data(), shard, 16);
+  }
+  if (head & (kJoinEndpointV4 | kJoinEndpointV6)) {
+    const bool v6 = (head & kJoinEndpointV6) != 0;
+    const uint8_t* addr = take(v6 ? 16 : 4);
+    uint64_t port = 0;
+    if (!addr || !take_be(2, port)) {
+      return std::nullopt;
+    }
+    m.endpoint = FormatEndpoint(v6, addr, static_cast<uint16_t>(port));
+  }
+  if (!take_be(8, m.token) || at != in.size()) {
+    return std::nullopt;
+  }
+  return m;
+}
+
+/// REXJ3|title|peer|session|shard|endpoint|token, REXJ2 without the token,
+/// or the first cut's peer|title|session, as the host bridge still writes it.
+bool ParseJoinText(const std::string& secret, JoinMaterial& m) {
+  std::vector<std::string> parts;
+  {
+    std::stringstream in(secret);
+    std::string part;
+    while (std::getline(in, part, '|')) {
+      parts.push_back(part);
+    }
+  }
+  std::string peer_text, title_text, session_text, shard_text, endpoint_text, token_text;
+  if (parts.size() == 7 && parts[0] == kJoinSecretVersion) {
+    title_text = parts[1];
+    peer_text = parts[2];
+    session_text = parts[3];
+    shard_text = parts[4];
+    endpoint_text = parts[5];
+    token_text = parts[6];
+  } else if (parts.size() == 6 && parts[0] == kJoinSecretVersionNoToken) {
+    title_text = parts[1];
+    peer_text = parts[2];
+    session_text = parts[3];
+    shard_text = parts[4];
+    endpoint_text = parts[5];
+  } else if (parts.size() == 3) {
+    peer_text = parts[0];
+    title_text = parts[1];
+    session_text = parts[2];
+  } else {
+    REXNET_WARN("join material not understood ({} field(s))", parts.size());
+    return false;
+  }
+
+  if (std::sscanf(title_text.c_str(), "%x", &m.title) != 1) {
+    return false;
+  }
+  if (!token_text.empty()) {
+    unsigned long long parsed = 0;
+    if (std::sscanf(token_text.c_str(), "%llx", &parsed) != 1) {
+      REXNET_WARN("join material: bad token");
+      return false;
+    }
+    m.token = parsed;
+  }
+  const std::optional<RexNetPeerId> peer = RexNet::PeerIdFromString(peer_text);
+  if (!peer || !ParseHex16(session_text, m.session)) {
+    REXNET_WARN("join material: bad peer or session id");
+    return false;
+  }
+  m.peer = *peer;
+  std::array<uint8_t, 16> shard{};
+  if (!shard_text.empty() && shard_text != "-" && ParseHex16(shard_text, shard)) {
+    m.shard = shard;
+  }
+  if (endpoint_text != "-") {
+    m.endpoint = endpoint_text;
+  }
+  return true;
+}
 
 }  // namespace
 
@@ -680,71 +1018,41 @@ std::string RexNet::JoinSecretLocked() {
   if (!session_id_.has_value()) {
     return join_secret_cache_;
   }
-  std::string secret = kJoinSecretVersion;
-  secret += '|';
-  secret += fmt::format("{:08X}", title_id_);
-  secret += '|';
-  secret += PeerIdString(local_peer_id_);
-  secret += '|';
-  secret += Hex16(*session_id_);
-  secret += '|';
-  secret += current_shard_ ? Hex16(*current_shard_) : std::string("-");
-  secret += '|';
-  secret += public_endpoints_.empty() ? std::string("-") : *public_endpoints_.begin();
-  secret += '|';
-  secret += fmt::format("{:016x}", join_token_);
+  JoinMaterial material;
+  material.title = title_id_;
+  material.peer = local_peer_id_;
+  material.session = *session_id_;
+  material.shard = current_shard_;
+  material.endpoint = public_endpoints_.empty() ? std::string() : *public_endpoints_.begin();
+  material.token = join_token_;
+  std::string secret = EncodeJoinMaterial(material);
+  // Only a peer id that is not ed25519 runs past the limit. The endpoint goes
+  // first (the DHT finds the host without it), then the shard.
+  if (secret.size() > kJoinSecretMax) {
+    material.endpoint.clear();
+    secret = EncodeJoinMaterial(material);
+  }
+  if (secret.size() > kJoinSecretMax) {
+    material.shard.reset();
+    secret = EncodeJoinMaterial(material);
+  }
   join_secret_cache_ = std::move(secret);
   return join_secret_cache_;
 }
 
 bool RexNet::JoinFromSecret(const std::string& secret) {
-  std::vector<std::string> parts;
-  {
-    std::stringstream in(secret);
-    std::string part;
-    while (std::getline(in, part, '|')) {
-      parts.push_back(part);
-    }
-  }
-
-  // REXJ3|title|peer|session|shard|endpoint|token, REXJ2 without the token,
-  // or the first cut's peer|title|session.
-  std::string peer_text, title_text, session_text, shard_text, endpoint_text, token_text;
-  if (parts.size() == 7 && parts[0] == kJoinSecretVersion) {
-    title_text = parts[1];
-    peer_text = parts[2];
-    session_text = parts[3];
-    shard_text = parts[4];
-    endpoint_text = parts[5];
-    token_text = parts[6];
-  } else if (parts.size() == 6 && parts[0] == kJoinSecretVersionNoToken) {
-    title_text = parts[1];
-    peer_text = parts[2];
-    session_text = parts[3];
-    shard_text = parts[4];
-    endpoint_text = parts[5];
-  } else if (parts.size() == 3) {
-    peer_text = parts[0];
-    title_text = parts[1];
-    session_text = parts[2];
-  } else {
-    REXNET_WARN("join material not understood ({} field(s))", parts.size());
-    return false;
-  }
-
-  uint32_t title = 0;
-  if (std::sscanf(title_text.c_str(), "%x", &title) != 1) {
-    return false;
-  }
-  uint64_t token = 0;
-  if (!token_text.empty()) {
-    unsigned long long parsed = 0;
-    if (std::sscanf(token_text.c_str(), "%llx", &parsed) != 1) {
-      REXNET_WARN("join material: bad token");
+  JoinMaterial material;
+  if (secret.find('|') == std::string::npos) {
+    std::optional<JoinMaterial> decoded = DecodeJoinMaterial(secret);
+    if (!decoded) {
+      REXNET_WARN("join material not understood");
       return false;
     }
-    token = parsed;
+    material = std::move(*decoded);
+  } else if (!ParseJoinText(secret, material)) {
+    return false;
   }
+
   uint32_t our_title = 0;
   uint32_t our_xex_title = 0;
   {
@@ -752,24 +1060,21 @@ bool RexNet::JoinFromSecret(const std::string& secret) {
     our_title = title_id_;
     our_xex_title = xex_title_id_;
   }
-  if (title != our_title && title != our_xex_title) {
-    REXNET_WARN("join refused: title {:08X} is not ours ({:08X})", title, our_title);
+  if (material.title != our_title && material.title != our_xex_title) {
+    REXNET_WARN("join refused: title {:08X} is not ours ({:08X})", material.title, our_title);
     return false;
   }
-  const std::optional<RexNetPeerId> peer = PeerIdFromString(peer_text);
   InviteInfo invite;
-  if (!peer || !ParseHex16(session_text, invite.session_id)) {
-    REXNET_WARN("join material: bad peer or session id");
-    return false;
-  }
-  invite.peer = *peer;
-  invite.title_id = title;
+  invite.peer = material.peer;
+  invite.session_id = material.session;
+  invite.title_id = material.title;
+  const std::string peer_text = PeerIdString(material.peer);
 
   // The endpoint first: a confirmed public address dials in one step where
   // the DHT would take a lookup, and the invite's accept resolves on the host's
   // descriptor, which needs the connection.
-  if (!endpoint_text.empty() && endpoint_text != "-") {
-    const std::string multiaddr = EndpointToMultiaddr(endpoint_text, peer_text);
+  if (!material.endpoint.empty()) {
+    const std::string multiaddr = EndpointToMultiaddr(material.endpoint, peer_text);
     if (!multiaddr.empty()) {
       ConnectManual(multiaddr);
     }
@@ -777,21 +1082,20 @@ bool RexNet::JoinFromSecret(const std::string& secret) {
   if (!AcceptInvite(invite)) {
     // Already on its way: the descriptor or the timeout resolves it, and a
     // second arm would run the title's join twice.
-    REXNET_INFO("join to {}'s session already pending; not re-armed", PeerIdString(*peer));
+    REXNET_INFO("join to {}'s session already pending; not re-armed", peer_text);
     return true;
   }
   // The host is known: ask it outright, with the token that proves the
   // material came from it, and keep the DHT search as the fallback for a dial
   // that has not landed yet. Friendship is the players' business, not the
   // join's: nothing here sends a request.
-  SessionQuery(*peer, token);
+  SessionQuery(material.peer, material.token);
   SessionSearch();
-  std::array<uint8_t, 16> shard{};
-  if (!shard_text.empty() && shard_text != "-" && ParseHex16(shard_text, shard)) {
-    ShardJoin(shard);
+  if (material.shard) {
+    ShardJoin(*material.shard);
   }
-  REXNET_INFO("joining {}'s session from invite material{}", PeerIdString(*peer),
-              token ? "" : " (no token: a private session will not answer)");
+  REXNET_INFO("joining {}'s session from invite material{}", peer_text,
+              material.token ? "" : " (no token: a private session will not answer)");
   return true;
 }
 
