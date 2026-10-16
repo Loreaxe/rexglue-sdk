@@ -1022,8 +1022,9 @@ struct Behaviour {
     upnp: upnp::tokio::Behaviour,
     relay_client: relay::client::Behaviour,
     /// Circuit-v2 relay *server* (§9 torrent model): every node offers to relay
-    /// for others, so a publicly reachable peer brokers rendezvous + DCUtR for
-    /// NAT'd peers with no dedicated server. A NAT'd node still runs it, but no
+    /// for other RexNet nodes (never the public DHT's peers; see
+    /// [`rexnet_relay_config`]), so a publicly reachable peer brokers rendezvous
+    /// + DCUtR for NAT'd peers with no dedicated server. A NAT'd node still runs it, but no
     /// one can reach it to reserve, so relaying is self-selecting -- reachable
     /// peers seed, firewalled peers cannot, exactly like a torrent swarm.
     /// Reservation/data/time caps in `relay::Config` bound what we carry.
@@ -1046,11 +1047,41 @@ struct Behaviour {
     gossipsub: gossipsub::Behaviour,
 }
 
+/// Connected peers whose identify shows they are not RexNet nodes. Shared with
+/// the relay server's reservation gate, which runs inside the swarm where the
+/// engine's own peer tables are out of reach.
+type RelayStrangers = Arc<std::sync::Mutex<HashSet<PeerId>>>;
+
+/// The relay server's configuration: libp2p's caps and rate limits, with a
+/// RexNet-only gate in front. A reservation makes us the way in to its holder,
+/// so only a RexNet node may keep one, and every circuit we carry -- which can
+/// only end at a reservation holder -- ends at a RexNet node. What crosses it
+/// is that pair's Noise-encrypted connection; we forward bytes we cannot read.
+///
+/// The gate refuses peers identified as strangers, not peers unidentified: a
+/// reservation can arrive before our identify of its sender completes, and a
+/// RexNet node refused there backs the relay off for minutes. A stranger that
+/// reserves in that window is disconnected when its identify lands
+/// ([`Engine::evict_relay_stranger`]), which drops the reservation with it.
+fn rexnet_relay_config(strangers: RelayStrangers) -> relay::Config {
+    let mut config = relay::Config::default();
+    // First, so a refused stranger does not spend anyone's rate budget.
+    config.reservation_rate_limiters.insert(
+        0,
+        Box::new(move |peer: PeerId, _: &Multiaddr, _: Instant| {
+            strangers.lock().map(|s| !s.contains(&peer)).unwrap_or(false)
+        }),
+    );
+    config
+}
+
 /// Build the swarm and spawn the engine task onto the current tokio runtime.
 /// Must be called from within a runtime context (the FFI wraps this in
 /// `Runtime::block_on`).
 pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandles, BoxError> {
     let peer_id = keypair.public().to_peer_id();
+    let relay_strangers = RelayStrangers::default();
+    let relay_gate = relay_strangers.clone();
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -1089,7 +1120,7 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
                 autonat: autonat::Behaviour::new(local_id, autonat::Config::default()),
                 upnp: upnp::tokio::Behaviour::default(),
                 relay_client,
-                relay_server: relay::Behaviour::new(local_id, relay::Config::default()),
+                relay_server: relay::Behaviour::new(local_id, rexnet_relay_config(relay_gate)),
                 dcutr: dcutr::Behaviour::new(local_id),
                 echo: request_response::cbor::Behaviour::new(
                     [(
@@ -1315,6 +1346,8 @@ pub async fn spawn(keypair: Keypair, config: EngineConfig) -> Result<EngineHandl
             relay_addrs,
             relay_retry_at: HashMap::new(),
             rexnet_peers: HashSet::new(),
+            relay_strangers,
+            relay_tenants: HashSet::new(),
             shard_enabled: false,
             shard_cap: DEFAULT_SHARD_CAP,
             current_shard: None,
@@ -1456,6 +1489,11 @@ struct Engine {
     /// i.e. other RexNet nodes, as opposed to the public DHT peers we are
     /// also connected to. Asked directly during shard discovery.
     rexnet_peers: HashSet<PeerId>,
+    /// Connected peers identified as not RexNet, shared with the relay
+    /// server's reservation gate.
+    relay_strangers: RelayStrangers,
+    /// Peers holding a reservation on our relay server.
+    relay_tenants: HashSet<PeerId>,
     /// Opt-in per title (§17.5); false means we never join or publish.
     shard_enabled: bool,
     shard_cap: u16,
@@ -3241,6 +3279,19 @@ impl Engine {
         }
     }
 
+    /// A peer's identify shows it is not a RexNet node: our relay refuses its
+    /// reservations from now on, and one it took before we knew is dropped by
+    /// disconnecting it.
+    fn evict_relay_stranger(&mut self, peer: PeerId) {
+        if let Ok(mut strangers) = self.relay_strangers.lock() {
+            strangers.insert(peer);
+        }
+        if self.relay_tenants.remove(&peer) {
+            tracing::info!(%peer, "relay: dropped a reservation held by a non-RexNet peer");
+            let _ = self.swarm.disconnect_peer_id(peer);
+        }
+    }
+
     /// Close an inbound connection from a peer that is nothing to us: not
     /// wanted, not a relay of ours, not a friend, not a bootstrap node.
     fn close_public_inbound(&mut self, peer: PeerId, connection: libp2p::swarm::ConnectionId) {
@@ -3958,6 +4009,10 @@ impl Engine {
                     // A relay that goes away stops being one; leaving it
                     // labelled would strand a stale "relay" row in the UI.
                     self.rexnet_peers.remove(&peer_id);
+                    self.relay_tenants.remove(&peer_id);
+                    if let Ok(mut strangers) = self.relay_strangers.lock() {
+                        strangers.remove(&peer_id);
+                    }
                     self.pending_datagrams.remove(&peer_id);
                     // Guest TCP sockets to a peer that went away must be
                     // closed, or the game waits on a socket that will never
@@ -4038,6 +4093,7 @@ impl Engine {
                 // the crawl otherwise fills the inbound budget and a friend
                 // cannot get in.
                 if !info.protocols.iter().any(|p| p.as_ref() == crate::protocol::SHARD) {
+                    self.evict_relay_stranger(peer_id);
                     self.close_public_inbound(peer_id, connection_id);
                 }
                 // Feed identify-learned addresses into the routing table so
@@ -4470,6 +4526,30 @@ impl Engine {
             // Per-circuit detail at debug; the role change itself is what
             // `mark_relay` says at info.
             SwarmEvent::Behaviour(BehaviourEvent::RelayServer(event)) => {
+                match &event {
+                    relay::Event::ReservationReqAccepted { src_peer_id, renewed } => {
+                        self.relay_tenants.insert(*src_peer_id);
+                        if !renewed {
+                            let rexnet = self.rexnet_peers.contains(src_peer_id);
+                            tracing::info!(peer = %src_peer_id, rexnet,
+                                "relay: reservation accepted");
+                        }
+                    }
+                    relay::Event::ReservationReqDenied { src_peer_id, status } => {
+                        let stranger = self
+                            .relay_strangers
+                            .lock()
+                            .map(|s| s.contains(src_peer_id))
+                            .unwrap_or(false);
+                        tracing::info!(peer = %src_peer_id, stranger, ?status,
+                            "relay: reservation refused");
+                    }
+                    relay::Event::ReservationClosed { src_peer_id }
+                    | relay::Event::ReservationTimedOut { src_peer_id } => {
+                        self.relay_tenants.remove(src_peer_id);
+                    }
+                    _ => {}
+                }
                 tracing::debug!(?event, "relay server (we are relaying for the mesh)");
             }
             SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
