@@ -118,6 +118,11 @@ constexpr uint32_t kXOnlineLogonConnectionEstablished = 0x001510F0;
 /// that drives join-in-progress UIs (Fable 2 orbs).
 constexpr uint16_t kRichKeyTitleName = 0xFF00;
 constexpr uint16_t kRichKeySessionId = 0xFF01;
+/// kRichKeyPlayerStatus: a short string the player states about themselves ("looking for
+/// co-op"); kRichKeyPlayerSignal: a u32, a sequence (high 24 bits) and a signal id (low 8) — a
+/// greeting a game sends to everyone who sees its presence, new each time its sequence moves.
+constexpr uint16_t kRichKeyPlayerStatus = 0xFF02;
+constexpr uint16_t kRichKeyPlayerSignal = 0xFF03;
 
 /// Per-game configuration (design spec §11.1). Everything derivable at
 /// runtime (title id, ports) stays out; only genuinely per-game knowledge
@@ -327,6 +332,8 @@ class RexNet {
     std::string title_name;  // from the reserved rich KV, may be empty
     bool has_session = false;
     std::array<uint8_t, 16> session_id{};  // valid when has_session
+    std::string status;      // kRichKeyPlayerStatus, may be empty
+    uint32_t signal = 0;     // kRichKeyPlayerSignal, 0 = none
     std::vector<uint8_t> rich;
   };
 
@@ -361,8 +368,15 @@ class RexNet {
     bool has_session = false;  // friend is hosting a joinable session
     std::array<uint8_t, 16> session_id{};
     uint8_t presence_state = 0;
+    std::string status;   // what they state about themselves (kRichKeyPlayerStatus)
+    uint32_t signal = 0;  // their last signal: sequence << 8 | id (kRichKeyPlayerSignal)
   };
   std::vector<FriendInfo> SnapshotFriends();
+
+  /// States this player's status to everyone who sees their presence (empty clears it).
+  void SetPlayerStatus(const std::string& status);
+  /// Sends a signal (a greeting, by id) to everyone who sees this player's presence.
+  void SendPlayerSignal(uint8_t id);
 
   /// Resolve a friend's advertised session by its XNKID (first 8 bytes of
   /// the session id): host peer + full 16-byte id. XSessionSearchByID.
@@ -708,6 +722,7 @@ class RexNet {
     std::vector<uint8_t> bytes;
   };
   std::map<uint16_t, RichValue> rich_kvs_;
+  uint32_t player_signal_sequence_ = 0;
   void PushRichLocked();  // rebuild blob + SetPresence; call with mutex_ held
 
   std::optional<std::pair<RexNetPeerId, std::array<uint8_t, 16>>> pending_accept_;

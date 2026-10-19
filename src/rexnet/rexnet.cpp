@@ -1290,6 +1290,8 @@ std::vector<RexNet::FriendInfo> RexNet::SnapshotFriends() {
       info.has_session = it->second.has_session;
       info.session_id = it->second.session_id;
       info.presence_state = it->second.state;
+      info.status = it->second.status;
+      info.signal = it->second.signal;
     }
     // Presence wins; a name learned from a pasted friend code or the
     // request payload fills in until it arrives.
@@ -1587,6 +1589,32 @@ void RexNet::RememberFriendName(const RexNetPeerId& peer, const std::string& nam
   std::lock_guard lock(mutex_);
   friend_names_[std::string(reinterpret_cast<const char*>(key), 20)] = clean;
   SaveFriendNamesLocked();
+}
+
+void RexNet::SetPlayerStatus(const std::string& status) {
+  std::lock_guard lock(mutex_);
+  if (status.empty()) {
+    rich_kvs_.erase(kRichKeyPlayerStatus);
+  } else {
+    RichValue rich;
+    rich.is_string = true;
+    const size_t n = std::min<size_t>(status.size(), 48);
+    rich.bytes.assign(status.begin(), status.begin() + n);
+    rich_kvs_[kRichKeyPlayerStatus] = std::move(rich);
+  }
+  PushRichLocked();
+}
+
+void RexNet::SendPlayerSignal(uint8_t id) {
+  std::lock_guard lock(mutex_);
+  ++player_signal_sequence_;
+  const uint32_t value = ((player_signal_sequence_ & 0xFFFFFFu) << 8) | id;
+  RichValue rich;
+  rich.is_string = false;
+  rich.bytes = {static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value >> 16),
+                static_cast<uint8_t>(value >> 24)};
+  rich_kvs_[kRichKeyPlayerSignal] = std::move(rich);
+  PushRichLocked();
 }
 
 void RexNet::SetGameTitleName(const std::string& name) {
@@ -2191,6 +2219,11 @@ void RexNet::HandleEvent(const RexNetEvent& event) {
           } else if (key == kRichKeySessionId && !is_string && len == 16) {
             std::memcpy(info.session_id.data(), p, 16);
             info.has_session = true;
+          } else if (key == kRichKeyPlayerStatus && is_string) {
+            info.status.assign(reinterpret_cast<const char*>(p), len);
+          } else if (key == kRichKeyPlayerSignal && !is_string && len == 4) {
+            info.signal = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                          (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
           }
           p += len;
         }
