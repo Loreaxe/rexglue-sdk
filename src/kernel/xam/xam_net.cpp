@@ -45,6 +45,7 @@
 
 #if REXGLUE_ENABLE_REXNET
 #include <rex/runtime.h>
+#include <rex/net/pseudonym.h>
 #include <rex/net/rexnet.h>
 #endif
 
@@ -440,12 +441,17 @@ void RexNetStartup() {
           "RexNet");
     }
 
-    // Local profile from identity + display name (design spec §11): a
-    // stable offline-format XUID derived from the keypair, so the same
-    // install presents the same identity to every title.
+    // Local profile from identity (design spec §11): a stable offline-format
+    // XUID derived from the keypair, so the same install presents the same
+    // identity to every title. The profile NAME is the player's pseudonym,
+    // not their display name: titles put the gamertag in their own packets
+    // (Fable 2's join messages and its presence channel reach strangers and
+    // the whole LAN), and a display name never goes to a non-friend
+    // (§17.3.8). Where a title shows another player, the shell names them
+    // by the §17.2 rule instead.
     if (auto* profile = kernel_state->user_profile()) {
       profile->set_identity(net::RexNet::XuidFromPeer(rexnet->local_peer_id()),
-                            options.display_name);
+                            net::Pseudonym(rexnet->local_peer_id()));
       // The profile just went from signed-in-locally to signed-in-to-LIVE.
       // Titles cache XamUserGetSigninState and only re-scan on
       // XN_SYS_SIGNINCHANGED (Fable 2 keeps NLivePresence in
