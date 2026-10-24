@@ -100,8 +100,18 @@ inline timespec DurationToTimeSpec(std::chrono::duration<_Rep, _Period> duration
 
 // Thread interruption is done using user-defined signals
 // This implementation uses the SIGRTMAX - SIGRTMIN to signal to a thread
-// gdb tip, for SIG = SIGRTMIN + SignalType : handle SIG nostop
-// lldb tip, for SIG = SIGRTMIN + SignalType : process handle SIG -s false
+// gdb tip, for SIG = SIGRTMIN + kFirstSignalOffset + SignalType : handle SIG nostop
+// lldb tip, for SIG = SIGRTMIN + kFirstSignalOffset + SignalType : process handle SIG -s false
+//
+// SIGRTMIN ITSELF IS TAKEN: coreclr's PAL injects GC-suspension activations with SIGRTMIN
+// (INJECT_ACTIVATION_SIGNAL) into every thread that has run managed code, and its handler
+// is installed at runtime start. A handler of ours on the same number replaces it, so an
+// activation aimed at a guest thread inside a managed callback (the asset reader on the
+// GameThread) ran WaitSuspended with no Resume ever coming; the GC then never completed and
+// every managed thread, Godot's main thread included, stopped (refii_hang_20261024_124012).
+// Our signals therefore start two above SIGRTMIN.
+constexpr int kFirstSignalOffset = 2;
+
 enum class SignalType {
   kThreadSuspend,
   kThreadUserCallback,
@@ -128,7 +138,7 @@ int GetSystemSignal(SignalType num) {
       return SIGUSR1;
   }
 #else
-  auto result = SIGRTMIN + static_cast<int>(num);
+  auto result = SIGRTMIN + kFirstSignalOffset + static_cast<int>(num);
   assert_true(result < SIGRTMAX);
   return result;
 #endif
@@ -146,7 +156,7 @@ SignalType GetSystemSignalType(int num) {
       return SignalType::kThreadSuspend;
   }
 #else
-  return static_cast<SignalType>(num - SIGRTMIN);
+  return static_cast<SignalType>(num - SIGRTMIN - kFirstSignalOffset);
 #endif
 }
 
