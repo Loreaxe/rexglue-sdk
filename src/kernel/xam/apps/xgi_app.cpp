@@ -498,7 +498,12 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // answers the size probe itself (needs 0x536 bytes / error 122); XAM
       // only sees the fill call, a 0x14-byte block:
       //   +0x00 user_index
-      //   +0x04 u64: XNKID guest pointer in the low dword (std of r3)
+      //   +0x04 u64: the XNKID ITSELF. XSessionSearchByID takes `XNKID sessionID` BY
+      //         VALUE (XDK), the 8-byte struct riding in r3, and the stub's `std r3`
+      //         lays its bytes at +4..+11 (0x82d01288). It is NOT a pointer: reading
+      //         the low dword as one and translating it crashed in
+      //         FindFriendSessionByXnkid on whatever a friend's id bytes were
+      //         (0x2378B6E5, three player reports, 2026-10-25).
       //   +0x0C *pcbResultsBuffer (byte count, already >= 0x536)
       //   +0x10 XSESSION_SEARCHRESULT_HEADER out ptr
       // Fable 2 reaches this from the friends-list/orb join
@@ -511,16 +516,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }
 
       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t session_id_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
+      const uint8_t* xnkid = buffer + 4;
+      uint64_t session_id = memory::load_and_swap<uint64_t>(buffer + 4);
       uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 12);
       uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
 
-      REXKRNL_INFO("XSessionSearchByID(user {}, xnkid @{:08X}, {} bytes into {:08X})", user_index,
-                   session_id_ptr, results_buffer_size, search_results_ptr);
+      REXKRNL_INFO("XSessionSearchByID(user {}, xnkid {:016X}, {} bytes into {:08X})", user_index,
+                   session_id, results_buffer_size, search_results_ptr);
 
 #if REXGLUE_ENABLE_REXNET
-      if (auto* rexnet = net::RexNet::shared(); rexnet && session_id_ptr && search_results_ptr) {
-        const uint8_t* xnkid = memory_->TranslateVirtual(session_id_ptr);
+      if (auto* rexnet = net::RexNet::shared(); rexnet && session_id != 0 && search_results_ptr) {
         std::vector<net::RexNet::SessionResult> results;
         if (auto found = rexnet->FindFriendSessionByXnkid(xnkid)) {
           net::RexNet::SessionResult result;
