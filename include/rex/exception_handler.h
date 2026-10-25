@@ -493,6 +493,12 @@ class Exception {
   uint32_t modified_v_registers() const { return modified_v_registers_; }
 #endif  // REX_ARCH
 
+  // The platform's own exception record (Win32: the PEXCEPTION_POINTERS the vectored handler
+  // was given), or null where the platform has none to offer. Valid for the handler's
+  // duration only.
+  void* native_info() const { return native_info_; }
+  void set_native_info(void* info) { native_info_ = info; }
+
   // In case of AV, address that was read from/written to.
   uint64_t fault_address() const { return fault_address_; }
 
@@ -513,6 +519,7 @@ class Exception {
 #endif  // REX_ARCH
   uint64_t fault_address_ = 0;
   AccessViolationOperation access_violation_operation_ = AccessViolationOperation::kUnknown;
+  void* native_info_ = nullptr;
 };
 
 //=============================================================================
