@@ -499,11 +499,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // only sees the fill call, a 0x14-byte block:
       //   +0x00 user_index
       //   +0x04 u64: the XNKID ITSELF. XSessionSearchByID takes `XNKID sessionID` BY
-      //         VALUE (XDK), the 8-byte struct riding in r3, and the stub's `std r3`
-      //         lays its bytes at +4..+11 (0x82d01288). It is NOT a pointer: reading
-      //         the low dword as one and translating it crashed in
-      //         FindFriendSessionByXnkid on whatever a friend's id bytes were
-      //         (0x2378B6E5, three player reports, 2026-10-25).
+      //         VALUE (XDK signature), the 8-byte struct riding in r3, and the title-side
+      //         stub stores r3's bytes at +4..+11. It is NOT a pointer: reading the low
+      //         dword as one and translating it faults on whatever the id bytes are.
       //   +0x0C *pcbResultsBuffer (byte count, already >= 0x536)
       //   +0x10 XSESSION_SEARCHRESULT_HEADER out ptr
       // Fable 2 reaches this from the friends-list/orb join
