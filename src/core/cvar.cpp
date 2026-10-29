@@ -347,6 +347,10 @@ bool SetFlagFromCommandLine(std::string_view name, std::string_view value) {
   return SetFlagFromSource(name, value, Source::kCommandLine) != ApplyResult::kRejected;
 }
 
+bool SetFlagFromConfig(std::string_view name, std::string_view value) {
+  return SetFlagFromSource(name, value, Source::kConfig) == ApplyResult::kApplied;
+}
+
 bool InvokeCommand(std::string_view name, std::string_view args) {
   std::function<void(std::string_view)> cb;
   {

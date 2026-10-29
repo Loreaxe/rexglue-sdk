@@ -196,6 +196,11 @@ bool SetFlagByName(std::string_view name, std::string_view value);
 // skipped because a higher-priority source already won returns true.
 bool SetFlagFromCommandLine(std::string_view name, std::string_view value);
 
+// Set a flag as a config file states it: applied only when nothing of higher
+// precedence (environment, command line, runtime) has set it already. For a
+// config read outside LoadConfig, such as an early pass over the same file.
+bool SetFlagFromConfig(std::string_view name, std::string_view value);
+
 std::string GetFlagByName(std::string_view name);
 
 // Which source last wrote this flag. Returns Source::kDefault for unknown names.
