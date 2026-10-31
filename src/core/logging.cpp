@@ -38,6 +38,9 @@ REXCVAR_DEFINE_STRING(log_level, "info", "Log",
     .allowed({"trace", "debug", "info", "warn", "error", "critical", "off"});
 
 REXCVAR_DEFINE_STRING(log_file, "", "Log", "Log file path (empty = auto sequential naming)");
+REXCVAR_DEFINE_STRING(log_prefix, "", "Log",
+                      "Prefix of the auto-named log files (empty = the app's name); a host that runs "
+                      "more than one title from one app names each title's logs with it");
 
 REXCVAR_DEFINE_BOOL(log_verbose, false, "Log", "Enable verbose logging (sets level to trace)")
     .debug_only();
