@@ -13,6 +13,29 @@
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/user_module.h>
+#include <rex/types.h>
+
+namespace rex {
+namespace kernel {
+namespace xam {
+
+// The title id of the logged-on title: the running executable's, from its XEX header (the same
+// read as XamGetCurrentTitleId).
+u32 XNetLogonGetTitleID_entry() {
+  auto module = REX_KERNEL_STATE()->GetExecutableModule();
+  if (module) {
+    return module->title_id();
+  }
+  return 0;
+}
+
+}  // namespace xam
+}  // namespace kernel
+}  // namespace rex
+
+REX_EXPORT(__imp__XNetLogonGetTitleID, rex::kernel::xam::XNetLogonGetTitleID_entry)
 
 // kinda gross but oh well
 REX_EXPORT_STUB(__imp__CancelWaitableTimer);
@@ -244,7 +267,6 @@ REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
 REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
 REX_EXPORT_STUB(__imp__XNetLogonGetState);
 REX_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
-REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
 REX_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
 REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
 REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
