@@ -22,6 +22,7 @@
 REXCVAR_DECLARE(std::string, log_level);
 REXCVAR_DECLARE(std::string, log_file);
 REXCVAR_DECLARE(std::string, log_prefix);
+REXCVAR_DECLARE(std::string, log_dir);
 REXCVAR_DECLARE(bool, log_verbose);
 REXCVAR_DECLARE(bool, log_noisy);
 REXCVAR_DECLARE(int32_t, log_flush_interval);
