@@ -119,7 +119,8 @@ static_assert_size(XCONTENT_AGGREGATE_DATA, 0x148);
 class ContentPackage {
  public:
   ContentPackage(KernelState* kernel_state, const std::string_view root_name,
-                 const XCONTENT_AGGREGATE_DATA& data, const std::filesystem::path& package_path);
+                 const XCONTENT_AGGREGATE_DATA& data, const std::filesystem::path& package_path,
+                 bool read_only = false);
   ~ContentPackage();
 
   void LoadPackageLicenseMask(const std::filesystem::path header_path);
@@ -171,6 +172,14 @@ class ContentManager {
                                  XContentType content_type, XCONTENT_AGGREGATE_DATA& data) const;
 
   std::filesystem::path ResolveGameUserContentPath();
+
+  // The folder every content type of `title_id` (and its Headers folder) sits below for the
+  // profile `xuid`. kCurrentlyRunningTitleId names the running title.
+  std::filesystem::path ResolveTitleRoot(uint64_t xuid, uint32_t title_id) const;
+
+  // True for content of a title other than the running one: XAM lets a title open its
+  // alternate titles' content OPEN_EXISTING only, so it is never created, written or deleted.
+  bool IsOtherTitle(uint32_t title_id) const;
   bool IsContentOpen(const XCONTENT_AGGREGATE_DATA& data) const;
   void CloseOpenedFilesFromContent(const std::string_view root_name);
 
@@ -198,6 +207,7 @@ class ContentManager {
 
   KernelState* kernel_state_;
   std::filesystem::path root_path_;
+  std::unordered_map<uint32_t, std::string> title_folders_;
 
   // TODO(benvanik): remove use of global lock, it's bad here!
   rex::thread::global_critical_region global_critical_region_;

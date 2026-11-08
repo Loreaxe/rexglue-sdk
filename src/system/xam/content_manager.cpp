@@ -40,13 +40,13 @@ static int content_device_id_ = 0;
 
 ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
                                const XCONTENT_AGGREGATE_DATA& data,
-                               const std::filesystem::path& package_path)
+                               const std::filesystem::path& package_path, bool read_only)
     : kernel_state_(kernel_state), root_name_(root_name), package_path_(package_path), license_(0) {
   device_path_ = fmt::format("\\Device\\Content\\{0}\\", ++content_device_id_);
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, read_only,
                                                                   /*allow_share_delete=*/true);
   device->Initialize();
   fs->RegisterDevice(std::move(device));
@@ -97,6 +97,18 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
   // Package root path:
   // content_root/xuid/title_id/content_type/
   return root_path_ / xuid_str / title_id_str / content_type_str;
+}
+
+std::filesystem::path ContentManager::ResolveTitleRoot(uint64_t xuid, uint32_t title_id) const {
+  if (title_id == kCurrentlyRunningTitleId) {
+    title_id = kernel_state_->title_id();
+  }
+  // content_root/xuid/title_id/
+  return root_path_ / fmt::format("{:016X}", xuid) / fmt::format("{:08X}", title_id);
+}
+
+bool ContentManager::IsOtherTitle(uint32_t title_id) const {
+  return title_id != kCurrentlyRunningTitleId && title_id != kernel_state_->title_id();
 }
 
 std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
